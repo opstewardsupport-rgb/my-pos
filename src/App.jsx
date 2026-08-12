@@ -109,7 +109,7 @@ export default function App() {
     <div className="flex flex-col items-center justify-center min-h-screen bg-gradient-to-b from-[#f7f8f9] to-[#d8dbdf] p-4 text-slate-800">
       <form onSubmit={handleAuth} className="bg-[#ffffff] border border-[#d1d5db] p-8 rounded-2xl shadow-2xl shadow-slate-400/25 w-full max-w-md">
         
-        {/* Updated Postimages Link */}
+        {/* Direct Raw Image Link */}
         <div className="flex flex-col items-center mb-6">
           <img 
             src="https://i.postimg.cc/bvvq6YGY/Gemini-Generated-Image-gzijxcgzijxcgzij-removebg-preview.png" 
