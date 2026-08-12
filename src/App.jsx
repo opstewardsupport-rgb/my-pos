@@ -7,10 +7,11 @@ export default function App() {
   const [session, setSession] = useState(null)
   const [loading, setLoading] = useState(true)
   
-  // Added back business name state
   const [businessName, setBusinessName] = useState('')
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
+  const [confirmPassword, setConfirmPassword] = useState('') // Added confirm password state
+  
   const [isLoginMode, setIsLoginMode] = useState(false)
   const [subscribeLater, setSubscribeLater] = useState(false)
   const [discountCode, setDiscountCode] = useState('')
@@ -18,13 +19,11 @@ export default function App() {
   const [isSuccess, setIsSuccess] = useState(false)
 
   useEffect(() => {
-    // Check if user is already logged in or arriving via verification link
     supabase.auth.getSession().then(({ data: { session } }) => {
       setSession(session)
       setLoading(false)
     })
 
-    // Listen for changes in authentication state (like clicking the email link)
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
       setSession(session)
     })
@@ -46,7 +45,17 @@ export default function App() {
         setIsSuccess(true)
       }
     } else {
-      // Include business name in user metadata during sign up
+      // --- VALIDATIONS FOR SIGN UP ---
+      if (password.length < 5) {
+        setMessage('Password must be at least 5 characters long.')
+        return
+      }
+
+      if (password !== confirmPassword) {
+        setMessage('Passwords do not match. Please check and try again.')
+        return
+      }
+
       const { error } = await supabase.auth.signUp({ 
         email, 
         password,
@@ -70,12 +79,10 @@ export default function App() {
     setSession(null)
   }
 
-  // Show a loading state briefly while checking session
   if (loading) {
     return <div className="flex items-center justify-center min-h-screen bg-gray-100">Loading...</div>
   }
 
-  // --- IF USER IS LOGGED IN (OR JUST CLICKED THE VERIFICATION LINK) ---
   if (session) {
     return (
       <div className="flex flex-col items-center justify-center min-h-screen bg-gray-100 p-4">
@@ -99,7 +106,6 @@ export default function App() {
     )
   }
 
-  // --- REGULAR SIGN-UP / LOGIN FORM ---
   return (
     <div className="flex flex-col items-center justify-center min-h-screen bg-gray-100 p-4">
       <form onSubmit={handleAuth} className="bg-white p-6 rounded shadow-md w-full max-w-sm">
@@ -107,7 +113,6 @@ export default function App() {
           {isLoginMode ? 'POS Login' : 'POS Sign Up'}
         </h2>
 
-        {/* Business Name Input (Only shows on Sign Up) */}
         {!isLoginMode && (
           <input
             type="text"
@@ -130,12 +135,24 @@ export default function App() {
         
         <input
           type="password"
-          placeholder="Password"
+          placeholder="Password (min 5 characters)"
           value={password}
           onChange={(e) => setPassword(e.target.value)}
           className="w-full p-2 mb-3 border rounded"
           required
         />
+
+        {/* Confirm Password field only shows during Sign Up */}
+        {!isLoginMode && (
+          <input
+            type="password"
+            placeholder="Confirm Password"
+            value={confirmPassword}
+            onChange={(e) => setConfirmPassword(e.target.value)}
+            className="w-full p-2 mb-3 border rounded"
+            required
+          />
+        )}
 
         {!isLoginMode && (
           <>
