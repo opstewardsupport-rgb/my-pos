@@ -109,14 +109,14 @@ export default function App() {
     <div className="flex flex-col items-center justify-center min-h-screen bg-gradient-to-b from-[#f7f8f9] to-[#d8dbdf] p-4 text-slate-800">
       <form onSubmit={handleAuth} className="bg-[#ffffff] border border-[#d1d5db] p-8 rounded-2xl shadow-2xl shadow-slate-400/25 w-full max-w-md">
         
-        {/* Direct Embedded Logo & Typography */}
+        {/* Your Exact Logo Image */}
         <div className="flex flex-col items-center mb-6">
-          <div className="flex items-center justify-center w-16 h-16 bg-slate-900 text-white rounded-2xl shadow-md mb-3">
-            <svg className="w-9 h-9" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
-            </svg>
-          </div>
-          <h1 className="text-2xl font-black tracking-tight text-slate-900">OpSteward</h1>
+          <img 
+            src="https://i.postimg.cc/bvvq6YGY/Gemini-Generated-Image-gzijxcgzijxcgzij-removebg-preview.png" 
+            alt="OpSteward Logo" 
+            className="w-56 h-auto mb-2 object-contain"
+            crossOrigin="anonymous"
+          />
           <h2 className="text-xs font-bold tracking-widest text-slate-500 uppercase mt-1">
             {isLoginMode ? 'POS Login' : 'Create Account'}
           </h2>
