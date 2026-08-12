@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { createClient } from '@supabase/supabase-js'
 
-const supabase = createClient('YOUR_SUPABASE_URL', 'YOUR_SUPABASE_ANON_KEY')
+const supabase = createClient('sb_publishable_GUX0Y4Nyr-zeFAHB2IB0Xw_K7syHDWY', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRkZ2N5ZmZiYmx4eGNjc3VqdGR5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODY1Mjc0NzAsImV4cCI6MjEwMjEwMzQ3MH0.EojAkWVBtpV0Dz5ZYxix5cM36ZS7W0sK2zxYflXRnw8')
 
 export default function App() {
   const [session, setSession] = useState(null)
