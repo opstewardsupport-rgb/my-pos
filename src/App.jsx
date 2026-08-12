@@ -107,63 +107,67 @@ export default function App() {
 
   return (
     <div className="flex flex-col items-center justify-center min-h-screen bg-slate-900 p-4">
-      <form onSubmit={handleAuth} className="bg-slate-800 border border-slate-700 p-8 rounded-xl shadow-xl w-full max-w-sm text-slate-100">
+      <form onSubmit={handleAuth} className="bg-slate-800 border border-slate-700 p-8 rounded-xl shadow-xl w-full max-w-md text-slate-100">
         
-        {/* LOGO AREA: Replace the src below with your actual hosted logo image link */}
         <div className="flex flex-col items-center mb-6">
-          <img 
-            src="https://via.placeholder.com/120x40?text=YOUR+LOGO" 
-            alt="POS Logo" 
-            className="h-12 object-contain mb-2"
-          />
-          <h2 className="text-xl font-bold tracking-wide">
+          <div className="flex items-center space-x-2 mb-2">
+            <svg className="w-10 h-10 text-white" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+            </svg>
+            <span className="text-2xl font-bold tracking-wider text-white">OpSteward</span>
+          </div>
+          <h2 className="text-lg font-medium text-slate-300">
             {isLoginMode ? 'POS Login' : 'Create Account'}
           </h2>
         </div>
 
         {!isLoginMode && (
-          <div className="mb-3">
+          <div className="mb-4">
+            <label className="block text-xs font-semibold text-slate-400 mb-1">BUSINESS NAME</label>
             <input
               type="text"
               placeholder="Business Name"
               value={businessName}
               onChange={(e) => setBusinessName(e.target.value)}
-              className="w-full p-3 bg-slate-900 border border-slate-700 rounded-lg text-white placeholder-slate-400 focus:outline-none focus:border-indigo-500"
+              className="w-full p-3 bg-slate-900 border border-slate-700 rounded-lg text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500"
               required
             />
           </div>
         )}
 
-        <div className="mb-3">
+        <div className="mb-4">
+          <label className="block text-xs font-semibold text-slate-400 mb-1">EMAIL ADDRESS</label>
           <input
             type="email"
             placeholder="Email Address"
             value={email}
             onChange={(e) => setEmail(e.target.value)}
-            className="w-full p-3 bg-slate-900 border border-slate-700 rounded-lg text-white placeholder-slate-400 focus:outline-none focus:border-indigo-500"
+            className="w-full p-3 bg-slate-900 border border-slate-700 rounded-lg text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500"
             required
           />
         </div>
         
-        <div className="mb-3">
+        <div className="mb-4">
+          <label className="block text-xs font-semibold text-slate-400 mb-1">PASSWORD</label>
           <input
             type="password"
             placeholder="Password (min 5 chars)"
             value={password}
             onChange={(e) => setPassword(e.target.value)}
-            className="w-full p-3 bg-slate-900 border border-slate-700 rounded-lg text-white placeholder-slate-400 focus:outline-none focus:border-indigo-500"
+            className="w-full p-3 bg-slate-900 border border-slate-700 rounded-lg text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500"
             required
           />
         </div>
 
         {!isLoginMode && (
-          <div className="mb-3">
+          <div className="mb-4">
+            <label className="block text-xs font-semibold text-slate-400 mb-1">CONFIRM PASSWORD</label>
             <input
               type="password"
               placeholder="Confirm Password"
               value={confirmPassword}
               onChange={(e) => setConfirmPassword(e.target.value)}
-              className="w-full p-3 bg-slate-900 border border-slate-700 rounded-lg text-white placeholder-slate-400 focus:outline-none focus:border-indigo-500"
+              className="w-full p-3 bg-slate-900 border border-slate-700 rounded-lg text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500"
               required
             />
           </div>
@@ -171,21 +175,21 @@ export default function App() {
 
         {!isLoginMode && (
           <>
-            <div className="mb-4 flex items-center space-x-2 mt-4">
+            <div className="mb-4 flex items-center space-x-2 mt-4 bg-slate-900/50 p-3 rounded-lg border border-slate-700">
               <input 
                 type="checkbox" 
                 id="subCheck"
                 checked={subscribeLater}
                 onChange={(e) => setSubscribeLater(e.target.checked)}
-                className="h-4 w-4 text-indigo-600 rounded border-slate-700 bg-slate-900"
+                className="h-4 w-4 text-indigo-600 rounded border-slate-700 bg-slate-900 focus:ring-indigo-500"
               />
-              <label htmlFor="subCheck" className="text-sm text-slate-300">
+              <label htmlFor="subCheck" className="text-sm text-slate-300 cursor-pointer select-none">
                 Subscribe after a 3-day trial period
               </label>
             </div>
 
             {subscribeLater && (
-              <div className="mb-4 p-3 bg-slate-900 border border-indigo-900 rounded-lg">
+              <div className="mb-4 p-3 bg-slate-900 border border-indigo-900/60 rounded-lg animate-fadeIn">
                 <label className="block text-xs font-semibold text-indigo-400 mb-1">
                   DISCOUNT CODE
                 </label>
@@ -194,7 +198,7 @@ export default function App() {
                   placeholder="Enter code (e.g. TRIAL3DAYS)"
                   value={discountCode}
                   onChange={(e) => setDiscountCode(e.target.value)}
-                  className="w-full p-2 text-sm bg-slate-800 border border-slate-700 text-white rounded placeholder-slate-500 focus:outline-none focus:border-indigo-500"
+                  className="w-full p-2.5 text-sm bg-slate-800 border border-slate-700 text-white rounded placeholder-slate-500 focus:outline-none focus:border-indigo-500"
                 />
               </div>
             )}
@@ -203,7 +207,7 @@ export default function App() {
 
         <button 
           type="submit" 
-          className="w-full bg-indigo-600 text-white py-3 rounded-lg font-semibold hover:bg-indigo-500 transition mt-2 mb-3 shadow-lg shadow-indigo-600/30"
+          className="w-full bg-indigo-600 text-white py-3 rounded-lg font-semibold hover:bg-indigo-500 transition mt-2 mb-4 shadow-lg shadow-indigo-600/30"
         >
           {isLoginMode ? 'Log In' : 'Sign Up'}
         </button>
