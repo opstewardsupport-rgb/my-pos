@@ -3,7 +3,7 @@ import { createClient } from '@supabase/supabase-js'
 
 const supabase = createClient('https://tdgcyffbblxxccsujtdy.supabase.co', 'sb_publishable_GUX0Y4Nyr-zeFAHB2IB0Xw_K7syHDWY')
 
-// Your exact logo direct image link:
+// Using your exact uploaded logo link directly:
 const logoImage = "https://i.ibb.co/pBTM7RQv/Gemini-Generated-Image-gzijxcgzijxcgzij-removebg-preview.png"
 
 export default function App() {
@@ -114,12 +114,14 @@ export default function App() {
         
         {/* Your Exact Logo Image Header */}
         <div className="flex flex-col items-center mb-6">
-          <img 
-            src={logoImage} 
-            alt="OpSteward Logo" 
-            className="w-56 h-auto mb-2 object-contain"
-          />
-          <h2 className="text-xs font-bold tracking-widest text-slate-500 uppercase">
+          <div className="bg-white p-2 rounded-xl shadow-sm border border-slate-100 mb-2 flex justify-center">
+            <img 
+              src={logoImage} 
+              alt="OpSteward Logo" 
+              className="w-44 h-auto object-contain block"
+            />
+          </div>
+          <h2 className="text-xs font-bold tracking-widest text-slate-500 uppercase mt-1">
             {isLoginMode ? 'POS Login' : 'Create Account'}
           </h2>
         </div>
