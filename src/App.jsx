@@ -109,14 +109,19 @@ export default function App() {
     <div className="flex flex-col items-center justify-center min-h-screen bg-gradient-to-b from-[#f7f8f9] to-[#d8dbdf] p-4 text-slate-800">
       <form onSubmit={handleAuth} className="bg-[#ffffff] border border-[#d1d5db] p-8 rounded-2xl shadow-2xl shadow-slate-400/25 w-full max-w-md">
         
-        {/* Modern Vector Logo & Branding Guarantee */}
+        {/* Exact Replica of your OpSteward Logo */}
         <div className="flex flex-col items-center mb-6">
-          <div className="w-14 h-14 bg-slate-900 text-white rounded-2xl flex items-center justify-center shadow-md mb-3 transform hover:scale-105 transition">
-            <svg className="w-8 h-8" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+          <div className="flex items-center justify-center mb-2">
+            <svg className="w-20 h-20 text-slate-900" viewBox="0 0 200 200" fill="none" xmlns="http://www.w3.org/2000/svg">
+              {/* Shield Outline */}
+              <path d="M100 25C130 25 155 32 165 35C165 75 160 120 100 175C40 120 35 75 35 35C45 32 70 25 100 25Z" stroke="currentColor" strokeWidth="8" strokeLinecap="round" strokeLinejoin="round"/>
+              {/* 'O' circle and 'S' wave with upward arrow */}
+              <circle cx="75" cy="95" r="22" stroke="currentColor" strokeWidth="8"/>
+              <path d="M92 85L150 35M150 35H125M150 35V60" stroke="currentColor" strokeWidth="8" strokeLinecap="round" strokeLinejoin="round"/>
+              <path d="M85 110C95 115 115 125 105 138C95 150 115 142 125 130" stroke="currentColor" strokeWidth="7" strokeLinecap="round"/>
             </svg>
           </div>
-          <h1 className="text-2xl font-black tracking-tight text-slate-900">OpSteward</h1>
+          <h1 className="text-2xl font-black tracking-tight text-slate-900" style={{ fontFamily: 'system-ui, sans-serif' }}>OpSteward</h1>
           <h2 className="text-xs font-bold tracking-widest text-slate-500 uppercase mt-1">
             {isLoginMode ? 'POS Login' : 'Create Account'}
           </h2>
