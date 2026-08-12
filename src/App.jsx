@@ -3,6 +3,9 @@ import { createClient } from '@supabase/supabase-js'
 
 const supabase = createClient('https://tdgcyffbblxxccsujtdy.supabase.co', 'sb_publishable_GUX0Y4Nyr-zeFAHB2IB0Xw_K7syHDWY')
 
+// Your exact logo direct image link:
+const logoImage = "https://i.ibb.co/pBTM7RQv/Gemini-Generated-Image-gzijxcgzijxcgzij-removebg-preview.png"
+
 export default function App() {
   const [session, setSession] = useState(null)
   const [loading, setLoading] = useState(true)
@@ -109,24 +112,13 @@ export default function App() {
     <div className="flex flex-col items-center justify-center min-h-screen bg-gradient-to-b from-[#f7f8f9] to-[#d8dbdf] p-4 text-slate-800">
       <form onSubmit={handleAuth} className="bg-[#ffffff] border border-[#d1d5db] p-8 rounded-2xl shadow-2xl shadow-slate-400/25 w-full max-w-md">
         
-        {/* OpSteward Exact Logo Graphic & Typography */}
+        {/* Your Exact Logo Image Header */}
         <div className="flex flex-col items-center mb-6">
-          <div className="flex flex-col items-center mb-3">
-            {/* SVG accurately tracing your uploaded logo layout */}
-            <svg className="w-24 h-24 text-slate-900 drop-shadow-sm mb-1" viewBox="0 0 100 90" fill="none" stroke="currentColor" strokeWidth="4.5" strokeLinecap="round" strokeLinejoin="round">
-              {/* Shield Outline */}
-              <path d="M50 4 L78 18 C78 45 68 70 50 84 C32 70 22 45 22 18 Z" />
-              {/* 'O' / Circle part */}
-              <circle cx="42" cy="42" r="13" strokeWidth="4.5" />
-              {/* Arrow extending through to 'S' curve */}
-              <path d="M50 43 L71 22 M71 22 H60 M71 22 V33" strokeWidth="4.5" />
-              {/* 'S' lower body shape */}
-              <path d="M37 57 C37 52, 60 52, 60 63 C60 74, 37 70, 42 78" strokeWidth="4.5" />
-            </svg>
-            <span className="text-3xl font-extrabold tracking-tight text-slate-900">
-              Op<span className="font-normal text-slate-700">Steward</span>
-            </span>
-          </div>
+          <img 
+            src={logoImage} 
+            alt="OpSteward Logo" 
+            className="w-56 h-auto mb-2 object-contain"
+          />
           <h2 className="text-xs font-bold tracking-widest text-slate-500 uppercase">
             {isLoginMode ? 'POS Login' : 'Create Account'}
           </h2>
