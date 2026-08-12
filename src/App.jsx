@@ -3,9 +3,6 @@ import { createClient } from '@supabase/supabase-js'
 
 const supabase = createClient('https://tdgcyffbblxxccsujtdy.supabase.co', 'sb_publishable_GUX0Y4Nyr-zeFAHB2IB0Xw_K7syHDWY')
 
-// Using your exact uploaded logo link directly:
-const logoImage = "https://i.ibb.co/pBTM7RQv/Gemini-Generated-Image-gzijxcgzijxcgzij-removebg-preview.png"
-
 export default function App() {
   const [session, setSession] = useState(null)
   const [loading, setLoading] = useState(true)
@@ -112,15 +109,13 @@ export default function App() {
     <div className="flex flex-col items-center justify-center min-h-screen bg-gradient-to-b from-[#f7f8f9] to-[#d8dbdf] p-4 text-slate-800">
       <form onSubmit={handleAuth} className="bg-[#ffffff] border border-[#d1d5db] p-8 rounded-2xl shadow-2xl shadow-slate-400/25 w-full max-w-md">
         
-        {/* Your Exact Logo Image Header */}
+        {/* Updated Postimages Link */}
         <div className="flex flex-col items-center mb-6">
-          <div className="bg-white p-2 rounded-xl shadow-sm border border-slate-100 mb-2 flex justify-center">
-            <img 
-              src={logoImage} 
-              alt="OpSteward Logo" 
-              className="w-44 h-auto object-contain block"
-            />
-          </div>
+          <img 
+            src="https://i.postimg.cc/bvvq6YGY/Gemini-Generated-Image-gzijxcgzijxcgzij-removebg-preview.png" 
+            alt="OpSteward Logo" 
+            className="w-52 h-auto mb-2 object-contain"
+          />
           <h2 className="text-xs font-bold tracking-widest text-slate-500 uppercase mt-1">
             {isLoginMode ? 'POS Login' : 'Create Account'}
           </h2>
