@@ -1,17 +1,33 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { createClient } from '@supabase/supabase-js'
 
-// Replace these with your actual Supabase URL and Anon Key from your project dashboard
 const supabase = createClient('YOUR_SUPABASE_URL', 'YOUR_SUPABASE_ANON_KEY')
 
 export default function App() {
+  const [session, setSession] = useState(null)
+  const [loading, setLoading] = useState(true)
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
-  const [isLoginMode, setIsLoginMode] = useState(false) // Toggle between Sign Up and Log In
-  const [subscribeLater, setSubscribeLater] = useState(false) // Tracks 3-day trial preference
+  const [isLoginMode, setIsLoginMode] = useState(false)
+  const [subscribeLater, setSubscribeLater] = useState(false)
   const [discountCode, setDiscountCode] = useState('')
   const [message, setMessage] = useState('')
   const [isSuccess, setIsSuccess] = useState(false)
+
+  useEffect(() => {
+    // Check if user is already logged in or arriving via verification link
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setSession(session)
+      setLoading(false)
+    })
+
+    // Listen for changes in authentication state (like clicking the email link)
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setSession(session)
+    })
+
+    return () => subscription.unsubscribe()
+  }, [])
 
   const handleAuth = async (e) => {
     e.preventDefault()
@@ -19,11 +35,7 @@ export default function App() {
     setIsSuccess(false)
 
     if (isLoginMode) {
-      // --- LOG IN EXISTING USER ---
-      const { error } = await supabase.auth.signInWithPassword({
-        email,
-        password,
-      })
+      const { error } = await supabase.auth.signInWithPassword({ email, password })
       if (error) {
         setMessage(error.message)
       } else {
@@ -31,13 +43,7 @@ export default function App() {
         setIsSuccess(true)
       }
     } else {
-      // --- SIGN UP NEW USER ---
-      const { error } = await supabase.auth.signUp({
-        email,
-        password,
-      })
-
-      // Graceful success message guiding them to verify via email instead of raw error dumps
+      const { error } = await supabase.auth.signUp({ email, password })
       if (error) {
         setMessage('Please check your email inbox to verify your account and complete registration.')
         setIsSuccess(true)
@@ -48,6 +54,36 @@ export default function App() {
     }
   }
 
+  const handleLogout = async () => {
+    await supabase.auth.signOut()
+    setSession(null)
+  }
+
+  // Show a loading state briefly while checking session
+  if (loading) {
+    return <div className="flex items-center justify-center min-h-screen bg-gray-100">Loading...</div>
+  }
+
+  // --- IF USER IS LOGGED IN (OR JUST CLICKED THE VERIFICATION LINK) ---
+  if (session) {
+    return (
+      <div className="flex flex-col items-center justify-center min-h-screen bg-gray-100 p-4">
+        <div className="bg-white p-6 rounded shadow-md w-full max-w-md text-center">
+          <h2 className="text-2xl font-bold mb-2 text-green-600">Welcome to your POS!</h2>
+          <p className="text-gray-600 mb-4">Logged in as: {session.user.email}</p>
+          
+          <button
+            onClick={handleLogout}
+            className="w-full bg-red-600 text-white py-2 rounded font-semibold hover:bg-red-700"
+          >
+            Log Out
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  // --- REGULAR SIGN-UP / LOGIN FORM ---
   return (
     <div className="flex flex-col items-center justify-center min-h-screen bg-gray-100 p-4">
       <form onSubmit={handleAuth} className="bg-white p-6 rounded shadow-md w-full max-w-sm">
@@ -73,7 +109,6 @@ export default function App() {
           required
         />
 
-        {/* Show trial checkbox and discount options only on the Sign Up view */}
         {!isLoginMode && (
           <>
             <div className="mb-4 flex items-center space-x-2">
@@ -89,7 +124,6 @@ export default function App() {
               </label>
             </div>
 
-            {/* Discount code box appears ONLY if person selects to subscribe after 3 days */}
             {subscribeLater && (
               <div className="mb-4 p-3 bg-blue-50 border border-blue-200 rounded">
                 <label className="block text-xs font-semibold text-blue-800 mb-1">
