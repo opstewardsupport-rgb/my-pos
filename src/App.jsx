@@ -109,15 +109,24 @@ export default function App() {
     <div className="flex flex-col items-center justify-center min-h-screen bg-gradient-to-b from-[#f7f8f9] to-[#d8dbdf] p-4 text-slate-800">
       <form onSubmit={handleAuth} className="bg-[#ffffff] border border-[#d1d5db] p-8 rounded-2xl shadow-2xl shadow-slate-400/25 w-full max-w-md">
         
-        {/* Your Exact Logo Image */}
+        {/* Guaranteed Logo Header Layout */}
         <div className="flex flex-col items-center mb-6">
-          <img 
-            src="https://i.postimg.cc/bvvq6YGY/Gemini-Generated-Image-gzijxcgzijxcgzij-removebg-preview.png" 
-            alt="OpSteward Logo" 
-            className="w-56 h-auto mb-2 object-contain"
-            crossOrigin="anonymous"
-          />
-          <h2 className="text-xs font-bold tracking-widest text-slate-500 uppercase mt-1">
+          <div className="flex items-center justify-center mb-2">
+            <img 
+              src="https://i.postimg.cc/bvvq6YGY/Gemini-Generated-Image-gzijxcgzijxcgzij-removebg-preview.png" 
+              alt="OpSteward Logo" 
+              className="h-12 w-auto object-contain"
+              onError={(e) => {
+                e.target.style.display = 'none';
+                e.target.nextElementSibling.style.display = 'flex';
+              }}
+            />
+            <div style={{ display: 'none' }} className="items-center space-x-2">
+              <div className="w-10 h-10 bg-slate-900 text-white rounded-xl flex items-center justify-center font-black">O</div>
+              <span className="text-2xl font-black tracking-tight text-slate-900">OpSteward</span>
+            </div>
+          </div>
+          <h2 className="text-xs font-bold tracking-widest text-slate-500 uppercase mt-2">
             {isLoginMode ? 'POS Login' : 'Create Account'}
           </h2>
         </div>
