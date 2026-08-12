@@ -6,6 +6,9 @@ const supabase = createClient('https://tdgcyffbblxxccsujtdy.supabase.co', 'sb_pu
 export default function App() {
   const [session, setSession] = useState(null)
   const [loading, setLoading] = useState(true)
+  
+  // Added back business name state
+  const [businessName, setBusinessName] = useState('')
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [isLoginMode, setIsLoginMode] = useState(false)
@@ -43,10 +46,18 @@ export default function App() {
         setIsSuccess(true)
       }
     } else {
-      const { error } = await supabase.auth.signUp({ email, password })
+      // Include business name in user metadata during sign up
+      const { error } = await supabase.auth.signUp({ 
+        email, 
+        password,
+        options: {
+          data: {
+            business_name: businessName,
+          }
+        }
+      })
       if (error) {
-        setMessage('Please check your email inbox to verify your account and complete registration.')
-        setIsSuccess(true)
+        setMessage(error.message)
       } else {
         setMessage('Registration successful! Please check your email to verify your account.')
         setIsSuccess(true)
@@ -70,7 +81,12 @@ export default function App() {
       <div className="flex flex-col items-center justify-center min-h-screen bg-gray-100 p-4">
         <div className="bg-white p-6 rounded shadow-md w-full max-w-md text-center">
           <h2 className="text-2xl font-bold mb-2 text-green-600">Welcome to your POS!</h2>
-          <p className="text-gray-600 mb-4">Logged in as: {session.user.email}</p>
+          <p className="text-gray-600 mb-1">Logged in as: {session.user.email}</p>
+          {session.user.user_metadata?.business_name && (
+            <p className="text-sm font-medium text-blue-600 mb-4">
+              Business: {session.user.user_metadata.business_name}
+            </p>
+          )}
           
           <button
             onClick={handleLogout}
@@ -90,6 +106,18 @@ export default function App() {
         <h2 className="text-xl font-bold mb-4 text-center">
           {isLoginMode ? 'POS Login' : 'POS Sign Up'}
         </h2>
+
+        {/* Business Name Input (Only shows on Sign Up) */}
+        {!isLoginMode && (
+          <input
+            type="text"
+            placeholder="Business Name"
+            value={businessName}
+            onChange={(e) => setBusinessName(e.target.value)}
+            className="w-full p-2 mb-3 border rounded"
+            required
+          />
+        )}
 
         <input
           type="email"
