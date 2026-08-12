@@ -79,24 +79,24 @@ export default function App() {
   }
 
   if (loading) {
-    return <div className="flex items-center justify-center min-h-screen bg-slate-900 text-white">Loading...</div>
+    return <div className="flex items-center justify-center min-h-screen bg-[#f1f3f5] text-slate-700 font-medium">Loading...</div>
   }
 
   if (session) {
     return (
-      <div className="flex flex-col items-center justify-center min-h-screen bg-slate-900 p-4">
-        <div className="bg-slate-800 border border-slate-700 p-8 rounded-xl shadow-xl w-full max-w-md text-center">
-          <h2 className="text-2xl font-bold mb-2 text-emerald-400">Welcome to your POS!</h2>
-          <p className="text-slate-300 mb-1">Logged in as: {session.user.email}</p>
+      <div className="flex flex-col items-center justify-center min-h-screen bg-gradient-to-b from-[#f7f8f9] to-[#e2e5e9] p-4">
+        <div className="bg-[#ffffff] border border-[#d1d5db] p-8 rounded-2xl shadow-2xl shadow-slate-400/20 w-full max-w-md text-center">
+          <h2 className="text-2xl font-bold mb-2 text-slate-800">Welcome to your POS!</h2>
+          <p className="text-slate-600 mb-1">Logged in as: {session.user.email}</p>
           {session.user.user_metadata?.business_name && (
-            <p className="text-sm font-medium text-indigo-400 mb-6">
+            <p className="text-sm font-semibold text-slate-500 mb-6 tracking-wide uppercase">
               Business: {session.user.user_metadata.business_name}
             </p>
           )}
           
           <button
             onClick={handleLogout}
-            className="w-full bg-rose-600 text-white py-2 rounded-lg font-semibold hover:bg-rose-700 transition"
+            className="w-full bg-slate-800 text-slate-100 py-3 rounded-xl font-semibold hover:bg-slate-700 transition shadow-md"
           >
             Log Out
           </button>
@@ -106,69 +106,69 @@ export default function App() {
   }
 
   return (
-    <div className="flex flex-col items-center justify-center min-h-screen bg-slate-900 p-4">
-      <form onSubmit={handleAuth} className="bg-slate-800 border border-slate-700 p-8 rounded-xl shadow-xl w-full max-w-md text-slate-100">
+    <div className="flex flex-col items-center justify-center min-h-screen bg-gradient-to-b from-[#f7f8f9] to-[#d8dbdf] p-4 text-slate-800">
+      <form onSubmit={handleAuth} className="bg-[#ffffff] border border-[#d1d5db] p-8 rounded-2xl shadow-2xl shadow-slate-400/25 w-full max-w-md">
         
         {/* OpSteward Logo and Header */}
         <div className="flex flex-col items-center mb-6">
-          <div className="flex items-center space-x-2 mb-2">
-            <svg className="w-10 h-10 text-white" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+          <div className="flex items-center space-x-2.5 mb-2">
+            <svg className="w-10 h-10 text-slate-800" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
               <path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
             </svg>
-            <span className="text-2xl font-bold tracking-wider text-white">OpSteward</span>
+            <span className="text-2xl font-bold tracking-wider text-slate-900">OpSteward</span>
           </div>
-          <h2 className="text-lg font-medium text-slate-300">
+          <h2 className="text-sm font-semibold tracking-widest text-slate-500 uppercase">
             {isLoginMode ? 'POS Login' : 'Create Account'}
           </h2>
         </div>
 
         {!isLoginMode && (
           <div className="mb-4">
-            <label className="block text-xs font-semibold text-slate-400 mb-1">BUSINESS NAME</label>
+            <label className="block text-xs font-bold text-slate-500 mb-1 tracking-wider">BUSINESS NAME</label>
             <input
               type="text"
               placeholder="Business Name"
               value={businessName}
               onChange={(e) => setBusinessName(e.target.value)}
-              className="w-full p-3 bg-slate-900 border border-slate-700 rounded-lg text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500"
+              className="w-full p-3 bg-[#f8f9fa] border border-[#d1d5db] rounded-xl text-slate-900 placeholder-slate-400 focus:outline-none focus:border-slate-500 focus:bg-white transition"
               required
             />
           </div>
         )}
 
         <div className="mb-4">
-          <label className="block text-xs font-semibold text-slate-400 mb-1">EMAIL ADDRESS</label>
+          <label className="block text-xs font-bold text-slate-500 mb-1 tracking-wider">EMAIL ADDRESS</label>
           <input
             type="email"
             placeholder="Email Address"
             value={email}
             onChange={(e) => setEmail(e.target.value)}
-            className="w-full p-3 bg-slate-900 border border-slate-700 rounded-lg text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500"
+            className="w-full p-3 bg-[#f8f9fa] border border-[#d1d5db] rounded-xl text-slate-900 placeholder-slate-400 focus:outline-none focus:border-slate-500 focus:bg-white transition"
             required
           />
         </div>
         
         <div className="mb-4">
-          <label className="block text-xs font-semibold text-slate-400 mb-1">PASSWORD</label>
+          <label className="block text-xs font-bold text-slate-500 mb-1 tracking-wider">PASSWORD</label>
           <input
             type="password"
             placeholder="Password (min 5 chars)"
             value={password}
             onChange={(e) => setPassword(e.target.value)}
-            className="w-full p-3 bg-slate-900 border border-slate-700 rounded-lg text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500"
+            className="w-full p-3 bg-[#f8f9fa] border border-[#d1d5db] rounded-xl text-slate-900 placeholder-slate-400 focus:outline-none focus:border-slate-500 focus:bg-white transition"
             required
           />
         </div>
 
         {!isLoginMode && (
           <div className="mb-4">
-            <label className="block text-xs font-semibold text-slate-400 mb-1">CONFIRM PASSWORD</label>
+            <label className="block text-xs font-bold text-slate-500 mb-1 tracking-wider">CONFIRM PASSWORD</label>
             <input
               type="password"
               placeholder="Confirm Password"
               value={confirmPassword}
               onChange={(e) => setConfirmPassword(e.target.value)}
-              className="w-full p-3 bg-slate-900 border border-slate-700 rounded-lg text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500"
+              className="w-full p-3 bg-[#f8f9fa] border border-[#d1d5db] rounded-xl text-slate-900 placeholder-slate-400 focus:outline-none focus:border-slate-500 focus:bg-white transition"
               required
             />
           </div>
@@ -176,22 +176,22 @@ export default function App() {
 
         {!isLoginMode && (
           <>
-            <div className="mb-4 flex items-center space-x-2 mt-4 bg-slate-900/50 p-3 rounded-lg border border-slate-700">
+            <div className="mb-4 flex items-center space-x-2.5 mt-4 bg-[#f8f9fa] p-3.5 rounded-xl border border-[#d1d5db]">
               <input 
                 type="checkbox" 
                 id="subCheck"
                 checked={subscribeLater}
                 onChange={(e) => setSubscribeLater(e.target.checked)}
-                className="h-4 w-4 text-indigo-600 rounded border-slate-700 bg-slate-900 focus:ring-indigo-500"
+                className="h-4 w-4 text-slate-800 rounded border-slate-300 bg-white focus:ring-slate-500 accent-slate-800"
               />
-              <label htmlFor="subCheck" className="text-sm text-slate-300 cursor-pointer select-none">
+              <label htmlFor="subCheck" className="text-sm font-medium text-slate-700 cursor-pointer select-none">
                 Subscribe after a 3-day trial period
               </label>
             </div>
 
             {subscribeLater && (
-              <div className="mb-4 p-3 bg-slate-900 border border-indigo-900/60 rounded-lg">
-                <label className="block text-xs font-semibold text-indigo-400 mb-1">
+              <div className="mb-4 p-3.5 bg-[#f8f9fa] border border-[#cbd5e1] rounded-xl">
+                <label className="block text-xs font-bold text-slate-600 mb-1 tracking-wider">
                   DISCOUNT CODE
                 </label>
                 <input
@@ -199,7 +199,7 @@ export default function App() {
                   placeholder="Enter code (e.g. TRIAL3DAYS)"
                   value={discountCode}
                   onChange={(e) => setDiscountCode(e.target.value)}
-                  className="w-full p-2.5 text-sm bg-slate-800 border border-slate-700 text-white rounded placeholder-slate-500 focus:outline-none focus:border-indigo-500"
+                  className="w-full p-2.5 text-sm bg-white border border-[#d1d5db] text-slate-900 rounded-lg placeholder-slate-400 focus:outline-none focus:border-slate-500"
                 />
               </div>
             )}
@@ -208,7 +208,7 @@ export default function App() {
 
         <button 
           type="submit" 
-          className="w-full bg-indigo-600 text-white py-3 rounded-lg font-semibold hover:bg-indigo-500 transition mt-2 mb-4 shadow-lg shadow-indigo-600/30"
+          className="w-full bg-slate-900 text-white py-3.5 rounded-xl font-bold hover:bg-slate-800 transition mt-2 mb-4 shadow-lg shadow-slate-500/20 tracking-wide"
         >
           {isLoginMode ? 'Log In' : 'Sign Up'}
         </button>
@@ -219,13 +219,13 @@ export default function App() {
             setIsLoginMode(!isLoginMode)
             setMessage('')
           }}
-          className="w-full text-sm text-indigo-400 hover:text-indigo-300 text-center transition"
+          className="w-full text-sm font-medium text-slate-600 hover:text-slate-900 text-center transition"
         >
           {isLoginMode ? "Don't have an account? Sign Up" : 'Already have an account? Log In'}
         </button>
 
         {message && (
-          <p className={`mt-4 text-sm text-center font-medium ${isSuccess ? 'text-emerald-400' : 'text-indigo-300'}`}>
+          <p className={`mt-4 text-sm text-center font-medium ${isSuccess ? 'text-emerald-600' : 'text-rose-600'}`}>
             {message}
           </p>
         )}
