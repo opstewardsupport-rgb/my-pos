@@ -179,6 +179,26 @@ const EMPLOYEES_KEY = "cafe_pos_employees_v1";
 const CURRENT_EMPLOYEE_KEY = "cafe_pos_current_employee_v1";
 const SHIFTS_KEY = "cafe_pos_shifts_v1";
 const WASTE_KEY = "cafe_pos_waste_v1";
+
+// Every one of the local-storage keys above (plus ORDER_COUNTER_KEY further
+// down) holds café-operational data — catalog, sales, shifts, waste,
+// employees — that used to be shared by WHOEVER was logged in on a given
+// device/browser, since the keys themselves were the same no matter which
+// account was signed in. That meant two different business accounts using
+// the same browser would see each other's sales history.
+//
+// `scopedKey()` fixes that by suffixing every one of these keys with the
+// signed-in owner's Supabase auth user id (a stable UUID — safer to key on
+// than email, since email can be changed later without losing your data).
+// So "cafe_pos_sales_v1" becomes e.g.
+// "cafe_pos_sales_v1::3fa2b1c4-...-91ab" — a completely separate bucket of
+// browser storage per account. Returns null (meaning "don't touch storage")
+// if there's no signed-in user id yet, so nothing gets read or written
+// before we actually know whose data it is.
+function scopedKey(baseKey, userId) {
+  return userId ? `${baseKey}::${userId}` : null;
+}
+
 // ---- Supabase (cloud account, auth, trial, referrals & subscription) ----
 // The anon key is safe to ship in client code — it only grants what your
 // Row Level Security policies on the `businesses` table allow (see
@@ -449,8 +469,11 @@ const unitLabel = (u) => (UNITS.find((x) => x.id === u) || { id: u }).id || u;
 // account data, so there's no need to round-trip it through the network on
 // every keystroke. Only the owner's account, trial, referral and
 // subscription info live in Supabase (see below), so that part works
-// correctly across every device the owner logs into.
+// correctly across every device the owner logs into. Every key passed in
+// here is expected to already be scoped per-account via scopedKey() — a
+// null key (no signed-in user yet) is a deliberate no-op, not an error.
 async function safeGet(key) {
+  if (!key) return null;
   try {
     const raw = window.localStorage.getItem(key);
     return raw ? JSON.parse(raw) : null;
@@ -459,6 +482,7 @@ async function safeGet(key) {
   }
 }
 async function safeSet(key, value) {
+  if (!key) return false;
   try {
     window.localStorage.setItem(key, JSON.stringify(value));
     return true;
@@ -571,6 +595,11 @@ export default function CafePOS() {
   // form or the main app, even though a session technically exists.
   const [passwordRecovery, setPasswordRecovery] = useState(false);
   const accountRef = useRef(null);
+  // Always holds the currently-signed-in Supabase auth user id (or null
+  // when signed out), kept in a ref so every safeGet/safeSet call site can
+  // read the CURRENT value at call-time via scopedKey() without having to
+  // thread authUser through a long chain of useCallback dependency arrays.
+  const authUserIdRef = useRef(null);
   // Owner opened the Upgrade screen voluntarily (e.g. from the trial banner
   // or Settings) while still inside their trial window. Once the trial
   // actually expires, the upgrade screen is shown automatically instead —
@@ -610,12 +639,14 @@ export default function CafePOS() {
       if (session?.user) {
         const biz = await fetchBusiness(session.user.id);
         if (!mounted) return;
+        authUserIdRef.current = session.user.id;
         setAuthUser(session.user);
         accountRef.current = biz;
         setAccount(biz);
         setLoggedIn(true);
       } else {
         if (!mounted) return;
+        authUserIdRef.current = null;
         setAuthUser(null);
         accountRef.current = null;
         setAccount(null);
@@ -700,42 +731,69 @@ export default function CafePOS() {
     };
   }, [account]);
 
+  // Loads (or seeds) this ACCOUNT's local café data — catalog, sales,
+  // employees, shifts, waste log, currency, order counter. Re-runs any time
+  // the signed-in user id changes: on login, on logout, and on switching to
+  // a different account in the same browser — each with its own completely
+  // separate bucket of localStorage, via scopedKey() (see its comment near
+  // CATALOG_KEY above). Nothing is read or written to storage until we
+  // actually know which account we're loading for.
   useEffect(() => {
+    const userId = authUser?.id || null;
+
+    if (!userId) {
+      // Signed out (or not yet signed in): don't touch storage, and don't
+      // leave a previous account's data sitting in memory — reset to
+      // clean, empty defaults. The login/signup screen is what actually
+      // renders at this point (see the `!loggedIn` gate further down), so
+      // this is just hygiene, not something the person will see.
+      setCatalog({ ingredients: [], products: [], categories: [] });
+      setSales([]);
+      setNextOrderNo(1);
+      setCurrencyCode("PHP");
+      setEmployees([]);
+      setCurrentEmployeeId(null);
+      setShifts([]);
+      setWasteLogs([]);
+      setLoading(true);
+      return;
+    }
+
     (async () => {
       setLoading(true);
-      let cat = await safeGet(CATALOG_KEY);
-      let sal = await safeGet(SALES_KEY);
-      let cur = await safeGet(CURRENCY_KEY);
-      let emps = await safeGet(EMPLOYEES_KEY);
-      let curEmpId = await safeGet(CURRENT_EMPLOYEE_KEY);
-      let shiftsData = await safeGet(SHIFTS_KEY);
-      let wasteData = await safeGet(WASTE_KEY);
-      let orderCounter = await safeGet(ORDER_COUNTER_KEY);
-      if (!cat) { cat = seedCatalog(); await safeSet(CATALOG_KEY, cat); }
+      let cat = await safeGet(scopedKey(CATALOG_KEY, userId));
+      let sal = await safeGet(scopedKey(SALES_KEY, userId));
+      let cur = await safeGet(scopedKey(CURRENCY_KEY, userId));
+      let emps = await safeGet(scopedKey(EMPLOYEES_KEY, userId));
+      let curEmpId = await safeGet(scopedKey(CURRENT_EMPLOYEE_KEY, userId));
+      let shiftsData = await safeGet(scopedKey(SHIFTS_KEY, userId));
+      let wasteData = await safeGet(scopedKey(WASTE_KEY, userId));
+      let orderCounter = await safeGet(scopedKey(ORDER_COUNTER_KEY, userId));
+      if (!cat) { cat = seedCatalog(); await safeSet(scopedKey(CATALOG_KEY, userId), cat); }
       if (!cat.categories) {
         const found = Array.from(new Set(cat.products.map((p) => p.category)));
         cat.categories = found.length
           ? found.map((c) => ({ id: c, name: c.charAt(0).toUpperCase() + c.slice(1) }))
           : [{ id: "drink", name: "Drinks" }, { id: "food", name: "Food" }];
-        await safeSet(CATALOG_KEY, cat);
+        await safeSet(scopedKey(CATALOG_KEY, userId), cat);
       }
-      if (!sal) { sal = []; await safeSet(SALES_KEY, sal); }
+      if (!sal) { sal = []; await safeSet(scopedKey(SALES_KEY, userId), sal); }
       // Reports/history only need to keep RETENTION_MONTHS worth of whole months.
       const purged = purgeOldSales(sal);
-      if (purged.length !== sal.length) { sal = purged; await safeSet(SALES_KEY, sal); }
-      if (!cur) { cur = "PHP"; await safeSet(CURRENCY_KEY, cur); }
+      if (purged.length !== sal.length) { sal = purged; await safeSet(scopedKey(SALES_KEY, userId), sal); }
+      if (!cur) { cur = "PHP"; await safeSet(scopedKey(CURRENCY_KEY, userId), cur); }
       if (!emps || emps.length === 0) {
         emps = [
           { id: uid("emp"), name: "Jamie", role: "manager" },
           { id: uid("emp"), name: "Sam", role: "staff" },
         ];
-        await safeSet(EMPLOYEES_KEY, emps);
+        await safeSet(scopedKey(EMPLOYEES_KEY, userId), emps);
       }
       // Older saved employee lists won't have a `role` yet — default them to
       // "staff" so the Manager/Staff grouping always has something to show.
       if (emps.some((e) => !e.role)) {
         emps = emps.map((e) => (e.role ? e : { ...e, role: "staff" }));
-        await safeSet(EMPLOYEES_KEY, emps);
+        await safeSet(scopedKey(EMPLOYEES_KEY, userId), emps);
       }
       // A previous version of the seed used the category itself as the
       // placeholder name ("Manager" / "Staff"), which made the category look
@@ -750,20 +808,20 @@ export default function CafePOS() {
           e.name === "Manager" && e.role === "manager" ? { ...e, name: "Jamie" } :
           e.name === "Staff" && e.role === "staff" ? { ...e, name: "Sam" } : e
         );
-        await safeSet(EMPLOYEES_KEY, emps);
+        await safeSet(scopedKey(EMPLOYEES_KEY, userId), emps);
       }
       if (!curEmpId || !emps.some((e) => e.id === curEmpId)) {
         curEmpId = emps[0].id;
-        await safeSet(CURRENT_EMPLOYEE_KEY, curEmpId);
+        await safeSet(scopedKey(CURRENT_EMPLOYEE_KEY, userId), curEmpId);
       }
-      if (!shiftsData) { shiftsData = []; await safeSet(SHIFTS_KEY, shiftsData); }
-      if (!wasteData) { wasteData = []; await safeSet(WASTE_KEY, wasteData); }
+      if (!shiftsData) { shiftsData = []; await safeSet(scopedKey(SHIFTS_KEY, userId), shiftsData); }
+      if (!wasteData) { wasteData = []; await safeSet(scopedKey(WASTE_KEY, userId), wasteData); }
       if (!orderCounter) {
         // First run on this counter — pick up numbering after the highest
         // order number already on file so upgrades don't restart at 1.
         const maxExisting = sal.length ? Math.max(0, ...sal.map((s) => s.orderNo || 0)) : 0;
         orderCounter = maxExisting + 1;
-        await safeSet(ORDER_COUNTER_KEY, orderCounter);
+        await safeSet(scopedKey(ORDER_COUNTER_KEY, userId), orderCounter);
       }
       setCatalog(cat);
       setSales(sal);
@@ -775,11 +833,11 @@ export default function CafePOS() {
       setWasteLogs(wasteData);
       setLoading(false);
     })();
-  }, []);
+  }, [authUser?.id]);
 
   const changeCurrency = useCallback(async (code) => {
     setCurrencyCode(code);
-    const ok = await safeSet(CURRENCY_KEY, code);
+    const ok = await safeSet(scopedKey(CURRENCY_KEY, authUserIdRef.current), code);
     if (!ok) notify("Couldn't save the currency — check connection and try again.", "err");
   }, []);
 
@@ -1050,25 +1108,25 @@ export default function CafePOS() {
 
   const persistEmployees = useCallback(async (next) => {
     setEmployees(next);
-    const ok = await safeSet(EMPLOYEES_KEY, next);
+    const ok = await safeSet(scopedKey(EMPLOYEES_KEY, authUserIdRef.current), next);
     if (!ok) notify("Couldn't save employees — check connection and try again.", "err");
   }, [notify]);
 
   const selectEmployee = useCallback(async (id) => {
     setCurrentEmployeeId(id);
-    const ok = await safeSet(CURRENT_EMPLOYEE_KEY, id);
+    const ok = await safeSet(scopedKey(CURRENT_EMPLOYEE_KEY, authUserIdRef.current), id);
     if (!ok) notify("Couldn't switch employee — check connection and try again.", "err");
   }, [notify]);
 
   const persistShifts = useCallback(async (next) => {
     setShifts(next);
-    const ok = await safeSet(SHIFTS_KEY, next);
+    const ok = await safeSet(scopedKey(SHIFTS_KEY, authUserIdRef.current), next);
     if (!ok) notify("Couldn't save shift data — check connection and try again.", "err");
   }, [notify]);
 
   const persistWaste = useCallback(async (next) => {
     setWasteLogs(next);
-    const ok = await safeSet(WASTE_KEY, next);
+    const ok = await safeSet(scopedKey(WASTE_KEY, authUserIdRef.current), next);
     if (!ok) notify("Couldn't save the waste log — check connection and try again.", "err");
   }, [notify]);
 
@@ -1116,13 +1174,13 @@ export default function CafePOS() {
 
   const persistCatalog = useCallback(async (next) => {
     setCatalog(next);
-    const ok = await safeSet(CATALOG_KEY, next);
+    const ok = await safeSet(scopedKey(CATALOG_KEY, authUserIdRef.current), next);
     if (!ok) notify("Couldn't save — check connection and try again.", "err");
   }, [notify]);
 
   const persistSales = useCallback(async (next) => {
     setSales(next);
-    const ok = await safeSet(SALES_KEY, next);
+    const ok = await safeSet(scopedKey(SALES_KEY, authUserIdRef.current), next);
     if (!ok) notify("Couldn't save the sale — check connection and try again.", "err");
   }, [notify]);
 
