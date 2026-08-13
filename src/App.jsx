@@ -54,10 +54,14 @@
      add column if not exists subscription_period_end timestamptz;
 
    -- Redeems someone else's referral code: gives the CALLER a one-time 25%
-   -- discount on their first payment, and — ONLY if the code owner is
-   -- currently an active, paying, non-lapsed subscriber — gives the CODE
-   -- OWNER a stacking 3% reward credit that keeps applying to their own
-   -- future renewals. If the code owner is on a free trial or their paid
+   -- discount on their first payment (first month only), and — ONLY if the
+   -- code owner is currently an active, paying, non-lapsed subscriber —
+   -- gives the CODE OWNER a 3% reward credit toward their CURRENT billing
+   -- cycle. Reward credits earned this way accumulate only within the
+   -- current billing month; the app resets reward_credits back to 0 every
+   -- time a subscriber's period renews (see markSubscriptionActive in the
+   -- app code), so a discount earned this month never carries into next
+   -- month's bill. If the code owner is on a free trial or their paid
    -- period has lapsed, the code still works for the new sign-up's 25%
    -- discount, but no reward credit is recorded for the owner (this mirrors
    -- the app hiding an owner's code entirely while they're on a free trial
@@ -253,13 +257,15 @@ const SUBSCRIPTION_PERIOD_DAYS = 30;
 
 // Referral program:
 //  - REFERRAL_DISCOUNT_PERCENT: a ONE-TIME discount a brand-new subscriber
-//    gets on their very first payment, if they redeemed someone else's code
-//    before paying. It's consumed after that first payment (see
-//    markSubscriptionActive) — it never applies to renewals.
+//    gets on their very first payment (first month only), if they redeemed
+//    someone else's code before paying. It's consumed after that first
+//    payment (see markSubscriptionActive) — it never applies to renewals.
 //  - REFERRAL_REWARD_PERCENT: what the CODE OWNER earns, every time their
-//    code is redeemed by someone new. This one stacks and keeps applying as
-//    a discount to the code owner's own renewals going forward (see
-//    UpgradeView) — that's the "next bill" it reflects on.
+//    code is redeemed by someone new. This is a CURRENT-BILLING-MONTH-ONLY
+//    credit: it accumulates as new referrals come in during the owner's
+//    current billing cycle, then resets back to 0% the moment a new billing
+//    cycle starts (see markSubscriptionActive, which zeroes reward_credits
+//    on every renewal) — it does NOT roll over or stack across months.
 // Both numbers are enforced server-side in the redeem_referral() SQL
 // function at the top of this file — these constants are just what the UI
 // displays, so keep them in sync if you ever change the SQL.
@@ -296,57 +302,52 @@ function purgeOldSales(salesArr) {
 
 // `zeroDecimal: true` currencies (JPY, IDR, VND) are conventionally shown
 // with no cents/decimal places — ₦4,061 not ₦4,061.00.
-// Alphabetical by currency name (not by code) — this is the order shown in
-// every currency picker in the app, including the one-time choice made at
-// sign-up (see SignUpView) which is permanent from then on.
 const CURRENCIES = [
-  { code: "AUD", symbol: "A$", label: "Australian Dollar (A$)" },
-  { code: "GBP", symbol: "£", label: "British Pound (£)" },
+  { code: "PHP", symbol: "₱", label: "Philippine Peso (₱)" },
+  { code: "USD", symbol: "$", label: "US Dollar ($)" },
   { code: "EUR", symbol: "€", label: "Euro (€)" },
+  { code: "GBP", symbol: "£", label: "British Pound (£)" },
+  { code: "JPY", symbol: "¥", label: "Japanese Yen (¥)", zeroDecimal: true },
+  { code: "AUD", symbol: "A$", label: "Australian Dollar (A$)" },
+  { code: "SGD", symbol: "S$", label: "Singapore Dollar (S$)" },
+  { code: "MYR", symbol: "RM", label: "Malaysian Ringgit (RM)" },
   { code: "INR", symbol: "₹", label: "Indian Rupee (₹)" },
   { code: "IDR", symbol: "Rp", label: "Indonesian Rupiah (Rp)", zeroDecimal: true },
-  { code: "JPY", symbol: "¥", label: "Japanese Yen (¥)", zeroDecimal: true },
-  { code: "MYR", symbol: "RM", label: "Malaysian Ringgit (RM)" },
-  { code: "PHP", symbol: "₱", label: "Philippine Peso (₱)" },
-  { code: "SGD", symbol: "S$", label: "Singapore Dollar (S$)" },
   { code: "THB", symbol: "฿", label: "Thai Baht (฿)" },
-  { code: "USD", symbol: "$", label: "US Dollar ($)" },
   { code: "VND", symbol: "₫", label: "Vietnamese Dong (₫)", zeroDecimal: true },
 ];
 
 // =============================================================================
 // LOCKED SUBSCRIPTION PRICING — see MONTHLY_PRICE_PHP / CURRENCIES above.
 // =============================================================================
-// The subscription price (₱1,699/month) is converted into every supported
-// currency ONE TIME, using the PHP mid-market exchange rate on the day this
-// table was written (13 Aug 2026), and the resulting number is then
-// HARDCODED here. That's the "fixed exchange rate lock" — a subscriber who
-// picks USD always sees the exact same USD number every day, even though
-// the real PHP↔USD rate moves daily; it never silently recalculates from a
-// live rate. This is a deliberate design choice: predictable billing beats
-// currency-accurate billing for a subscription price.
+// This is the official monthly list price for each supported currency, set
+// by the business (NOT a live/daily exchange-rate conversion). A subscriber
+// who picks USD always sees the exact same USD number every day — it never
+// silently recalculates from a moving exchange rate. This is a deliberate
+// design choice: predictable, round billing numbers beat currency-accurate
+// billing for a subscription price.
 //
-// EDIT ME: if you want to re-lock these to a fresher rate (e.g. once a
-// year, or if PHP moves a lot), just replace the numbers below — nothing
-// else in the app needs to change, since every screen reads from this table
-// instead of computing its own conversion. Whatever you charge via PayMongo
-// is still in PHP (PAYMONGO_LINK / PAYMONGO_LINK_REFERRAL settle in PHP —
-// that's what your Philippine payment processor supports), so these other-
-// currency amounts are the "what you'll pay in your currency" reference
-// shown to the subscriber; the actual PayMongo charge is the PHP amount.
+// EDIT ME: to change what a currency is billed, just replace the number
+// below — nothing else in the app needs to change, since every screen
+// (Settings, Upgrade/Subscribe) reads from this table instead of computing
+// its own conversion. Whatever you charge via PayMongo is still in PHP
+// (PAYMONGO_LINK / PAYMONGO_LINK_REFERRAL settle in PHP — that's what your
+// Philippine payment processor supports), so these other-currency amounts
+// are the "what you'll pay in your currency" reference shown to the
+// subscriber; the actual PayMongo charge is the PHP amount.
 const LOCKED_SUBSCRIPTION_PRICE_PHP = {
   PHP: 1699,
-  USD: 27.65,
-  EUR: 25.49,
-  GBP: 20.48,
-  JPY: 4061,
-  AUD: 39.25,
-  SGD: 35.68,
-  MYR: 116.21,
-  INR: 2406,
-  IDR: 450800,
-  THB: 898.77,
-  VND: 702000,
+  USD: 35.00,
+  EUR: 28.00,
+  GBP: 24.00,
+  JPY: 5200,
+  AUD: 53.00,
+  SGD: 47.00,
+  MYR: 155.00,
+  INR: 2950,
+  IDR: 550000,
+  THB: 1250,
+  VND: 875000,
 };
 
 // Formats a subscription-pricing amount (NOT a POS sale amount — see
@@ -838,6 +839,12 @@ export default function CafePOS() {
     })();
   }, [authUser?.id]);
 
+  const changeCurrency = useCallback(async (code) => {
+    setCurrencyCode(code);
+    const ok = await safeSet(scopedKey(CURRENCY_KEY, authUserIdRef.current), code);
+    if (!ok) notify("Couldn't save the currency — check connection and try again.", "err");
+  }, []);
+
   CURRENT_SYMBOL = (CURRENCIES.find((c) => c.code === currencyCode) || CURRENCIES[0]).symbol;
 
   const notify = useCallback((msg, type = "ok") => {
@@ -856,7 +863,7 @@ export default function CafePOS() {
   // never a bare `false` — so the sign-up screen can actually tell the owner
   // what went wrong (e.g. "you already have an account, log in instead")
   // instead of a generic "something went wrong, try again."
-  const signUp = useCallback(async ({ businessName, email, password, referralCode, currency }) => {
+  const signUp = useCallback(async ({ businessName, email, password, referralCode }) => {
     const cleanEmail = email.trim();
     const { data, error } = await supabase.auth.signUp({ email: cleanEmail, password });
     if (error) {
@@ -879,15 +886,6 @@ export default function CafePOS() {
     if (bizErr) {
       notify("Account created, but saving your business details failed: " + bizErr.message, "err");
     }
-
-    // The currency chosen on the sign-up form is locked in right here, the
-    // moment the account is created — before there's even a session (email
-    // confirmation may still be pending below). There's no changeCurrency
-    // path left anywhere in the app after this, so this is the only place
-    // CURRENCY_KEY is ever written.
-    const chosenCurrency = (CURRENCIES.find((c) => c.code === currency) || CURRENCIES.find((c) => c.code === "PHP")).code;
-    await safeSet(scopedKey(CURRENCY_KEY, user.id), chosenCurrency);
-    setCurrencyCode(chosenCurrency);
 
     if (referralCode && referralCode.trim()) {
       const { error: refErr } = await supabase.rpc("redeem_referral", {
@@ -1059,10 +1057,15 @@ export default function CafePOS() {
     // good, so it doesn't silently reapply to every future renewal.
     const isFirstPayment = accountRef.current?.subscriptionStatus !== "active";
     const periodEnd = new Date(Date.now() + SUBSCRIPTION_PERIOD_DAYS * MS_PER_DAY).toISOString();
+    // Every time a billing cycle starts (first payment OR a renewal), the
+    // 3% referral reward credit resets back to 0% for the new month — it
+    // does not accumulate or roll over. Fresh referrals made DURING the new
+    // cycle build the credit back up toward the *next* bill.
     const updates = {
       subscription_status: "active",
       subscription_period_end: periodEnd,
       payment_reference: referenceNote || null,
+      reward_credits: 0,
     };
     if (isFirstPayment) updates.discount_percent = 0;
     const { error } = await supabase.from("businesses").update(updates).eq("id", authUser.id);
@@ -1076,10 +1079,11 @@ export default function CafePOS() {
       subscriptionPeriodEnd: periodEnd,
       paymentReference: referenceNote || "",
       discountPercent: isFirstPayment ? 0 : (accountRef.current?.discountPercent || 0),
+      rewardCredits: 0,
     };
     accountRef.current = next;
     setAccount(next);
-    notify(isFirstPayment ? "You're upgraded — thanks for subscribing!" : "Renewed — thanks for staying with us!");
+    notify(isFirstPayment ? "You're upgraded — thanks for subscribing!" : "Renewed — thanks for staying with us! Your reward credit has reset to 0% for the new billing cycle.");
     return true;
   }, [authUser, notify]);
 
@@ -2166,6 +2170,7 @@ export default function CafePOS() {
           setConfirmReset={() => {}}
           resetAll={() => {}}
           currencyCode={currencyCode}
+          changeCurrency={() => {}}
           employees={[]}
           currentEmployee={null}
           selectEmployee={() => {}}
@@ -2193,6 +2198,7 @@ export default function CafePOS() {
         setConfirmReset={setConfirmReset}
         resetAll={resetAll}
         currencyCode={currencyCode}
+        changeCurrency={changeCurrency}
         employees={employees}
         currentEmployee={currentEmployee}
         selectEmployee={requestEmployeeChange}
@@ -2529,7 +2535,7 @@ function Shell({ children }) {
   );
 }
 
-function Header({ businessName, low, confirmReset, setConfirmReset, resetAll, currencyCode, employees, currentEmployee, selectEmployee, openEmployeeModal }) {
+function Header({ businessName, low, confirmReset, setConfirmReset, resetAll, currencyCode, changeCurrency, employees, currentEmployee, selectEmployee, openEmployeeModal }) {
   return (
     <header className="max-w-6xl mx-auto px-4 sm:px-6 pt-6 pb-3 flex items-start justify-between no-print">
       <div>
@@ -2560,13 +2566,15 @@ function Header({ businessName, low, confirmReset, setConfirmReset, resetAll, cu
             <AlertTriangle size={12} /> {low} low on stock
           </span>
         )}
-        <span
-          className="text-xs px-2.5 py-1.5 rounded-full border"
+        <select
+          value={currencyCode}
+          onChange={(e) => changeCurrency(e.target.value)}
+          className="text-xs px-2 py-1.5 rounded-full border"
           style={{ borderColor: "var(--line)", color: "var(--ink-soft)", background: "var(--surface)" }}
-          title="Currency — chosen at sign-up, can't be changed"
+          title="Currency"
         >
-          {currencyCode} {(CURRENCIES.find((c) => c.code === currencyCode) || CURRENCIES[0]).symbol}
-        </span>
+          {CURRENCIES.map((c) => <option key={c.code} value={c.code}>{c.code} {c.symbol}</option>)}
+        </select>
         <button
           onClick={() => (confirmReset ? resetAll() : setConfirmReset(true))}
           onBlur={() => setConfirmReset(false)}
@@ -5511,12 +5519,6 @@ function SignUpView({ onSignUp, onSwitchToLogin }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
-  // The billing/display currency is chosen once, right here, and can never
-  // be changed afterward (see changeCurrency having been removed from
-  // Header/Settings) — so the subscription price is only ever shown in the
-  // one currency the owner actually committed to at setup. Defaults to PHP
-  // since that's what PayMongo actually settles in.
-  const [currency, setCurrency] = useState("PHP");
   const [error, setError] = useState("");
   // True only when the error is specifically "this email already has an
   // account" — lets us show a one-click "Log in instead" link rather than
@@ -5535,7 +5537,7 @@ function SignUpView({ onSignUp, onSwitchToLogin }) {
     setBusy(true);
     // No referral code here — that's entered later, on the Subscribe popup,
     // alongside the price, once there's actually something to discount.
-    const result = await onSignUp({ businessName, email, password, referralCode: "", currency });
+    const result = await onSignUp({ businessName, email, password, referralCode: "" });
     setBusy(false);
     if (result !== true) {
       setError(result || "Couldn't create the account — check your connection and try again.");
@@ -5550,7 +5552,7 @@ function SignUpView({ onSignUp, onSwitchToLogin }) {
         <img src={LOGO_DATA_URL} alt="" className="h-14 w-auto mx-auto mb-4" style={{ objectFit: "contain" }} />
         <h1 className="display-font text-lg text-center mb-1" style={{ fontWeight: 600 }}>Set up your café</h1>
         <p className="text-xs text-center mb-5" style={{ color: "var(--ink-soft)" }}>
-          Create an owner account to get started. Your business details can be changed later in Settings — your currency can't, so pick carefully.
+          Create an owner account to get started. You can change any of this later in Settings.
         </p>
         <div className="space-y-3">
           <Field label="Business name">
@@ -5580,19 +5582,6 @@ function SignUpView({ onSignUp, onSwitchToLogin }) {
           </Field>
           <Field label="Confirm password">
             <PasswordInput value={confirm} onChange={setConfirm} onKeyDown={onEnter} placeholder="Retype password" />
-          </Field>
-          <Field label="Currency (permanent — can't be changed later)">
-            <select
-              value={currency}
-              onChange={(e) => setCurrency(e.target.value)}
-              className="w-full border rounded-lg px-3 py-2 text-sm"
-              style={{ borderColor: "var(--line)" }}
-            >
-              {CURRENCIES.map((c) => <option key={c.code} value={c.code}>{c.label}</option>)}
-            </select>
-            <p className="text-[11px] mt-1" style={{ color: "var(--ink-soft)" }}>
-              Your monthly subscription fee (and every price in your POS) will always be shown in this currency — it's locked in as soon as you create your account.
-            </p>
           </Field>
         </div>
         {error && (
@@ -5934,29 +5923,18 @@ function AutoSaveField({ label, value, onSave, type = "text", placeholder, minLe
 // Shown either as a full-page block (trial expired, onClose === null) or as
 // a dismissable modal (owner opened it voluntarily from the trial banner or
 // Settings, onClose is a function). Sends the owner to the PayMongo link —
-// which accepts GCash/Maya/local cards as well as international cards — and
-// then lets them self-report the payment reference so their account flips
-// to "active" right away. There's no PayMongo webhook wired up here (see
-// supabase-schema.sql notes), so reconcile references against the PayMongo
-// dashboard periodically.
+// which accepts GCash/Maya/local cards as well as international cards.
+// NOTE: the old self-report "I've paid — activate my account" button/flow
+// has been removed. There's no PayMongo webhook wired up (see
+// supabase-schema.sql notes), so `onConfirm`/markSubscriptionActive — which
+// still flips subscription_status to "active" and resets reward credits for
+// the new billing cycle — now needs to be triggered another way (e.g. an
+// admin/back-office action, or a webhook you add later) once you've
+// reconciled a payment against the PayMongo dashboard or a manual transfer.
 function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onApplyCode, onClose, onLogOut }) {
-  const [reference, setReference] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
   const [code, setCode] = useState("");
   const [codeBusy, setCodeBusy] = useState(false);
   const [codeError, setCodeError] = useState("");
-
-  const confirm = async () => {
-    if (busy) return;
-    if (!reference.trim()) { setError("Enter the reference number or email from your PayMongo receipt (or your manual payment)."); return; }
-    setError("");
-    setBusy(true);
-    const ok = await onConfirm(reference.trim());
-    setBusy(false);
-    if (!ok) setError("Couldn't confirm the upgrade — check your connection and try again.");
-    else if (onClose) onClose();
-  };
 
   const applyCode = async () => {
     if (codeBusy) return;
@@ -6041,7 +6019,7 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
         {discountPercent > 0 && (
           <div className="flex items-center justify-between text-sm mt-1.5">
             <span style={{ color: "#2F6B45" }}>
-              {hasSubscribedBefore ? `Earned reward credit (${discountPercent}%)` : `Referral discount (${discountPercent}%)`}
+              {hasSubscribedBefore ? `Earned reward credit (${discountPercent}%, this cycle only)` : `Referral discount (${discountPercent}% off, first month only)`}
             </span>
             <span style={{ color: "#2F6B45" }}>−{fmt(discountAmount)}</span>
           </div>
@@ -6124,28 +6102,6 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
         </>
       )}
 
-      <div className="mt-5 pt-4" style={{ borderTop: "1px solid var(--line)" }}>
-        <Field label="Already paid? Enter your payment reference">
-          <input
-            value={reference}
-            onChange={(e) => setReference(e.target.value)}
-            placeholder="Reference number or receipt email"
-            className="w-full border rounded-lg px-3 py-2 text-sm"
-            style={{ borderColor: "var(--line)" }}
-          />
-        </Field>
-        {error && <p className="text-xs mt-2" style={{ color: "var(--alert)" }}>{error}</p>}
-        <button
-          type="button"
-          onClick={confirm}
-          disabled={busy}
-          className="w-full mt-3 py-2.5 rounded-lg text-sm font-medium border"
-          style={{ borderColor: "var(--primary)", color: "var(--primary)", opacity: busy ? 0.7 : 1 }}
-        >
-          {busy ? "Confirming…" : "I've paid — activate my account"}
-        </button>
-      </div>
-
       <p className="text-[11px] text-center mt-5" style={{ color: "var(--ink-soft)" }}>
         Questions about billing? Email{" "}
         <a href={`mailto:${SUPPORT_EMAIL}`} style={{ color: "var(--primary)" }}>{SUPPORT_EMAIL}</a>
@@ -6222,6 +6178,15 @@ function SettingsView({ account, onUpdateField, onLogOut, onDeleteAccount, trial
   const updatedRemainingBill = nextBillAmount - earnedCreditAmount;
   const fmt = (n) => formatSubscriptionAmount(n, currencyCode);
 
+  // ---- Pricing preview for a not-yet-subscribed owner ----
+  // If they've already redeemed a referral code before paying, show the
+  // "from → to" price (full price crossed out → discounted first-month
+  // price) right here in Settings, not just after opening the Upgrade
+  // popup. The 25% signup discount only ever applies to the FIRST month.
+  const preSignupDiscountPercent = account?.discountPercent || 0;
+  const preSignupDiscountAmount = nextBillAmount * (preSignupDiscountPercent / 100);
+  const preSignupFinalPrice = nextBillAmount - preSignupDiscountAmount;
+
   return (
     <div className="max-w-md">
       <h2 className="display-font text-xl mb-1 flex items-center gap-2" style={{ fontWeight: 600 }}>
@@ -6275,13 +6240,43 @@ function SettingsView({ account, onUpdateField, onLogOut, onDeleteAccount, trial
           )}
         </div>
         {!trialInfo?.isSubscribed && (
-          <button
-            onClick={openUpgrade}
-            className="w-full mt-3 py-2 rounded-lg text-xs font-medium"
-            style={{ background: "var(--primary)", color: "#fff" }}
-          >
-            Upgrade now
-          </button>
+          <>
+            {/* ---- Monthly fee preview — shown right here as soon as the
+                owner is looking at the upgrade option, in their chosen
+                currency. If a referral code was already applied, this shows
+                the "from → to" price so the discount is obvious before they
+                even open the Subscribe screen. ---- */}
+            <div className="rounded-lg p-3 mt-3" style={{ background: "var(--bg)" }}>
+              {preSignupDiscountPercent > 0 ? (
+                <>
+                  <div className="flex items-center justify-between text-xs">
+                    <span style={{ color: "var(--ink-soft)" }}>Monthly fee</span>
+                    <span className="line-through" style={{ color: "var(--ink-soft)" }}>{fmt(nextBillAmount)}/mo</span>
+                  </div>
+                  <div className="flex items-center justify-between text-xs mt-1">
+                    <span style={{ color: "#2F6B45" }}>Referral discount ({preSignupDiscountPercent}% off, first month only)</span>
+                    <span style={{ color: "#2F6B45" }}>−{fmt(preSignupDiscountAmount)}</span>
+                  </div>
+                  <div className="flex items-center justify-between text-sm font-semibold mt-2 pt-2" style={{ borderTop: "1px dashed var(--line)" }}>
+                    <span>Your first month</span>
+                    <span>{fmt(preSignupFinalPrice)}<span className="text-xs font-normal">/mo</span></span>
+                  </div>
+                </>
+              ) : (
+                <div className="flex items-center justify-between text-sm">
+                  <span style={{ color: "var(--ink-soft)" }}>Monthly fee</span>
+                  <span className="font-semibold">{fmt(nextBillAmount)}<span className="text-xs font-normal" style={{ color: "var(--ink-soft)" }}>/mo</span></span>
+                </div>
+              )}
+            </div>
+            <button
+              onClick={openUpgrade}
+              className="w-full mt-3 py-2 rounded-lg text-xs font-medium"
+              style={{ background: "var(--primary)", color: "#fff" }}
+            >
+              Upgrade now — {fmt(preSignupDiscountPercent > 0 ? preSignupFinalPrice : nextBillAmount)}/mo
+            </button>
+          </>
         )}
       </div>
 
@@ -6308,8 +6303,16 @@ function SettingsView({ account, onUpdateField, onLogOut, onDeleteAccount, trial
             </button>
           </div>
           <p className="text-[11px]" style={{ color: "var(--ink-soft)" }}>
-            Share this code — new sign-ups who use it get {REFERRAL_DISCOUNT_PERCENT}% off, and you earn a {REFERRAL_REWARD_PERCENT}% reward credit every time it's used.
+            Share this code — new sign-ups who use it get {REFERRAL_DISCOUNT_PERCENT}% off their first month, and you earn a {REFERRAL_REWARD_PERCENT}% reward credit every time it's used.
           </p>
+
+          {/* ---- Current-month referral explainer ---- */}
+          <div className="rounded-lg p-3" style={{ background: "var(--bg)" }}>
+            <div className="text-[11px] font-medium mb-1">Current month</div>
+            <p className="text-[11px]" style={{ color: "var(--ink-soft)" }}>
+              Every time a new user signs up with your referral code, you earn {REFERRAL_REWARD_PERCENT}% off your immediate current billing cycle. When the month ends and the next billing cycle begins, that {REFERRAL_REWARD_PERCENT}% discount resets to 0% for the new month until fresh referrals are made during that cycle.
+            </p>
+          </div>
           <div className="flex gap-3 pt-1">
             <div className="flex-1 rounded-lg p-3 text-center" style={{ background: "var(--bg)" }}>
               <div className="text-lg font-semibold" style={{ fontFamily: "var(--display-font, inherit)" }}>{account?.referralCount || 0}</div>
@@ -6345,6 +6348,10 @@ function SettingsView({ account, onUpdateField, onLogOut, onDeleteAccount, trial
               <span>{fmt(updatedRemainingBill)}</span>
             </div>
           </div>
+
+          <p className="text-[10px]" style={{ color: "var(--ink-soft)" }}>
+            <b>Note on referral credits:</b> The {REFERRAL_REWARD_PERCENT}% reward credit applies only to the current billing month and does not accumulate or roll over to future months. It resets to 0% at the start of each new billing cycle.
+          </p>
         </div>
       ) : (
         <div className="rounded-xl border p-4 sm:p-5 mt-4" style={{ borderColor: "var(--line)", background: "var(--surface)" }}>
@@ -6352,7 +6359,7 @@ function SettingsView({ account, onUpdateField, onLogOut, onDeleteAccount, trial
             <Store size={13} /> Referral code
           </div>
           <p className="text-[11px] mt-2" style={{ color: "var(--ink-soft)" }}>
-            Your referral code unlocks once you're a paying subscriber — subscribe to get your own code to share, and start earning a {REFERRAL_REWARD_PERCENT}% reward credit every time it's used.
+            Your referral code unlocks once you're a paying subscriber — subscribe to get your own code to share, and start earning a {REFERRAL_REWARD_PERCENT}% reward credit every time it's used. New users who sign up with your code get {REFERRAL_DISCOUNT_PERCENT}% off their first month.
           </p>
         </div>
       )}
