@@ -1,25 +1,31 @@
 /* =============================================================================
    ONE-TIME SUPABASE SETUP — run this once, then ignore it forever
    =============================================================================
-   This app's "Delete account" button (Settings → Danger zone) needs a small
-   database function to exist in your Supabase project before it will work.
+   This app needs a few small database functions/columns to exist in your
+   Supabase project before "Delete account" and the referral program will
+   work correctly.
 
    WHY THIS CAN'T LIVE INSIDE THE APP ITSELF:
    The public API key shipped in this file (see SUPABASE_ANON_KEY below) is
-   deliberately powerless to delete a login/auth user directly — if it could,
-   anyone could delete anyone's account. The only safe way to allow "delete
-   my own account" is a database function that runs with elevated privileges
-   but is hard-coded to only ever touch auth.uid() — the caller's own row.
-   That function has to be created inside Supabase itself, not shipped as
-   browser code, the same way you'd never ship a database password to the
-   browser. So: one copy-paste, one time, in a different place than this file.
+   deliberately powerless to delete a login/auth user directly, or to hand
+   out discounts to itself — if it could, anyone could delete anyone's
+   account, or write themselves a 100% coupon from the browser console. The
+   only safe way to allow "delete my own account" or "redeem this referral
+   code" is a database function that runs with elevated privileges but is
+   hard-coded to only ever do the one safe thing it's meant to do. That
+   function has to be created inside Supabase itself, not shipped as browser
+   code, the same way you'd never ship a database password to the browser.
+   So: one copy-paste, one time, in a different place than this file.
 
    HOW TO RUN IT:
    1. Open your project at https://supabase.com/dashboard
    2. Left sidebar → SQL Editor → "New query"
    3. Paste everything between the START/END markers below
    4. Click "Run"
-   You only ever have to do this once per Supabase project.
+   You only ever have to do this once per Supabase project. If you ever
+   change REFERRAL_DISCOUNT_PERCENT or REFERRAL_REWARD_PERCENT below, update
+   the matching numbers in this SQL too (they're intentionally hard-coded on
+   the server, not read from the client, so the browser can't fake them).
 
    ---- START: paste into Supabase SQL Editor ----
 
@@ -40,6 +46,83 @@
 
    -- Let any logged-in user call it (it can still only affect their own row).
    grant execute on function delete_own_account() to authenticated;
+
+   -- Tracks when the current paid period ends, so the app knows when a
+   -- renewal (not just the free trial) is due. Safe to run even if this
+   -- column already exists.
+   alter table public.businesses
+     add column if not exists subscription_period_end timestamptz;
+
+   -- Redeems someone else's referral code: gives the CALLER a one-time 25%
+   -- discount on their first payment, and gives the CODE OWNER a stacking
+   -- 3% reward credit that keeps applying to their own future renewals.
+   -- Guards against every way someone could try to farm their own code:
+   --   - can't redeem your own code (by account id)
+   --   - can't redeem a code whose owner shares your account's email either
+   --     (belt-and-suspenders — Supabase Auth already blocks duplicate
+   --     emails, so this mainly catches a business row whose email field
+   --     drifted out of sync with its auth email)
+   --   - can only be redeemed once per account, ever
+   --   - can only be redeemed before your FIRST payment — it's a new-signup
+   --     perk, not something you can retroactively apply once you're an
+   --     active subscriber
+   create or replace function redeem_referral(p_code text)
+   returns void
+   language plpgsql
+   security definer
+   set search_path = public
+   as $$
+   declare
+     v_caller_id uuid := auth.uid();
+     v_caller_email text;
+     v_caller_status text;
+     v_caller_referred_by uuid;
+     v_referrer_id uuid;
+     v_referrer_email text;
+   begin
+     if v_caller_id is null then
+       raise exception 'You must be logged in to redeem a referral code.';
+     end if;
+
+     select email, subscription_status, referred_by
+       into v_caller_email, v_caller_status, v_caller_referred_by
+       from public.businesses
+       where id = v_caller_id;
+
+     if v_caller_status = 'active' then
+       raise exception 'Referral codes can only be used before your first payment.';
+     end if;
+
+     if v_caller_referred_by is not null then
+       raise exception 'You''ve already redeemed a referral code.';
+     end if;
+
+     select id, email into v_referrer_id, v_referrer_email
+       from public.businesses
+       where upper(referral_code) = upper(trim(p_code));
+
+     if v_referrer_id is null then
+       raise exception 'Invalid referral code.';
+     end if;
+
+     if v_referrer_id = v_caller_id
+        or (v_referrer_email is not null and v_caller_email is not null
+            and lower(v_referrer_email) = lower(v_caller_email)) then
+       raise exception 'You can''t use your own referral code.';
+     end if;
+
+     update public.businesses
+       set discount_percent = 25, referred_by = v_referrer_id
+       where id = v_caller_id;
+
+     update public.businesses
+       set reward_credits = coalesce(reward_credits, 0) + 3,
+           referral_count = coalesce(referral_count, 0) + 1
+       where id = v_referrer_id;
+   end;
+   $$;
+
+   grant execute on function redeem_referral(text) to authenticated;
 
    ---- END: paste into Supabase SQL Editor ----
 ============================================================================= */
@@ -74,20 +157,36 @@ const WASTE_KEY = "cafe_pos_waste_v1";
 // supabase-schema.sql). Auth, the trial clock, referral codes/rewards, and
 // subscription status all live in Supabase so an owner's account works the
 // same on every device, not just the one they signed up on.
+// ONE-TIME SETUP for "Forgot password" — Supabase only sends people back to
+// URLs you've explicitly allowed. In your Supabase dashboard, go to
+// Authentication → URL Configuration, and add the URL where this app is
+// hosted (e.g. https://your-app-url.com) under "Redirect URLs". Without
+// this, the reset-password email link will fail to bring the owner back
+// into the app.
 const SUPABASE_URL = "https://tdgcyffbblxxccsujtdy.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_GUX0Y4Nyr-zeFAHB2IB0Xw_K7syHDWY";
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
-// Your PayMongo payment link. PayMongo link checkouts accept both local
-// (GCash, Maya, cards issued in PH) and international cards, so one link
-// covers both audiences.
+// Your PayMongo payment link, for a full-price payment. PayMongo link
+// checkouts accept both local (GCash, Maya, cards issued in PH) and
+// international cards, so one link covers both audiences.
 const PAYMONGO_LINK = "https://pm.link/org-KtaTpiR8vpcqBk2K2zkWjuxr/1VfePGD";
+
+// EDIT ME: a SECOND PayMongo Payment Link, created at the referral-discounted
+// price (see MONTHLY_PRICE_PHP and REFERRAL_DISCOUNT_PERCENT below — right
+// now that's ₱1,699 × 75% = ₱1,274.25, so create this link for ₱1,274.25 or
+// ₱1,275 if your PayMongo account only takes whole pesos). This is what
+// actually charges a new, referred subscriber the discounted amount — a
+// Payment Link is a fixed price, so the discount shown in the app has to be
+// backed by a real link at that exact price, or the discount would just be
+// cosmetic and they'd still get charged full price at checkout.
+const PAYMONGO_LINK_REFERRAL = "https://pm.link/org-KtaTpiR8vpcqBk2K2zkWjuxr/REPLACE_WITH_DISCOUNTED_LINK";
 
 // EDIT ME: your actual monthly subscription price, shown on the Subscribe
 // popup. This is just a display number — it doesn't charge anything by
 // itself, PayMongo's own checkout page (opened via PAYMONGO_LINK above)
 // is what actually sets the real amount charged. Keep the two in sync.
-const MONTHLY_PRICE_PHP = 499;
+const MONTHLY_PRICE_PHP = 1699;
 
 // Support contact shown on the sign-up/login screens, the upgrade screen,
 // and in Settings, so owners always know where to send billing or account
@@ -98,11 +197,40 @@ const SUPPORT_EMAIL = "opsteward.support@gmail.com";
 const TRIAL_DAYS = 3;
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
-// Referral program: the new subscriber gets this % off, and the referrer
-// (the owner of the code that was used) earns this % as a stacking reward
-// credit every time their code is used by someone new.
+// How long a paid period lasts before renewal is due. Since there's no
+// PayMongo webhook wired up (see markSubscriptionActive), this is what
+// actually creates a "next bill" for reward credits to apply to — without
+// it, "active" would mean active forever with nothing to ever discount.
+const SUBSCRIPTION_PERIOD_DAYS = 30;
+
+// Referral program:
+//  - REFERRAL_DISCOUNT_PERCENT: a ONE-TIME discount a brand-new subscriber
+//    gets on their very first payment, if they redeemed someone else's code
+//    before paying. It's consumed after that first payment (see
+//    markSubscriptionActive) — it never applies to renewals.
+//  - REFERRAL_REWARD_PERCENT: what the CODE OWNER earns, every time their
+//    code is redeemed by someone new. This one stacks and keeps applying as
+//    a discount to the code owner's own renewals going forward (see
+//    UpgradeView) — that's the "next bill" it reflects on.
+// Both numbers are enforced server-side in the redeem_referral() SQL
+// function at the top of this file — these constants are just what the UI
+// displays, so keep them in sync if you ever change the SQL.
 const REFERRAL_DISCOUNT_PERCENT = 25;
 const REFERRAL_REWARD_PERCENT = 3;
+// Safety cap on how much of the price reward credits can ever discount, so
+// years of referrals can't silently reach 100%+ off. Purely a display/UI
+// cap — raise it if you want a more generous ceiling.
+const MAX_REWARD_CREDIT_PERCENT = 60;
+
+// EDIT ME: shown when a subscriber's exact discounted amount (e.g. a
+// renewal with reward credits applied) doesn't match either of the two
+// fixed PayMongo links above. PayMongo Payment Links are a fixed price
+// each, so an arbitrary, ever-changing reward-credit percentage can't be
+// charged through a static link without a backend that talks to PayMongo's
+// API directly. Until you build that, collect these payments manually
+// (GCash, bank transfer, in person) for the exact discounted amount shown.
+const MANUAL_PAYMENT_NOTE =
+  "This discount doesn't match a fixed PayMongo link, so pay this exact amount via GCash or bank transfer, then enter your reference below.";
 // Order numbers must never repeat, even after old sales are purged from
 // RETENTION_MONTHS — so this counter is tracked independently of sales.length
 // (which would otherwise shrink and start reissuing old numbers).
@@ -353,6 +481,12 @@ export default function CafePOS() {
   const [loggedIn, setLoggedIn] = useState(false);
   const [authChecked, setAuthChecked] = useState(false);
   const [authMode, setAuthMode] = useState("login"); // 'login' | 'signup', toggled on the auth screen
+  // True while the owner is in the middle of a "forgot password" flow —
+  // Supabase fires a PASSWORD_RECOVERY auth event when they land back on the
+  // app from the reset-password email link. While this is true we show a
+  // dedicated "choose a new password" screen instead of either the login
+  // form or the main app, even though a session technically exists.
+  const [passwordRecovery, setPasswordRecovery] = useState(false);
   const accountRef = useRef(null);
   // Owner opened the Upgrade screen voluntarily (e.g. from the trial banner
   // or Settings) while still inside their trial window. Once the trial
@@ -381,6 +515,7 @@ export default function CafePOS() {
       referralCount: data.referral_count || 0,
       trialStartDate: data.trial_start_date,
       subscriptionStatus: data.subscription_status || "trial",
+      subscriptionPeriodEnd: data.subscription_period_end || null,
       paymentReference: data.payment_reference || "",
     };
   }, []);
@@ -410,7 +545,13 @@ export default function CafePOS() {
 
     // Keeps every open tab/device in sync — e.g. logging out on one device,
     // or a password/email change, is reflected everywhere immediately.
-    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
+    const { data: listener } = supabase.auth.onAuthStateChange((event, session) => {
+      if (event === "PASSWORD_RECOVERY") {
+        // Clicking the "reset your password" email link lands here with a
+        // real session already established — don't drop the owner straight
+        // into the app, send them to the "choose a new password" screen.
+        if (mounted) setPasswordRecovery(true);
+      }
       applySession(session);
     });
 
@@ -422,17 +563,23 @@ export default function CafePOS() {
 
   // Trial / subscription status, recomputed whenever the account changes.
   // subscriptionStatus becomes "active" once an upgrade payment is
-  // confirmed (see markSubscriptionActive), which bypasses the trial clock
-  // entirely.
+  // confirmed (see markSubscriptionActive) and stays "active" from then on
+  // — but that alone would mean "active forever" with no next bill for
+  // reward credits to ever apply to. subscriptionPeriodEnd is what actually
+  // creates a recurring "renewal due" moment: once it passes, `expired`
+  // flips back on (reusing the same hard-block gate the trial uses) and
+  // `isSubscribed` flips off, until they renew and pay again.
   const trialInfo = useMemo(() => {
-    if (!account) return { daysLeft: TRIAL_DAYS, elapsedDays: 0, expired: false, isSubscribed: false };
+    if (!account) return { daysLeft: TRIAL_DAYS, elapsedDays: 0, expired: false, isSubscribed: false, renewalDue: false };
     if (account.subscriptionStatus === "active") {
-      return { daysLeft: null, elapsedDays: null, expired: false, isSubscribed: true };
+      const periodEndMs = account.subscriptionPeriodEnd ? new Date(account.subscriptionPeriodEnd).getTime() : null;
+      const renewalDue = Number.isFinite(periodEndMs) && Date.now() >= periodEndMs;
+      return { daysLeft: null, elapsedDays: null, expired: renewalDue, isSubscribed: !renewalDue, renewalDue, periodEndMs };
     }
     const start = new Date(account.trialStartDate).getTime();
     const elapsedDays = Number.isFinite(start) ? Math.floor((Date.now() - start) / MS_PER_DAY) : 0;
     const daysLeft = Math.max(0, TRIAL_DAYS - elapsedDays);
-    return { daysLeft, elapsedDays, expired: elapsedDays >= TRIAL_DAYS, isSubscribed: false };
+    return { daysLeft, elapsedDays, expired: elapsedDays >= TRIAL_DAYS, isSubscribed: false, renewalDue: false };
   }, [account]);
 
   useEffect(() => {
@@ -615,6 +762,42 @@ export default function CafePOS() {
     setLoggedIn(false);
   }, []);
 
+  // "Forgot password" — sends the owner an email with a link back into this
+  // app; clicking it triggers the PASSWORD_RECOVERY event handled above.
+  // Returns `true` on success, or a plain-English error STRING on failure.
+  // Deliberately doesn't reveal whether the email is actually registered
+  // (Supabase's own response doesn't distinguish this either) — the login
+  // screen shows the same "check your email" message either way.
+  const requestPasswordReset = useCallback(async (email) => {
+    const cleanEmail = (email || "").trim();
+    if (!cleanEmail) return "Enter your email first.";
+    const { error } = await supabase.auth.resetPasswordForEmail(cleanEmail, {
+      redirectTo: window.location.href,
+    });
+    if (error) return error.message || "Couldn't send the reset email — please try again.";
+    return true;
+  }, []);
+
+  // Called from the "choose a new password" screen once a recovery session
+  // is active. Sets the new password, then drops the owner into the app
+  // (the session from the recovery link is a real, valid session).
+  const completePasswordRecovery = useCallback(async (newPassword) => {
+    if (!newPassword || newPassword.length < 4) return "Password must be at least 4 characters.";
+    const { error } = await supabase.auth.updateUser({ password: newPassword });
+    if (error) return error.message || "Couldn't update your password — please try again.";
+    setPasswordRecovery(false);
+    notify("Password updated — you're logged in.");
+    return true;
+  }, [notify]);
+
+  // Bail out of the recovery flow without changing the password — signs out
+  // so the owner lands back on a normal login screen instead of being left
+  // half-authenticated in limbo.
+  const cancelPasswordRecovery = useCallback(async () => {
+    setPasswordRecovery(false);
+    await supabase.auth.signOut();
+  }, []);
+
   // Permanently deletes the signed-in owner's account: their `businesses`
   // row and their Supabase Auth user. The anon key can't delete an auth
   // user directly, so this calls a Postgres function (delete_own_account,
@@ -679,39 +862,63 @@ export default function CafePOS() {
     }
   }, [authUser, notify]);
 
-  // Called from the Upgrade screen once the owner has paid via the PayMongo
-  // link. There's no PayMongo webhook wired up here (that needs a small
-  // server function — see supabase-schema.sql's notes), so this is a
-  // self-reported confirmation: it flips subscription_status to "active"
-  // and stores whatever reference the owner typed in, for you to reconcile
-  // against PayMongo's dashboard.
+  // Called from the Upgrade screen once the owner has paid via PayMongo (or
+  // manually — see MANUAL_PAYMENT_NOTE). There's no PayMongo webhook wired
+  // up here (that needs a small server function — see supabase-schema.sql's
+  // notes), so this is a self-reported confirmation: it flips
+  // subscription_status to "active", starts a new SUBSCRIPTION_PERIOD_DAYS
+  // period, and stores whatever reference the owner typed in, for you to
+  // reconcile against PayMongo's dashboard.
   const markSubscriptionActive = useCallback(async (referenceNote) => {
     if (!authUser) return false;
-    const { error } = await supabase
-      .from("businesses")
-      .update({ subscription_status: "active", payment_reference: referenceNote || null })
-      .eq("id", authUser.id);
+    // First payment ever (was still on "trial") vs. a renewal of an
+    // already-active account. Only a first payment can be discounted by the
+    // one-time referral signup discount — and once used, it's gone for
+    // good, so it doesn't silently reapply to every future renewal.
+    const isFirstPayment = accountRef.current?.subscriptionStatus !== "active";
+    const periodEnd = new Date(Date.now() + SUBSCRIPTION_PERIOD_DAYS * MS_PER_DAY).toISOString();
+    const updates = {
+      subscription_status: "active",
+      subscription_period_end: periodEnd,
+      payment_reference: referenceNote || null,
+    };
+    if (isFirstPayment) updates.discount_percent = 0;
+    const { error } = await supabase.from("businesses").update(updates).eq("id", authUser.id);
     if (error) {
       notify("Couldn't confirm the upgrade — " + error.message, "err");
       return false;
     }
-    const next = { ...(accountRef.current || {}), subscriptionStatus: "active", paymentReference: referenceNote || "" };
+    const next = {
+      ...(accountRef.current || {}),
+      subscriptionStatus: "active",
+      subscriptionPeriodEnd: periodEnd,
+      paymentReference: referenceNote || "",
+      discountPercent: isFirstPayment ? 0 : (accountRef.current?.discountPercent || 0),
+    };
     accountRef.current = next;
     setAccount(next);
-    notify("You're upgraded — thanks for subscribing!");
+    notify(isFirstPayment ? "You're upgraded — thanks for subscribing!" : "Renewed — thanks for staying with us!");
     return true;
   }, [authUser, notify]);
 
   // Applies a referral/discount code from the Subscribe popup, for an owner
-  // who's already signed in (unlike the old signup-time flow, this can be
-  // used any time before they pay). Redeemed server-side via the same
-  // redeem_referral() function used at signup, so a client can't fake a
-  // discount for itself. Returns `true` on success, or an error STRING the
-  // popup can show directly (e.g. "Invalid referral code").
+  // who's already signed in, before their first payment (unlike the old
+  // signup-time flow, this can be used any time before they pay — but only
+  // before that first payment; see redeem_referral() in the SQL setup block
+  // at the top of this file, which is the actual source of truth for all of
+  // this, since a client can't be trusted to award itself a discount).
+  // Returns `true` on success, or an error STRING the popup can show
+  // directly (e.g. "Invalid referral code").
   const applyReferralCode = useCallback(async (code) => {
     if (!authUser) return "You need to be logged in to apply a code.";
     const clean = (code || "").trim();
     if (!clean) return "Enter a code first.";
+    // Fast, friendly client-side check for the obvious case (typing your
+    // own code) — redeem_referral() still enforces this for real server-side,
+    // including the same check by email, so this is just a quicker "no".
+    if (accountRef.current?.referralCode && clean.toUpperCase() === accountRef.current.referralCode.toUpperCase()) {
+      return "That's your own referral code — it can't be used on your own account.";
+    }
     const { error } = await supabase.rpc("redeem_referral", { p_code: clean.toUpperCase() });
     if (error) return error.message || "That code isn't valid.";
     const biz = await fetchBusiness(authUser.id);
@@ -719,7 +926,7 @@ export default function CafePOS() {
       accountRef.current = biz;
       setAccount(biz);
     }
-    notify(`Code applied — you now have ${biz?.discountPercent || REFERRAL_DISCOUNT_PERCENT}% off.`);
+    notify(`Code applied — you'll get ${biz?.discountPercent || REFERRAL_DISCOUNT_PERCENT}% off your first payment.`);
     return true;
   }, [authUser, notify, fetchBusiness]);
 
@@ -1733,11 +1940,19 @@ export default function CafePOS() {
     );
   }
 
+  if (passwordRecovery) {
+    return (
+      <Shell>
+        <ResetPasswordView onConfirm={completePasswordRecovery} onCancel={cancelPasswordRecovery} />
+      </Shell>
+    );
+  }
+
   if (!loggedIn) {
     return (
       <Shell>
         {authMode === "login" ? (
-          <LoginView account={account} onLogIn={logIn} onSwitchToSignUp={() => setAuthMode("signup")} />
+          <LoginView account={account} onLogIn={logIn} onResetPassword={requestPasswordReset} onSwitchToSignUp={() => setAuthMode("signup")} />
         ) : (
           <SignUpView onSignUp={signUp} onSwitchToLogin={() => setAuthMode("login")} />
         )}
@@ -5225,11 +5440,14 @@ function SignUpView({ onSignUp, onSwitchToLogin }) {
 // The default screen shown on first load and any time the owner isn't
 // logged in on this device — a normal login form, with a link over to
 // SignUpView for anyone who genuinely needs a new account.
-function LoginView({ account, onLogIn, onSwitchToSignUp }) {
+function LoginView({ account, onLogIn, onResetPassword, onSwitchToSignUp }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  // Toggles the login form over to a lightweight "send me a reset link"
+  // form, reusing whatever email the owner already typed.
+  const [forgotMode, setForgotMode] = useState(false);
 
   const submit = async () => {
     if (busy) return;
@@ -5240,6 +5458,18 @@ function LoginView({ account, onLogIn, onSwitchToSignUp }) {
     if (result !== true) setError(result || "Email or password is incorrect.");
   };
   const onEnter = (e) => { if (e.key === "Enter") submit(); };
+
+  if (forgotMode) {
+    return (
+      <AuthCard>
+        <ForgotPasswordForm
+          initialEmail={email}
+          onSend={onResetPassword}
+          onBack={() => setForgotMode(false)}
+        />
+      </AuthCard>
+    );
+  }
 
   return (
     <AuthCard>
@@ -5262,9 +5492,19 @@ function LoginView({ account, onLogIn, onSwitchToSignUp }) {
               style={{ borderColor: "var(--line)" }}
             />
           </Field>
-          <Field label="Password">
-            <PasswordInput value={password} onChange={setPassword} onKeyDown={onEnter} placeholder="Your password" />
-          </Field>
+          <div>
+            <Field label="Password">
+              <PasswordInput value={password} onChange={setPassword} onKeyDown={onEnter} placeholder="Your password" />
+            </Field>
+            <button
+              type="button"
+              onClick={() => { setError(""); setForgotMode(true); }}
+              className="text-[11px] underline mt-1.5"
+              style={{ color: "var(--ink-soft)" }}
+            >
+              Forgot password?
+            </button>
+          </div>
         </div>
         {error && <p className="text-xs mt-3" style={{ color: "var(--alert)" }}>{error}</p>}
         <button
@@ -5280,6 +5520,144 @@ function LoginView({ account, onLogIn, onSwitchToSignUp }) {
           New here?{" "}
           <button type="button" onClick={onSwitchToSignUp} className="underline font-medium" style={{ color: "var(--primary)" }}>
             Create an account
+          </button>
+        </p>
+      </div>
+    </AuthCard>
+  );
+}
+
+// Inline "send me a reset link" form, shown in place of the login form when
+// the owner taps "Forgot password?". Always ends in the same neutral
+// confirmation message on success, whether or not that email actually has
+// an account — Supabase's API doesn't distinguish the two either, so there's
+// nothing more specific to tell them.
+function ForgotPasswordForm({ initialEmail, onSend, onBack }) {
+  const [email, setEmail] = useState(initialEmail || "");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [sent, setSent] = useState(false);
+
+  const submit = async () => {
+    if (busy) return;
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) { setError("Enter a valid email address."); return; }
+    setError("");
+    setBusy(true);
+    const result = await onSend(email);
+    setBusy(false);
+    if (result === true) setSent(true);
+    else setError(result || "Couldn't send the reset email — please try again.");
+  };
+  const onEnter = (e) => { if (e.key === "Enter") submit(); };
+
+  if (sent) {
+    return (
+      <div>
+        <img src={LOGO_DATA_URL} alt="" className="h-14 w-auto mx-auto mb-4" style={{ objectFit: "contain" }} />
+        <h1 className="display-font text-lg text-center mb-1" style={{ fontWeight: 600 }}>Check your email</h1>
+        <p className="text-xs text-center mb-5" style={{ color: "var(--ink-soft)" }}>
+          If an account exists for <b>{email.trim()}</b>, we've sent a link to reset the password. Open it on this device to choose a new one.
+        </p>
+        <button
+          type="button"
+          onClick={onBack}
+          className="w-full py-2.5 rounded-lg text-sm font-medium border"
+          style={{ borderColor: "var(--line)", color: "var(--ink)" }}
+        >
+          Back to log in
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <img src={LOGO_DATA_URL} alt="" className="h-14 w-auto mx-auto mb-4" style={{ objectFit: "contain" }} />
+      <h1 className="display-font text-lg text-center mb-1" style={{ fontWeight: 600 }}>Reset your password</h1>
+      <p className="text-xs text-center mb-5" style={{ color: "var(--ink-soft)" }}>
+        Enter the email you registered with and we'll send you a link to set a new password.
+      </p>
+      <Field label="Email">
+        <input
+          type="email"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+          onKeyDown={onEnter}
+          placeholder="you@example.com"
+          autoFocus
+          className="w-full border rounded-lg px-3 py-2 text-sm"
+          style={{ borderColor: "var(--line)" }}
+        />
+      </Field>
+      {error && <p className="text-xs mt-3" style={{ color: "var(--alert)" }}>{error}</p>}
+      <button
+        type="button"
+        onClick={submit}
+        disabled={busy}
+        className="w-full mt-5 py-2.5 rounded-lg text-sm font-medium"
+        style={{ background: "var(--primary)", color: "#fff", opacity: busy ? 0.7 : 1 }}
+      >
+        {busy ? "Sending…" : "Send reset link"}
+      </button>
+      <p className="text-xs text-center mt-4" style={{ color: "var(--ink-soft)" }}>
+        <button type="button" onClick={onBack} className="underline font-medium" style={{ color: "var(--primary)" }}>
+          Back to log in
+        </button>
+      </p>
+    </div>
+  );
+}
+
+// Shown when the owner arrives back in the app via the password-reset email
+// link (a PASSWORD_RECOVERY session). They must set a new password before
+// doing anything else — there's no way to dismiss this into the main app.
+function ResetPasswordView({ onConfirm, onCancel }) {
+  const [password, setPassword] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const submit = async () => {
+    if (busy) return;
+    if (password.length < 4) { setError("Password must be at least 4 characters."); return; }
+    if (password !== confirm) { setError("Passwords don't match."); return; }
+    setError("");
+    setBusy(true);
+    const result = await onConfirm(password);
+    setBusy(false);
+    if (result !== true) setError(result || "Couldn't update your password — please try again.");
+  };
+  const onEnter = (e) => { if (e.key === "Enter") submit(); };
+
+  return (
+    <AuthCard>
+      <div>
+        <img src={LOGO_DATA_URL} alt="" className="h-14 w-auto mx-auto mb-4" style={{ objectFit: "contain" }} />
+        <h1 className="display-font text-lg text-center mb-1" style={{ fontWeight: 600 }}>Choose a new password</h1>
+        <p className="text-xs text-center mb-5" style={{ color: "var(--ink-soft)" }}>
+          You're resetting your password. Pick a new one to finish logging in.
+        </p>
+        <div className="space-y-3">
+          <Field label="New password">
+            <PasswordInput value={password} onChange={setPassword} onKeyDown={onEnter} placeholder="At least 4 characters" />
+          </Field>
+          <Field label="Confirm new password">
+            <PasswordInput value={confirm} onChange={setConfirm} onKeyDown={onEnter} placeholder="Retype password" />
+          </Field>
+        </div>
+        {error && <p className="text-xs mt-3" style={{ color: "var(--alert)" }}>{error}</p>}
+        <button
+          type="button"
+          onClick={submit}
+          disabled={busy}
+          className="w-full mt-5 py-2.5 rounded-lg text-sm font-medium"
+          style={{ background: "var(--primary)", color: "#fff", opacity: busy ? 0.7 : 1 }}
+        >
+          {busy ? "Saving…" : "Save new password"}
+        </button>
+        <p className="text-xs text-center mt-4" style={{ color: "var(--ink-soft)" }}>
+          <button type="button" onClick={onCancel} className="underline font-medium" style={{ color: "var(--ink-soft)" }}>
+            Cancel and log out
           </button>
         </p>
       </div>
@@ -5371,7 +5749,7 @@ function UpgradeView({ account, trialInfo, onConfirm, onApplyCode, onClose, onLo
 
   const confirm = async () => {
     if (busy) return;
-    if (!reference.trim()) { setError("Enter the reference number or email from your PayMongo receipt."); return; }
+    if (!reference.trim()) { setError("Enter the reference number or email from your PayMongo receipt (or your manual payment)."); return; }
     setError("");
     setBusy(true);
     const ok = await onConfirm(reference.trim());
@@ -5390,21 +5768,46 @@ function UpgradeView({ account, trialInfo, onConfirm, onApplyCode, onClose, onLo
     else setCode("");
   };
 
-  const discountPercent = account?.discountPercent || 0;
+  // Has this account ever paid before? Only a renewal (true) earns reward
+  // credits toward its price; only a first-ever payment (false) can use the
+  // one-time referral signup discount.
+  const hasSubscribedBefore = account?.subscriptionStatus === "active";
+  const signupDiscountPercent = account?.discountPercent || 0;
+  const rewardCreditPercent = Math.min(account?.rewardCredits || 0, MAX_REWARD_CREDIT_PERCENT);
+  const discountPercent = hasSubscribedBefore ? rewardCreditPercent : signupDiscountPercent;
   const fullPrice = MONTHLY_PRICE_PHP;
   const discountedPrice = Math.round(fullPrice * (1 - discountPercent / 100));
+
+  // PayMongo Payment Links are a fixed price each — there's no way to charge
+  // an arbitrary % off through one. We only have a real link for two exact
+  // prices: full price, and the flat one-time referral-signup price. Any
+  // other amount (a renewal discounted by an ever-changing reward-credit %)
+  // has to be collected manually so the amount actually charged matches
+  // what's shown here.
+  const usesReferralLink = !hasSubscribedBefore && discountPercent === REFERRAL_DISCOUNT_PERCENT;
+  const needsManualPayment = discountPercent > 0 && !usesReferralLink;
+  const payLink = usesReferralLink ? PAYMONGO_LINK_REFERRAL : PAYMONGO_LINK;
+
+  const headline = trialInfo?.renewalDue
+    ? "Time to renew"
+    : trialInfo?.expired
+    ? "Your free trial has ended"
+    : hasSubscribedBefore
+    ? "Manage your subscription"
+    : "Upgrade your account";
+  const subhead = trialInfo?.renewalDue
+    ? "Your paid period has ended — renew to keep the counter running. Your data is safe and right where you left it."
+    : trialInfo?.expired
+    ? "Subscribe to keep using your POS — your data is safe and will be right where you left it."
+    : hasSubscribedBefore
+    ? "Renew early any time, or just keep an eye on your reward credit."
+    : "Subscribe any time to keep the counter running after your trial ends.";
 
   const body = (
     <div className="max-w-sm mx-auto">
       <img src={LOGO_DATA_URL} alt="" className="h-12 w-auto mx-auto mb-4" style={{ objectFit: "contain" }} />
-      <h2 className="display-font text-lg text-center mb-1" style={{ fontWeight: 600 }}>
-        {trialInfo?.expired ? "Your free trial has ended" : "Upgrade your account"}
-      </h2>
-      <p className="text-xs text-center mb-5" style={{ color: "var(--ink-soft)" }}>
-        {trialInfo?.expired
-          ? "Subscribe to keep using your POS — your data is safe and will be right where you left it."
-          : "Subscribe any time to keep the counter running after your trial ends."}
-      </p>
+      <h2 className="display-font text-lg text-center mb-1" style={{ fontWeight: 600 }}>{headline}</h2>
+      <p className="text-xs text-center mb-5" style={{ color: "var(--ink-soft)" }}>{subhead}</p>
 
       {/* ---- Price ---- */}
       <div className="rounded-xl border p-4 mb-4 text-center" style={{ borderColor: "var(--line)", background: "var(--bg)" }}>
@@ -5412,51 +5815,78 @@ function UpgradeView({ account, trialInfo, onConfirm, onApplyCode, onClose, onLo
           <>
             <div className="text-xs line-through" style={{ color: "var(--ink-soft)" }}>₱{fullPrice}/month</div>
             <div className="display-font text-2xl" style={{ fontWeight: 600 }}>₱{discountedPrice}<span className="text-sm font-normal">/month</span></div>
-            <div className="text-[11px] mt-1 font-medium" style={{ color: "#2F6B45" }}>{discountPercent}% off applied</div>
+            <div className="text-[11px] mt-1 font-medium" style={{ color: "#2F6B45" }}>
+              {hasSubscribedBefore ? `${discountPercent}% reward credit applied` : `${discountPercent}% off your first payment`}
+            </div>
           </>
         ) : (
           <div className="display-font text-2xl" style={{ fontWeight: 600 }}>₱{fullPrice}<span className="text-sm font-normal">/month</span></div>
         )}
       </div>
 
-      {/* ---- Discount / referral code ---- */}
-      <div className="mb-4">
-        <Field label="Have a discount code?">
-          <div className="flex gap-2">
-            <input
-              value={code}
-              onChange={(e) => setCode(e.target.value.toUpperCase())}
-              onKeyDown={(e) => e.key === "Enter" && applyCode()}
-              placeholder="Enter code"
-              className="flex-1 border rounded-lg px-3 py-2 text-sm uppercase"
-              style={{ borderColor: "var(--line)" }}
-            />
-            <button
-              type="button"
-              onClick={applyCode}
-              disabled={codeBusy || !code.trim()}
-              className="px-3 py-2 rounded-lg text-xs font-medium border"
-              style={{ borderColor: "var(--primary)", color: "var(--primary)", opacity: codeBusy || !code.trim() ? 0.6 : 1 }}
-            >
-              {codeBusy ? "Applying…" : "Apply"}
-            </button>
+      {/* ---- Discount / referral code — only for a first-ever payment; a
+          referral code can't be applied once you're already an active
+          subscriber (see redeem_referral() in the SQL setup block). ---- */}
+      {!hasSubscribedBefore && (
+        signupDiscountPercent > 0 ? (
+          <div className="rounded-lg px-3 py-2 mb-4 text-xs" style={{ background: "#EAF0E2", color: "var(--primary-dark)" }}>
+            Referral code applied — {signupDiscountPercent}% off your first payment.
           </div>
-        </Field>
-        {codeError && <p className="text-xs mt-1.5" style={{ color: "var(--alert)" }}>{codeError}</p>}
-      </div>
+        ) : (
+          <div className="mb-4">
+            <Field label="Have a referral code?">
+              <div className="flex gap-2">
+                <input
+                  value={code}
+                  onChange={(e) => setCode(e.target.value.toUpperCase())}
+                  onKeyDown={(e) => e.key === "Enter" && applyCode()}
+                  placeholder="Enter code"
+                  className="flex-1 border rounded-lg px-3 py-2 text-sm uppercase"
+                  style={{ borderColor: "var(--line)" }}
+                />
+                <button
+                  type="button"
+                  onClick={applyCode}
+                  disabled={codeBusy || !code.trim()}
+                  className="px-3 py-2 rounded-lg text-xs font-medium border"
+                  style={{ borderColor: "var(--primary)", color: "var(--primary)", opacity: codeBusy || !code.trim() ? 0.6 : 1 }}
+                >
+                  {codeBusy ? "Applying…" : "Apply"}
+                </button>
+              </div>
+            </Field>
+            {codeError && <p className="text-xs mt-1.5" style={{ color: "var(--alert)" }}>{codeError}</p>}
+          </div>
+        )
+      )}
 
-      <a
-        href={PAYMONGO_LINK}
-        target="_blank"
-        rel="noopener noreferrer"
-        className="w-full flex items-center justify-center gap-2 py-2.5 rounded-lg text-sm font-medium"
-        style={{ background: "var(--primary)", color: "#fff" }}
-      >
-        <CreditCard size={15} /> Pay with PayMongo
-      </a>
-      <p className="text-[11px] text-center mt-2" style={{ color: "var(--ink-soft)" }}>
-        Accepts GCash, Maya, and local or international cards.
-      </p>
+      {hasSubscribedBefore && rewardCreditPercent > 0 && (
+        <div className="rounded-lg px-3 py-2 mb-4 text-xs" style={{ background: "#EAF0E2", color: "var(--primary-dark)" }}>
+          You're earning {rewardCreditPercent}% off from your referrals — it's already reflected in the price above.
+        </div>
+      )}
+
+      {needsManualPayment ? (
+        <div className="rounded-lg border p-3 text-xs" style={{ borderColor: "var(--line)" }}>
+          <div className="font-medium mb-1">Pay ₱{discountedPrice} to activate</div>
+          <p style={{ color: "var(--ink-soft)" }}>{MANUAL_PAYMENT_NOTE}</p>
+        </div>
+      ) : (
+        <>
+          <a
+            href={payLink}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="w-full flex items-center justify-center gap-2 py-2.5 rounded-lg text-sm font-medium"
+            style={{ background: "var(--primary)", color: "#fff" }}
+          >
+            <CreditCard size={15} /> Pay with PayMongo
+          </a>
+          <p className="text-[11px] text-center mt-2" style={{ color: "var(--ink-soft)" }}>
+            Accepts GCash, Maya, and local or international cards.
+          </p>
+        </>
+      )}
 
       <div className="mt-5 pt-4" style={{ borderTop: "1px solid var(--line)" }}>
         <Field label="Already paid? Enter your payment reference">
