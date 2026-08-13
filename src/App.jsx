@@ -962,7 +962,7 @@ export default function CafePOS() {
   // is active. Sets the new password, then drops the owner into the app
   // (the session from the recovery link is a real, valid session).
   const completePasswordRecovery = useCallback(async (newPassword) => {
-    if (!newPassword || newPassword.length < 4) return "Password must be at least 4 characters.";
+    if (!newPassword || newPassword.length < 6) return "Password must be at least 6 characters.";
     const { error } = await supabase.auth.updateUser({ password: newPassword });
     if (error) return error.message || "Couldn't update your password — please try again.";
     setPasswordRecovery(false);
@@ -5531,7 +5531,7 @@ function SignUpView({ onSignUp, onSwitchToLogin }) {
     setAlreadyExists(false);
     if (!businessName.trim()) { setError("Enter your business name."); return; }
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) { setError("Enter a valid email address."); return; }
-    if (password.length < 4) { setError("Password must be at least 4 characters."); return; }
+    if (password.length < 6) { setError("Password must be at least 6 characters."); return; }
     if (password !== confirm) { setError("Passwords don't match."); return; }
     setError("");
     setBusy(true);
@@ -5578,7 +5578,7 @@ function SignUpView({ onSignUp, onSwitchToLogin }) {
             />
           </Field>
           <Field label="Password">
-            <PasswordInput value={password} onChange={setPassword} onKeyDown={onEnter} placeholder="At least 4 characters" />
+            <PasswordInput value={password} onChange={setPassword} onKeyDown={onEnter} placeholder="At least 6 characters" />
           </Field>
           <Field label="Confirm password">
             <PasswordInput value={confirm} onChange={setConfirm} onKeyDown={onEnter} placeholder="Retype password" />
@@ -5808,7 +5808,7 @@ function ResetPasswordView({ onConfirm, onCancel }) {
 
   const submit = async () => {
     if (busy) return;
-    if (password.length < 4) { setError("Password must be at least 4 characters."); return; }
+    if (password.length < 6) { setError("Password must be at least 6 characters."); return; }
     if (password !== confirm) { setError("Passwords don't match."); return; }
     setError("");
     setBusy(true);
@@ -5828,7 +5828,7 @@ function ResetPasswordView({ onConfirm, onCancel }) {
         </p>
         <div className="space-y-3">
           <Field label="New password">
-            <PasswordInput value={password} onChange={setPassword} onKeyDown={onEnter} placeholder="At least 4 characters" />
+            <PasswordInput value={password} onChange={setPassword} onKeyDown={onEnter} placeholder="At least 6 characters" />
           </Field>
           <Field label="Confirm new password">
             <PasswordInput value={confirm} onChange={setConfirm} onKeyDown={onEnter} placeholder="Retype password" />
@@ -5935,6 +5935,10 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
   const [code, setCode] = useState("");
   const [codeBusy, setCodeBusy] = useState(false);
   const [codeError, setCodeError] = useState("");
+  // Controls the in-app checkout overlay (see checkoutModal below) — payment
+  // now happens inside the POS in an embedded frame instead of opening
+  // PayMongo's checkout in a new browser tab.
+  const [showCheckout, setShowCheckout] = useState(false);
 
   const applyCode = async () => {
     if (codeBusy) return;
@@ -6087,17 +6091,16 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
         </div>
       ) : (
         <>
-          <a
-            href={payLink}
-            target="_blank"
-            rel="noopener noreferrer"
+          <button
+            type="button"
+            onClick={() => setShowCheckout(true)}
             className="w-full flex items-center justify-center gap-2 py-2.5 rounded-lg text-sm font-medium"
             style={{ background: "var(--primary)", color: "#fff" }}
           >
-            <CreditCard size={15} /> Pay with PayMongo
-          </a>
+            <CreditCard size={15} /> Pay now
+          </button>
           <p className="text-[11px] text-center mt-2" style={{ color: "var(--ink-soft)" }}>
-            Accepts GCash, Maya, and local or international cards.
+            Accepts GCash, Maya, and local or international cards — pay right here, you won't leave the app.
           </p>
         </>
       )}
@@ -6119,6 +6122,47 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
     </div>
   );
 
+  // ---- In-app payment overlay ----
+  // Renders the PayMongo checkout inside an embedded frame, on top of
+  // everything else, so the owner pays without ever leaving the POS or
+  // opening a new browser tab/site. Note: some hosted checkout pages block
+  // being embedded this way for their own anti-clickjacking security (an
+  // X-Frame-Options / CSP header PayMongo controls, not this app) — if that
+  // ever happens the frame will just show blank/refuse to load, in which
+  // case the "Open in a new tab instead" link below is the fallback. A
+  // fully native in-app card form (no iframe at all) would need a backend
+  // holding your PayMongo secret key to create payment intents securely —
+  // that key can never live in this browser-side file.
+  const checkoutModal = showCheckout && (
+    <div className="fixed inset-0 z-[60] flex flex-col" style={{ background: "rgba(43,36,32,0.55)" }}>
+      <div className="flex items-center justify-between px-4 py-3" style={{ background: "var(--surface)", borderBottom: "1px solid var(--line)" }}>
+        <div className="flex items-center gap-2 text-sm font-medium">
+          <CreditCard size={15} /> Secure payment
+        </div>
+        <button onClick={() => setShowCheckout(false)} className="flex items-center gap-1 text-xs px-2 py-1 rounded-lg" style={{ color: "var(--ink-soft)" }}>
+          <X size={14} /> Close
+        </button>
+      </div>
+      <div className="flex-1" style={{ background: "#fff" }}>
+        <iframe
+          src={payLink}
+          title="Payment checkout"
+          className="w-full h-full"
+          style={{ border: 0 }}
+          allow="payment"
+        />
+      </div>
+      <div className="px-4 py-2 text-center" style={{ background: "var(--surface)", borderTop: "1px solid var(--line)" }}>
+        <p className="text-[10px]" style={{ color: "var(--ink-soft)" }}>
+          Not loading?{" "}
+          <a href={payLink} target="_blank" rel="noopener noreferrer" style={{ color: "var(--primary)" }}>
+            Open in a new tab instead
+          </a>
+        </p>
+      </div>
+    </div>
+  );
+
   // onClose === null means this is a hard block (trial expired): render as
   // a full page, not a dismissable modal, so there's no way around it.
   if (onClose === null) {
@@ -6127,6 +6171,7 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
         <div className="rounded-2xl border p-6 sm:p-8" style={{ borderColor: "var(--line)", background: "var(--surface)" }}>
           {body}
         </div>
+        {checkoutModal}
       </div>
     );
   }
@@ -6143,6 +6188,7 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
         </div>
         {body}
       </div>
+      {checkoutModal}
     </div>
   );
 }
@@ -6220,7 +6266,7 @@ function SettingsView({ account, onUpdateField, onLogOut, onDeleteAccount, trial
           type="password"
           onSave={(v) => onUpdateField("password", v)}
           placeholder="Leave blank to keep current password"
-          minLength={4}
+          minLength={6}
           helper="Type a new password to change it"
         />
       </div>
