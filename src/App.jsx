@@ -53,6 +53,15 @@
    alter table public.businesses
      add column if not exists subscription_period_end timestamptz;
 
+   -- The account's permanent billing/display currency, chosen once at
+   -- sign-up (see SignUpView) and never changed afterward. Having this on
+   -- the server (not just in this device's local storage) means the
+   -- currency travels with the account to a new device/browser instead of
+   -- silently resetting to PHP. Safe to run even if this column already
+   -- exists.
+   alter table public.businesses
+     add column if not exists currency_code text default 'PHP';
+
    -- Redeems someone else's referral code: gives the CALLER a one-time 25%
    -- discount on their first payment (first month only), and — ONLY if the
    -- code owner is currently an active, paying, non-lapsed subscriber —
@@ -316,6 +325,11 @@ const CURRENCIES = [
   { code: "THB", symbol: "฿", label: "Thai Baht (฿)" },
   { code: "VND", symbol: "₫", label: "Vietnamese Dong (₫)", zeroDecimal: true },
 ];
+
+// Alphabetical (by currency name) view of CURRENCIES, for the sign-up
+// currency picker — the base CURRENCIES array above stays in its original
+// order since other code doesn't care about order, only this dropdown does.
+const CURRENCIES_ALPHABETICAL = [...CURRENCIES].sort((a, b) => a.label.localeCompare(b.label));
 
 // =============================================================================
 // LOCKED SUBSCRIPTION PRICING — see MONTHLY_PRICE_PHP / CURRENCIES above.
@@ -633,6 +647,11 @@ export default function CafePOS() {
       subscriptionStatus: data.subscription_status || "trial",
       subscriptionPeriodEnd: data.subscription_period_end || null,
       paymentReference: data.payment_reference || "",
+      // Set once at sign-up (see SignUpView) and never changed afterward —
+      // this is the account's single, permanent billing/display currency.
+      // Falls back to PHP only for pre-existing accounts created before
+      // this field existed.
+      currencyCode: data.currency_code || "PHP",
     };
   }, []);
 
@@ -785,7 +804,14 @@ export default function CafePOS() {
       // Reports/history only need to keep RETENTION_MONTHS worth of whole months.
       const purged = purgeOldSales(sal);
       if (purged.length !== sal.length) { sal = purged; await safeSet(scopedKey(SALES_KEY, userId), sal); }
-      if (!cur) { cur = "PHP"; await safeSet(scopedKey(CURRENCY_KEY, userId), cur); }
+      if (!cur) {
+        // First time loading on this device: seed from the account's
+        // permanent, server-side currency (set once at sign-up) rather than
+        // always defaulting to PHP — so a returning owner on a new device
+        // sees their own currency, not a reset one.
+        cur = accountRef.current?.currencyCode || "PHP";
+        await safeSet(scopedKey(CURRENCY_KEY, userId), cur);
+      }
       if (!emps || emps.length === 0) {
         emps = [
           { id: uid("emp"), name: "Jamie", role: "manager" },
@@ -863,7 +889,7 @@ export default function CafePOS() {
   // never a bare `false` — so the sign-up screen can actually tell the owner
   // what went wrong (e.g. "you already have an account, log in instead")
   // instead of a generic "something went wrong, try again."
-  const signUp = useCallback(async ({ businessName, email, password, referralCode }) => {
+  const signUp = useCallback(async ({ businessName, email, password, currencyCode, referralCode }) => {
     const cleanEmail = email.trim();
     const { data, error } = await supabase.auth.signUp({ email: cleanEmail, password });
     if (error) {
@@ -877,15 +903,24 @@ export default function CafePOS() {
       return "Couldn't create the account — please try again.";
     }
 
+    // Currency is chosen once, right here, and never changes afterward — it
+    // drives both POS totals and the subscription price shown in Settings.
+    const chosenCurrency = CURRENCIES.some((c) => c.code === currencyCode) ? currencyCode : "PHP";
+
     const { error: bizErr } = await supabase.from("businesses").insert({
       id: user.id,
       business_name: businessName.trim(),
       email: cleanEmail,
       trial_start_date: new Date().toISOString(),
+      currency_code: chosenCurrency,
     });
     if (bizErr) {
       notify("Account created, but saving your business details failed: " + bizErr.message, "err");
     }
+    // Seed this device's local copy immediately too, so the very first
+    // render (before fetchBusiness round-trips) already shows the right
+    // currency instead of a brief flash of PHP.
+    await safeSet(scopedKey(CURRENCY_KEY, user.id), chosenCurrency);
 
     if (referralCode && referralCode.trim()) {
       const { error: refErr } = await supabase.rpc("redeem_referral", {
@@ -2566,15 +2601,18 @@ function Header({ businessName, low, confirmReset, setConfirmReset, resetAll, cu
             <AlertTriangle size={12} /> {low} low on stock
           </span>
         )}
-        <select
-          value={currencyCode}
-          onChange={(e) => changeCurrency(e.target.value)}
-          className="text-xs px-2 py-1.5 rounded-full border"
+        {/* Currency is set once at sign-up and permanent — shown here as a
+            plain read-only badge (not a selector) so it can't be switched
+            to peek at a different currency's subscription price. To change
+            it, an owner would need a new account. */}
+        <span
+          className="text-xs px-2.5 py-1.5 rounded-full border"
           style={{ borderColor: "var(--line)", color: "var(--ink-soft)", background: "var(--surface)" }}
-          title="Currency"
+          title="Currency (set at sign-up, can't be changed)"
         >
-          {CURRENCIES.map((c) => <option key={c.code} value={c.code}>{c.code} {c.symbol}</option>)}
-        </select>
+          {(CURRENCIES.find((c) => c.code === currencyCode) || CURRENCIES[0]).code}{" "}
+          {(CURRENCIES.find((c) => c.code === currencyCode) || CURRENCIES[0]).symbol}
+        </span>
         <button
           onClick={() => (confirmReset ? resetAll() : setConfirmReset(true))}
           onBlur={() => setConfirmReset(false)}
@@ -5519,6 +5557,12 @@ function SignUpView({ onSignUp, onSwitchToLogin }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
+  // Chosen once, here, at setup — this becomes the account's permanent
+  // billing/display currency. There's no way to change it later in
+  // Settings; the subscription price is only ever shown in this one
+  // currency going forward, so switching currencies to "shop" for a
+  // cheaper-looking price isn't possible.
+  const [currencyCode, setCurrencyCode] = useState("PHP");
   const [error, setError] = useState("");
   // True only when the error is specifically "this email already has an
   // account" — lets us show a one-click "Log in instead" link rather than
@@ -5537,7 +5581,7 @@ function SignUpView({ onSignUp, onSwitchToLogin }) {
     setBusy(true);
     // No referral code here — that's entered later, on the Subscribe popup,
     // alongside the price, once there's actually something to discount.
-    const result = await onSignUp({ businessName, email, password, referralCode: "" });
+    const result = await onSignUp({ businessName, email, password, currencyCode, referralCode: "" });
     setBusy(false);
     if (result !== true) {
       setError(result || "Couldn't create the account — check your connection and try again.");
@@ -5552,7 +5596,7 @@ function SignUpView({ onSignUp, onSwitchToLogin }) {
         <img src={LOGO_DATA_URL} alt="" className="h-14 w-auto mx-auto mb-4" style={{ objectFit: "contain" }} />
         <h1 className="display-font text-lg text-center mb-1" style={{ fontWeight: 600 }}>Set up your café</h1>
         <p className="text-xs text-center mb-5" style={{ color: "var(--ink-soft)" }}>
-          Create an owner account to get started. You can change any of this later in Settings.
+          Create an owner account to get started. Business name, email, and password can be changed later in Settings — your currency can't, so pick the right one now.
         </p>
         <div className="space-y-3">
           <Field label="Business name">
@@ -5582,6 +5626,19 @@ function SignUpView({ onSignUp, onSwitchToLogin }) {
           </Field>
           <Field label="Confirm password">
             <PasswordInput value={confirm} onChange={setConfirm} onKeyDown={onEnter} placeholder="Retype password" />
+          </Field>
+          <Field label="Currency">
+            <select
+              value={currencyCode}
+              onChange={(e) => setCurrencyCode(e.target.value)}
+              className="w-full border rounded-lg px-3 py-2 text-sm"
+              style={{ borderColor: "var(--line)" }}
+            >
+              {CURRENCIES_ALPHABETICAL.map((c) => <option key={c.code} value={c.code}>{c.label}</option>)}
+            </select>
+            <p className="text-[10px] mt-1" style={{ color: "var(--ink-soft)" }}>
+              Used for both your POS totals and your subscription price. This can't be changed after setup.
+            </p>
           </Field>
         </div>
         {error && (
