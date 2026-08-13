@@ -62,6 +62,64 @@
    alter table public.businesses
      add column if not exists currency_code text default 'PHP';
 
+   -- THIS IS THE PIECE THAT WAS MISSING: nothing in this project ever
+   -- actually WROTE a referral_code onto a business row — the app and the
+   -- redeem_referral() function below only ever READ it. So if you flip an
+   -- account to "active" (in the app, or by hand in the Supabase table
+   -- editor) but its referral_code is still null, the Settings page has
+   -- nothing to show, even though the account is correctly subscribed.
+   -- This trigger auto-generates a short, unique, uppercase code the
+   -- moment a business row is created, so every account gets one
+   -- automatically going forward — the code exists from day one, it's just
+   -- kept hidden in the UI (see SettingsView's isSubscriber check) until
+   -- the account actually subscribes.
+   create or replace function generate_referral_code()
+   returns text
+   language plpgsql
+   as $$
+   declare
+     v_chars text := 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; -- no 0/O/1/I, avoids confusing codes
+     v_code text;
+     v_exists boolean;
+   begin
+     loop
+       v_code := '';
+       for i in 1..6 loop
+         v_code := v_code || substr(v_chars, floor(random() * length(v_chars) + 1)::int, 1);
+       end loop;
+       select exists(select 1 from public.businesses where referral_code = v_code) into v_exists;
+       exit when not v_exists;
+     end loop;
+     return v_code;
+   end;
+   $$;
+
+   create or replace function set_referral_code_on_insert()
+   returns trigger
+   language plpgsql
+   as $$
+   begin
+     if new.referral_code is null then
+       new.referral_code := generate_referral_code();
+     end if;
+     return new;
+   end;
+   $$;
+
+   drop trigger if exists trg_set_referral_code on public.businesses;
+   create trigger trg_set_referral_code
+     before insert on public.businesses
+     for each row
+     execute function set_referral_code_on_insert();
+
+   -- ONE-TIME BACKFILL: run this once so any account created BEFORE this
+   -- trigger existed (including one you've already flipped to "active" by
+   -- hand) gets a code retroactively too. Safe to re-run — it only touches
+   -- rows that still have a null referral_code.
+   update public.businesses
+     set referral_code = generate_referral_code()
+     where referral_code is null;
+
    -- Redeems someone else's referral code: gives the CALLER a one-time 25%
    -- discount on their first payment (first month only), and — ONLY if the
    -- code owner is currently an active, paying, non-lapsed subscriber —
