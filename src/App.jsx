@@ -54,8 +54,15 @@
      add column if not exists subscription_period_end timestamptz;
 
    -- Redeems someone else's referral code: gives the CALLER a one-time 25%
-   -- discount on their first payment, and gives the CODE OWNER a stacking
-   -- 3% reward credit that keeps applying to their own future renewals.
+   -- discount on their first payment, and — ONLY if the code owner is
+   -- currently an active, paying, non-lapsed subscriber — gives the CODE
+   -- OWNER a stacking 3% reward credit that keeps applying to their own
+   -- future renewals. If the code owner is on a free trial or their paid
+   -- period has lapsed, the code still works for the new sign-up's 25%
+   -- discount, but no reward credit is recorded for the owner (this mirrors
+   -- the app hiding an owner's code entirely while they're on a free trial
+   -- — see "Subscriber-Only Eligibility" — and is enforced here too, in
+   -- case a code ever gets shared before that gating existed / by mistake).
    -- Guards against every way someone could try to farm their own code:
    --   - can't redeem your own code (by account id)
    --   - can't redeem a code whose owner shares your account's email either
@@ -79,6 +86,9 @@
      v_caller_referred_by uuid;
      v_referrer_id uuid;
      v_referrer_email text;
+     v_referrer_status text;
+     v_referrer_period_end timestamptz;
+     v_referrer_is_eligible boolean;
    begin
      if v_caller_id is null then
        raise exception 'You must be logged in to redeem a referral code.';
@@ -97,7 +107,8 @@
        raise exception 'You''ve already redeemed a referral code.';
      end if;
 
-     select id, email into v_referrer_id, v_referrer_email
+     select id, email, subscription_status, subscription_period_end
+       into v_referrer_id, v_referrer_email, v_referrer_status, v_referrer_period_end
        from public.businesses
        where upper(referral_code) = upper(trim(p_code));
 
@@ -111,14 +122,31 @@
        raise exception 'You can''t use your own referral code.';
      end if;
 
+     -- Subscriber-only eligibility: the code owner only earns the 3% reward
+     -- credit while they're an ACTIVE, PAYING subscriber — not during their
+     -- own free trial, and not once their paid period has lapsed without
+     -- renewing. This does not block the redemption itself; the new
+     -- sign-up still gets their 25% discount either way.
+     v_referrer_is_eligible := (v_referrer_status = 'active')
+       and (v_referrer_period_end is null or v_referrer_period_end > now());
+
      update public.businesses
        set discount_percent = 25, referred_by = v_referrer_id
        where id = v_caller_id;
 
-     update public.businesses
-       set reward_credits = coalesce(reward_credits, 0) + 3,
-           referral_count = coalesce(referral_count, 0) + 1
-       where id = v_referrer_id;
+     if v_referrer_is_eligible then
+       update public.businesses
+         set reward_credits = coalesce(reward_credits, 0) + 3,
+             referral_count = coalesce(referral_count, 0) + 1
+         where id = v_referrer_id;
+     else
+       -- Still counts as a referral for their history/stats, just with no
+       -- reward credit attached since they weren't an eligible subscriber
+       -- at the time it was used.
+       update public.businesses
+         set referral_count = coalesce(referral_count, 0) + 1
+         where id = v_referrer_id;
+     end if;
    end;
    $$;
 
@@ -246,20 +274,75 @@ function purgeOldSales(salesArr) {
   return (salesArr || []).filter((s) => monthKey(s.timestamp) >= cutoffKey);
 }
 
+// `zeroDecimal: true` currencies (JPY, IDR, VND) are conventionally shown
+// with no cents/decimal places — ₦4,061 not ₦4,061.00.
 const CURRENCIES = [
   { code: "PHP", symbol: "₱", label: "Philippine Peso (₱)" },
   { code: "USD", symbol: "$", label: "US Dollar ($)" },
   { code: "EUR", symbol: "€", label: "Euro (€)" },
   { code: "GBP", symbol: "£", label: "British Pound (£)" },
-  { code: "JPY", symbol: "¥", label: "Japanese Yen (¥)" },
+  { code: "JPY", symbol: "¥", label: "Japanese Yen (¥)", zeroDecimal: true },
   { code: "AUD", symbol: "A$", label: "Australian Dollar (A$)" },
   { code: "SGD", symbol: "S$", label: "Singapore Dollar (S$)" },
   { code: "MYR", symbol: "RM", label: "Malaysian Ringgit (RM)" },
   { code: "INR", symbol: "₹", label: "Indian Rupee (₹)" },
-  { code: "IDR", symbol: "Rp", label: "Indonesian Rupiah (Rp)" },
+  { code: "IDR", symbol: "Rp", label: "Indonesian Rupiah (Rp)", zeroDecimal: true },
   { code: "THB", symbol: "฿", label: "Thai Baht (฿)" },
-  { code: "VND", symbol: "₫", label: "Vietnamese Dong (₫)" },
+  { code: "VND", symbol: "₫", label: "Vietnamese Dong (₫)", zeroDecimal: true },
 ];
+
+// =============================================================================
+// LOCKED SUBSCRIPTION PRICING — see MONTHLY_PRICE_PHP / CURRENCIES above.
+// =============================================================================
+// The subscription price (₱1,699/month) is converted into every supported
+// currency ONE TIME, using the PHP mid-market exchange rate on the day this
+// table was written (13 Aug 2026), and the resulting number is then
+// HARDCODED here. That's the "fixed exchange rate lock" — a subscriber who
+// picks USD always sees the exact same USD number every day, even though
+// the real PHP↔USD rate moves daily; it never silently recalculates from a
+// live rate. This is a deliberate design choice: predictable billing beats
+// currency-accurate billing for a subscription price.
+//
+// EDIT ME: if you want to re-lock these to a fresher rate (e.g. once a
+// year, or if PHP moves a lot), just replace the numbers below — nothing
+// else in the app needs to change, since every screen reads from this table
+// instead of computing its own conversion. Whatever you charge via PayMongo
+// is still in PHP (PAYMONGO_LINK / PAYMONGO_LINK_REFERRAL settle in PHP —
+// that's what your Philippine payment processor supports), so these other-
+// currency amounts are the "what you'll pay in your currency" reference
+// shown to the subscriber; the actual PayMongo charge is the PHP amount.
+const LOCKED_SUBSCRIPTION_PRICE_PHP = {
+  PHP: 1699,
+  USD: 27.65,
+  EUR: 25.49,
+  GBP: 20.48,
+  JPY: 4061,
+  AUD: 39.25,
+  SGD: 35.68,
+  MYR: 116.21,
+  INR: 2406,
+  IDR: 450800,
+  THB: 898.77,
+  VND: 702000,
+};
+
+// Formats a subscription-pricing amount (NOT a POS sale amount — see
+// `money()` below for that) in a given currency, using that currency's own
+// symbol and decimal convention, with thousands separators for the larger
+// currencies (JPY/IDR/VND) so e.g. 450800 reads as "Rp450,800" not
+// "Rp450800".
+function formatSubscriptionAmount(amount, currencyCode) {
+  const cur = CURRENCIES.find((c) => c.code === currencyCode) || CURRENCIES[0];
+  const n = Number(amount) || 0;
+  const decimals = cur.zeroDecimal ? 0 : 2;
+  const formatted = n.toLocaleString(undefined, { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
+  return `${cur.symbol}${formatted}`;
+}
+
+// The locked subscription price for a given currency, falling back to PHP
+// if an unrecognized code somehow shows up.
+const lockedSubscriptionPrice = (currencyCode) =>
+  LOCKED_SUBSCRIPTION_PRICE_PHP[currencyCode] ?? LOCKED_SUBSCRIPTION_PRICE_PHP.PHP;
 
 let CURRENT_SYMBOL = "₱"; // updated each render from the chosen currency, read by money()
 
@@ -569,17 +652,52 @@ export default function CafePOS() {
   // creates a recurring "renewal due" moment: once it passes, `expired`
   // flips back on (reusing the same hard-block gate the trial uses) and
   // `isSubscribed` flips off, until they renew and pay again.
+  //
+  // `isSubscribed` (is_subscribed) — true ONLY while the account is an
+  //   active, PAYING subscriber with an unexpired paid period. This is the
+  //   single source of truth the rest of the app uses to gate anything
+  //   that's "subscriber-only" — including whether a referral code is shown
+  //   at all, and whether using someone's code earns THEM a reward credit
+  //   (see redeem_referral() in the SQL setup block, which enforces the
+  //   same rule server-side).
+  // `isFreeTrial` (is_free_trial) — true whenever the account hasn't ever
+  //   completed a paid upgrade yet, whether or not the countdown itself has
+  //   run out. A trial that's expired is still "under Free Trial" in the
+  //   sense that matters here: no code, no credits, until they pay.
   const trialInfo = useMemo(() => {
-    if (!account) return { daysLeft: TRIAL_DAYS, elapsedDays: 0, expired: false, isSubscribed: false, renewalDue: false };
+    if (!account) {
+      return { daysLeft: TRIAL_DAYS, elapsedDays: 0, expired: false, isSubscribed: false, isFreeTrial: true, renewalDue: false };
+    }
     if (account.subscriptionStatus === "active") {
       const periodEndMs = account.subscriptionPeriodEnd ? new Date(account.subscriptionPeriodEnd).getTime() : null;
       const renewalDue = Number.isFinite(periodEndMs) && Date.now() >= periodEndMs;
-      return { daysLeft: null, elapsedDays: null, expired: renewalDue, isSubscribed: !renewalDue, renewalDue, periodEndMs };
+      const isSubscribed = !renewalDue;
+      return {
+        daysLeft: null,
+        elapsedDays: null,
+        expired: renewalDue,
+        isSubscribed,
+        // Once you've ever paid, you're never treated as "on the free
+        // trial" again — even if a renewal is currently due, you're a
+        // lapsed subscriber, not a trial user, for referral-eligibility
+        // purposes (a lapsed subscriber's code stays hidden too, but for a
+        // different displayed reason — see SettingsView/UpgradeView).
+        isFreeTrial: false,
+        renewalDue,
+        periodEndMs,
+      };
     }
     const start = new Date(account.trialStartDate).getTime();
     const elapsedDays = Number.isFinite(start) ? Math.floor((Date.now() - start) / MS_PER_DAY) : 0;
     const daysLeft = Math.max(0, TRIAL_DAYS - elapsedDays);
-    return { daysLeft, elapsedDays, expired: elapsedDays >= TRIAL_DAYS, isSubscribed: false, renewalDue: false };
+    return {
+      daysLeft,
+      elapsedDays,
+      expired: elapsedDays >= TRIAL_DAYS,
+      isSubscribed: false,
+      isFreeTrial: true,
+      renewalDue: false,
+    };
   }, [account]);
 
   useEffect(() => {
@@ -1993,6 +2111,7 @@ export default function CafePOS() {
         <UpgradeView
           account={account}
           trialInfo={trialInfo}
+          currencyCode={currencyCode}
           onConfirm={markSubscriptionActive}
           onApplyCode={applyReferralCode}
           onClose={null}
@@ -2179,6 +2298,7 @@ export default function CafePOS() {
             onLogOut={logOut}
             onDeleteAccount={deleteAccount}
             trialInfo={trialInfo}
+            currencyCode={currencyCode}
             openUpgrade={() => setShowUpgrade(true)}
           />
         )}
@@ -2188,6 +2308,7 @@ export default function CafePOS() {
         <UpgradeView
           account={account}
           trialInfo={trialInfo}
+          currencyCode={currencyCode}
           onConfirm={markSubscriptionActive}
           onApplyCode={applyReferralCode}
           onClose={trialInfo.expired && !trialInfo.isSubscribed ? null : () => setShowUpgrade(false)}
@@ -5739,7 +5860,7 @@ function AutoSaveField({ label, value, onSave, type = "text", placeholder, minLe
 // to "active" right away. There's no PayMongo webhook wired up here (see
 // supabase-schema.sql notes), so reconcile references against the PayMongo
 // dashboard periodically.
-function UpgradeView({ account, trialInfo, onConfirm, onApplyCode, onClose, onLogOut }) {
+function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onApplyCode, onClose, onLogOut }) {
   const [reference, setReference] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -5775,15 +5896,30 @@ function UpgradeView({ account, trialInfo, onConfirm, onApplyCode, onClose, onLo
   const signupDiscountPercent = account?.discountPercent || 0;
   const rewardCreditPercent = Math.min(account?.rewardCredits || 0, MAX_REWARD_CREDIT_PERCENT);
   const discountPercent = hasSubscribedBefore ? rewardCreditPercent : signupDiscountPercent;
-  const fullPrice = MONTHLY_PRICE_PHP;
-  const discountedPrice = Math.round(fullPrice * (1 - discountPercent / 100));
 
-  // PayMongo Payment Links are a fixed price each — there's no way to charge
-  // an arbitrary % off through one. We only have a real link for two exact
-  // prices: full price, and the flat one-time referral-signup price. Any
-  // other amount (a renewal discounted by an ever-changing reward-credit %)
-  // has to be collected manually so the amount actually charged matches
-  // what's shown here.
+  // ---- Multi-currency, fixed-rate-locked pricing ----
+  // `fullPrice`/`discountAmount`/`finalPrice` are all in the subscriber's
+  // chosen display currency, read from the LOCKED_SUBSCRIPTION_PRICE_PHP
+  // table (see its comment near the top of the file) — never a live/daily
+  // conversion, so the number on screen for a given currency never moves
+  // day to day. `phpFullPrice`/`phpFinalPrice` are the real PHP amounts,
+  // since that's what PayMongo/manual payment actually settles in.
+  const fullPrice = lockedSubscriptionPrice(currencyCode);
+  const discountAmount = fullPrice * (discountPercent / 100);
+  const finalPrice = fullPrice - discountAmount;
+  const phpFullPrice = MONTHLY_PRICE_PHP;
+  const phpDiscountAmount = phpFullPrice * (discountPercent / 100);
+  const phpFinalPrice = Math.round(phpFullPrice - phpDiscountAmount);
+  const isForeignCurrency = currencyCode !== "PHP";
+  const fmt = (n) => formatSubscriptionAmount(n, currencyCode);
+  const fmtPhp = (n) => formatSubscriptionAmount(n, "PHP");
+
+  // PayMongo Payment Links are a fixed PHP price each — there's no way to
+  // charge an arbitrary % off, or a foreign currency, through one. We only
+  // have a real link for two exact PHP prices: full price, and the flat
+  // one-time referral-signup price. Any other amount (a renewal discounted
+  // by an ever-changing reward-credit %) has to be collected manually so
+  // the amount actually charged matches what's shown here.
   const usesReferralLink = !hasSubscribedBefore && discountPercent === REFERRAL_DISCOUNT_PERCENT;
   const needsManualPayment = discountPercent > 0 && !usesReferralLink;
   const payLink = usesReferralLink ? PAYMONGO_LINK_REFERRAL : PAYMONGO_LINK;
@@ -5809,18 +5945,39 @@ function UpgradeView({ account, trialInfo, onConfirm, onApplyCode, onClose, onLo
       <h2 className="display-font text-lg text-center mb-1" style={{ fontWeight: 600 }}>{headline}</h2>
       <p className="text-xs text-center mb-5" style={{ color: "var(--ink-soft)" }}>{subhead}</p>
 
-      {/* ---- Price ---- */}
-      <div className="rounded-xl border p-4 mb-4 text-center" style={{ borderColor: "var(--line)", background: "var(--bg)" }}>
-        {discountPercent > 0 ? (
-          <>
-            <div className="text-xs line-through" style={{ color: "var(--ink-soft)" }}>₱{fullPrice}/month</div>
-            <div className="display-font text-2xl" style={{ fontWeight: 600 }}>₱{discountedPrice}<span className="text-sm font-normal">/month</span></div>
-            <div className="text-[11px] mt-1 font-medium" style={{ color: "#2F6B45" }}>
-              {hasSubscribedBefore ? `${discountPercent}% reward credit applied` : `${discountPercent}% off your first payment`}
-            </div>
-          </>
-        ) : (
-          <div className="display-font text-2xl" style={{ fontWeight: 600 }}>₱{fullPrice}<span className="text-sm font-normal">/month</span></div>
+      {/* ---- Price breakdown ----
+          New sign-up with a code: Original Price / 25% Referral Discount /
+          Final Remaining Balance Due.
+          Existing subscriber with reward credit: Next Bill Amount / Earned
+          Reward Credit / Updated Remaining Bill Amount. Same three-line
+          shape either way — just different labels for the middle/last
+          rows, per the two scenarios. */}
+      <div className="rounded-xl border p-4 mb-4" style={{ borderColor: "var(--line)", background: "var(--bg)" }}>
+        <div className="flex items-center justify-between text-sm">
+          <span style={{ color: "var(--ink-soft)" }}>{hasSubscribedBefore ? "Next bill amount" : "Original price"}</span>
+          <span className={discountPercent > 0 ? "line-through" : ""} style={{ color: discountPercent > 0 ? "var(--ink-soft)" : "inherit" }}>
+            {fmt(fullPrice)}/month
+          </span>
+        </div>
+        {discountPercent > 0 && (
+          <div className="flex items-center justify-between text-sm mt-1.5">
+            <span style={{ color: "#2F6B45" }}>
+              {hasSubscribedBefore ? `Earned reward credit (${discountPercent}%)` : `Referral discount (${discountPercent}%)`}
+            </span>
+            <span style={{ color: "#2F6B45" }}>−{fmt(discountAmount)}</span>
+          </div>
+        )}
+        <div
+          className="flex items-center justify-between mt-2 pt-2"
+          style={{ borderTop: discountPercent > 0 ? "1px dashed var(--line)" : "none" }}
+        >
+          <span className="text-sm font-medium">{hasSubscribedBefore ? "Updated remaining bill" : "Final balance due"}</span>
+          <span className="display-font text-2xl" style={{ fontWeight: 600 }}>{fmt(finalPrice)}<span className="text-sm font-normal">/month</span></span>
+        </div>
+        {isForeignCurrency && (
+          <p className="text-[10px] mt-2" style={{ color: "var(--ink-soft)" }}>
+            Locked at today's rate for {currencyCode} — this amount won't change with daily exchange rates. Charged in PHP ({fmtPhp(phpFinalPrice)}) via PayMongo.
+          </p>
         )}
       </div>
 
@@ -5868,7 +6025,7 @@ function UpgradeView({ account, trialInfo, onConfirm, onApplyCode, onClose, onLo
 
       {needsManualPayment ? (
         <div className="rounded-lg border p-3 text-xs" style={{ borderColor: "var(--line)" }}>
-          <div className="font-medium mb-1">Pay ₱{discountedPrice} to activate</div>
+          <div className="font-medium mb-1">Pay {fmtPhp(phpFinalPrice)} to activate</div>
           <p style={{ color: "var(--ink-soft)" }}>{MANUAL_PAYMENT_NOTE}</p>
         </div>
       ) : (
@@ -5955,7 +6112,7 @@ function UpgradeView({ account, trialInfo, onConfirm, onApplyCode, onClose, onLo
   );
 }
 
-function SettingsView({ account, onUpdateField, onLogOut, onDeleteAccount, trialInfo, openUpgrade }) {
+function SettingsView({ account, onUpdateField, onLogOut, onDeleteAccount, trialInfo, currencyCode = "PHP", openUpgrade }) {
   const [confirmLogout, setConfirmLogout] = useState(false);
   const [copied, setCopied] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
@@ -5972,6 +6129,19 @@ function SettingsView({ account, onUpdateField, onLogOut, onDeleteAccount, trial
       // clipboard API unavailable — the code is still visible to copy by hand
     }
   };
+
+  // Subscriber-only eligibility: the referral code, referral stats, and
+  // billing/reward-credit breakdown below are only ever shown to an active,
+  // PAYING subscriber (trialInfo.isSubscribed) — never during a free trial,
+  // and never once a paid period has lapsed without renewing. This is what
+  // "hide the code during a Free Trial" means in practice: the code itself
+  // isn't rendered anywhere in the DOM below until this is true.
+  const isSubscriber = !!trialInfo?.isSubscribed;
+  const rewardCreditPercent = Math.min(account?.rewardCredits || 0, MAX_REWARD_CREDIT_PERCENT);
+  const nextBillAmount = lockedSubscriptionPrice(currencyCode);
+  const earnedCreditAmount = nextBillAmount * (rewardCreditPercent / 100);
+  const updatedRemainingBill = nextBillAmount - earnedCreditAmount;
+  const fmt = (n) => formatSubscriptionAmount(n, currencyCode);
 
   return (
     <div className="max-w-md">
@@ -6036,42 +6206,77 @@ function SettingsView({ account, onUpdateField, onLogOut, onDeleteAccount, trial
         )}
       </div>
 
-      {/* ---- Referral code & rewards ---- */}
-      <div className="rounded-xl border p-4 sm:p-5 mt-4 space-y-3" style={{ borderColor: "var(--line)", background: "var(--surface)" }}>
-        <div className="text-xs font-medium" style={{ color: "var(--ink-soft)" }}>Your referral code</div>
-        <div className="flex items-center gap-2">
-          <div
-            className="flex-1 text-center tracking-widest font-semibold text-sm py-2 rounded-lg border"
-            style={{ borderColor: "var(--line)", background: "var(--bg)", letterSpacing: "0.15em" }}
-          >
-            {account?.referralCode || "—"}
+      {/* ---- Referral code & rewards ----
+          Hidden entirely while on a Free Trial (or a lapsed/expired paid
+          period) — no code, no stats, no credit — until the account is an
+          active, paying subscriber. */}
+      {isSubscriber ? (
+        <div className="rounded-xl border p-4 sm:p-5 mt-4 space-y-3" style={{ borderColor: "var(--line)", background: "var(--surface)" }}>
+          <div className="text-xs font-medium" style={{ color: "var(--ink-soft)" }}>Your referral code</div>
+          <div className="flex items-center gap-2">
+            <div
+              className="flex-1 text-center tracking-widest font-semibold text-sm py-2 rounded-lg border"
+              style={{ borderColor: "var(--line)", background: "var(--bg)", letterSpacing: "0.15em" }}
+            >
+              {account?.referralCode || "—"}
+            </div>
+            <button
+              onClick={copyCode}
+              className="text-xs px-3 py-2 rounded-lg border"
+              style={{ borderColor: "var(--line)", color: "var(--ink-soft)" }}
+            >
+              {copied ? "Copied!" : "Copy"}
+            </button>
           </div>
-          <button
-            onClick={copyCode}
-            className="text-xs px-3 py-2 rounded-lg border"
-            style={{ borderColor: "var(--line)", color: "var(--ink-soft)" }}
-          >
-            {copied ? "Copied!" : "Copy"}
-          </button>
+          <p className="text-[11px]" style={{ color: "var(--ink-soft)" }}>
+            Share this code — new sign-ups who use it get {REFERRAL_DISCOUNT_PERCENT}% off, and you earn a {REFERRAL_REWARD_PERCENT}% reward credit every time it's used.
+          </p>
+          <div className="flex gap-3 pt-1">
+            <div className="flex-1 rounded-lg p-3 text-center" style={{ background: "var(--bg)" }}>
+              <div className="text-lg font-semibold" style={{ fontFamily: "var(--display-font, inherit)" }}>{account?.referralCount || 0}</div>
+              <div className="text-[10px]" style={{ color: "var(--ink-soft)" }}>Referrals</div>
+            </div>
+            <div className="flex-1 rounded-lg p-3 text-center" style={{ background: "var(--bg)" }}>
+              <div className="text-lg font-semibold">{rewardCreditPercent}%</div>
+              <div className="text-[10px]" style={{ color: "var(--ink-soft)" }}>Reward credit</div>
+            </div>
+            <div className="flex-1 rounded-lg p-3 text-center" style={{ background: "var(--bg)" }}>
+              <div className="text-lg font-semibold">{account?.discountPercent || 0}%</div>
+              <div className="text-[10px]" style={{ color: "var(--ink-soft)" }}>Your discount</div>
+            </div>
+          </div>
+
+          {/* ---- Bill balance breakdown — Next Bill Amount, Earned Reward
+              Credits, and the Updated Remaining Bill Amount after applying
+              those credits, in the subscriber's chosen currency. ---- */}
+          <div className="rounded-lg p-3 mt-1" style={{ background: "var(--bg)" }}>
+            <div className="text-[11px] font-medium mb-2" style={{ color: "var(--ink-soft)" }}>Your next bill</div>
+            <div className="flex items-center justify-between text-xs">
+              <span style={{ color: "var(--ink-soft)" }}>Next bill amount</span>
+              <span>{fmt(nextBillAmount)}</span>
+            </div>
+            {rewardCreditPercent > 0 && (
+              <div className="flex items-center justify-between text-xs mt-1">
+                <span style={{ color: "#2F6B45" }}>Earned reward credits ({rewardCreditPercent}%)</span>
+                <span style={{ color: "#2F6B45" }}>−{fmt(earnedCreditAmount)}</span>
+              </div>
+            )}
+            <div className="flex items-center justify-between text-sm font-semibold mt-2 pt-2" style={{ borderTop: "1px dashed var(--line)" }}>
+              <span>Updated remaining bill</span>
+              <span>{fmt(updatedRemainingBill)}</span>
+            </div>
+          </div>
         </div>
-        <p className="text-[11px]" style={{ color: "var(--ink-soft)" }}>
-          Share this code — new sign-ups who use it get {REFERRAL_DISCOUNT_PERCENT}% off, and you earn a {REFERRAL_REWARD_PERCENT}% reward credit every time it's used.
-        </p>
-        <div className="flex gap-3 pt-1">
-          <div className="flex-1 rounded-lg p-3 text-center" style={{ background: "var(--bg)" }}>
-            <div className="text-lg font-semibold" style={{ fontFamily: "var(--display-font, inherit)" }}>{account?.referralCount || 0}</div>
-            <div className="text-[10px]" style={{ color: "var(--ink-soft)" }}>Referrals</div>
+      ) : (
+        <div className="rounded-xl border p-4 sm:p-5 mt-4" style={{ borderColor: "var(--line)", background: "var(--surface)" }}>
+          <div className="flex items-center gap-2 text-xs font-medium" style={{ color: "var(--ink-soft)" }}>
+            <Store size={13} /> Referral code
           </div>
-          <div className="flex-1 rounded-lg p-3 text-center" style={{ background: "var(--bg)" }}>
-            <div className="text-lg font-semibold">{account?.rewardCredits || 0}%</div>
-            <div className="text-[10px]" style={{ color: "var(--ink-soft)" }}>Reward credit</div>
-          </div>
-          <div className="flex-1 rounded-lg p-3 text-center" style={{ background: "var(--bg)" }}>
-            <div className="text-lg font-semibold">{account?.discountPercent || 0}%</div>
-            <div className="text-[10px]" style={{ color: "var(--ink-soft)" }}>Your discount</div>
-          </div>
+          <p className="text-[11px] mt-2" style={{ color: "var(--ink-soft)" }}>
+            Your referral code unlocks once you're a paying subscriber — subscribe to get your own code to share, and start earning a {REFERRAL_REWARD_PERCENT}% reward credit every time it's used.
+          </p>
         </div>
-      </div>
+      )}
 
       <div className="mt-5 flex items-center justify-between flex-wrap gap-3">
         {confirmLogout ? (
