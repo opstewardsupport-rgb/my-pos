@@ -83,6 +83,12 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 // covers both audiences.
 const PAYMONGO_LINK = "https://pm.link/org-KtaTpiR8vpcqBk2K2zkWjuxr/1VfePGD";
 
+// EDIT ME: your actual monthly subscription price, shown on the Subscribe
+// popup. This is just a display number — it doesn't charge anything by
+// itself, PayMongo's own checkout page (opened via PAYMONGO_LINK above)
+// is what actually sets the real amount charged. Keep the two in sync.
+const MONTHLY_PRICE_PHP = 499;
+
 // Support contact shown on the sign-up/login screens, the upgrade screen,
 // and in Settings, so owners always know where to send billing or account
 // questions.
@@ -526,17 +532,22 @@ export default function CafePOS() {
   // grants the 25% discount to this new account and the 3% reward credit to
   // the referrer, and it's the source of truth so a client can't just fake
   // a discount for itself.
+  // Returns `true` on success, or a plain-English error STRING on failure —
+  // never a bare `false` — so the sign-up screen can actually tell the owner
+  // what went wrong (e.g. "you already have an account, log in instead")
+  // instead of a generic "something went wrong, try again."
   const signUp = useCallback(async ({ businessName, email, password, referralCode }) => {
     const cleanEmail = email.trim();
     const { data, error } = await supabase.auth.signUp({ email: cleanEmail, password });
     if (error) {
-      notify(error.message || "Couldn't create the account.", "err");
-      return false;
+      if (error.code === "user_already_exists" || /already registered/i.test(error.message || "")) {
+        return "An account with this email already exists. Log in instead.";
+      }
+      return error.message || "Couldn't create the account.";
     }
     const user = data?.user;
     if (!user) {
-      notify("Couldn't create the account — please try again.", "err");
-      return false;
+      return "Couldn't create the account — please try again.";
     }
 
     const { error: bizErr } = await supabase.from("businesses").insert({
@@ -575,9 +586,19 @@ export default function CafePOS() {
     return true;
   }, [notify, fetchBusiness]);
 
+  // Same idea as signUp: returns `true`, or a plain-English error STRING —
+  // e.g. "Email or password is incorrect" vs. "No account with that email
+  // yet — sign up instead" are different situations and deserve different
+  // messages instead of one generic failure.
   const logIn = useCallback(async ({ email, password }) => {
     const { data, error } = await supabase.auth.signInWithPassword({ email: email.trim(), password });
-    if (error || !data?.user) return false;
+    if (error) {
+      if (/invalid login credentials/i.test(error.message || "")) {
+        return "Email or password is incorrect.";
+      }
+      return error.message || "Couldn't log in — please try again.";
+    }
+    if (!data?.user) return "Couldn't log in — please try again.";
     const biz = await fetchBusiness(data.user.id);
     accountRef.current = biz;
     setAccount(biz);
@@ -680,6 +701,27 @@ export default function CafePOS() {
     notify("You're upgraded — thanks for subscribing!");
     return true;
   }, [authUser, notify]);
+
+  // Applies a referral/discount code from the Subscribe popup, for an owner
+  // who's already signed in (unlike the old signup-time flow, this can be
+  // used any time before they pay). Redeemed server-side via the same
+  // redeem_referral() function used at signup, so a client can't fake a
+  // discount for itself. Returns `true` on success, or an error STRING the
+  // popup can show directly (e.g. "Invalid referral code").
+  const applyReferralCode = useCallback(async (code) => {
+    if (!authUser) return "You need to be logged in to apply a code.";
+    const clean = (code || "").trim();
+    if (!clean) return "Enter a code first.";
+    const { error } = await supabase.rpc("redeem_referral", { p_code: clean.toUpperCase() });
+    if (error) return error.message || "That code isn't valid.";
+    const biz = await fetchBusiness(authUser.id);
+    if (biz) {
+      accountRef.current = biz;
+      setAccount(biz);
+    }
+    notify(`Code applied — you now have ${biz?.discountPercent || REFERRAL_DISCOUNT_PERCENT}% off.`);
+    return true;
+  }, [authUser, notify, fetchBusiness]);
 
   const persistEmployees = useCallback(async (next) => {
     setEmployees(next);
@@ -1694,10 +1736,10 @@ export default function CafePOS() {
   if (!loggedIn) {
     return (
       <Shell>
-        {account ? (
-          <LoginView account={account} onLogIn={logIn} />
+        {authMode === "login" ? (
+          <LoginView account={account} onLogIn={logIn} onSwitchToSignUp={() => setAuthMode("signup")} />
         ) : (
-          <SignUpView onSignUp={signUp} />
+          <SignUpView onSignUp={signUp} onSwitchToLogin={() => setAuthMode("login")} />
         )}
       </Shell>
     );
@@ -1737,6 +1779,7 @@ export default function CafePOS() {
           account={account}
           trialInfo={trialInfo}
           onConfirm={markSubscriptionActive}
+          onApplyCode={applyReferralCode}
           onClose={null}
           onLogOut={logOut}
         />
@@ -1931,6 +1974,7 @@ export default function CafePOS() {
           account={account}
           trialInfo={trialInfo}
           onConfirm={markSubscriptionActive}
+          onApplyCode={applyReferralCode}
           onClose={trialInfo.expired && !trialInfo.isSubscribed ? null : () => setShowUpgrade(false)}
         />
       )}
@@ -5064,27 +5108,37 @@ function PasswordInput({ value, onChange, placeholder, autoFocus, onKeyDown }) {
 }
 
 // First-time setup screen — creates the one owner account this café's POS
-// runs under. Shown automatically whenever no account exists yet.
-function SignUpView({ onSignUp }) {
+// runs under. Shown when the owner clicks over from the login screen (or
+// this is the very first thing they ever open — see onSwitchToLogin).
+function SignUpView({ onSignUp, onSwitchToLogin }) {
   const [businessName, setBusinessName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
-  const [referralCode, setReferralCode] = useState("");
   const [error, setError] = useState("");
+  // True only when the error is specifically "this email already has an
+  // account" — lets us show a one-click "Log in instead" link rather than
+  // just a plain error line, since that's actually the fix, not a retry.
+  const [alreadyExists, setAlreadyExists] = useState(false);
   const [busy, setBusy] = useState(false);
 
   const submit = async () => {
     if (busy) return;
+    setAlreadyExists(false);
     if (!businessName.trim()) { setError("Enter your business name."); return; }
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) { setError("Enter a valid email address."); return; }
     if (password.length < 4) { setError("Password must be at least 4 characters."); return; }
     if (password !== confirm) { setError("Passwords don't match."); return; }
     setError("");
     setBusy(true);
-    const ok = await onSignUp({ businessName, email, password, referralCode });
+    // No referral code here — that's entered later, on the Subscribe popup,
+    // alongside the price, once there's actually something to discount.
+    const result = await onSignUp({ businessName, email, password, referralCode: "" });
     setBusy(false);
-    if (!ok) setError("Couldn't create the account — check your connection and try again.");
+    if (result !== true) {
+      setError(result || "Couldn't create the account — check your connection and try again.");
+      if (/already exists/i.test(result || "")) setAlreadyExists(true);
+    }
   };
   const onEnter = (e) => { if (e.key === "Enter") submit(); };
 
@@ -5125,18 +5179,25 @@ function SignUpView({ onSignUp }) {
           <Field label="Confirm password">
             <PasswordInput value={confirm} onChange={setConfirm} onKeyDown={onEnter} placeholder="Retype password" />
           </Field>
-          <Field label="Referral code (optional)">
-            <input
-              value={referralCode}
-              onChange={(e) => setReferralCode(e.target.value.toUpperCase())}
-              onKeyDown={onEnter}
-              placeholder="Have a code? Get 25% off"
-              className="w-full border rounded-lg px-3 py-2 text-sm uppercase"
-              style={{ borderColor: "var(--line)" }}
-            />
-          </Field>
         </div>
-        {error && <p className="text-xs mt-3" style={{ color: "var(--alert)" }}>{error}</p>}
+        {error && (
+          <p className="text-xs mt-3" style={{ color: "var(--alert)" }}>
+            {error}
+            {alreadyExists && (
+              <>
+                {" "}
+                <button
+                  type="button"
+                  onClick={onSwitchToLogin}
+                  className="underline font-medium"
+                  style={{ color: "var(--alert)" }}
+                >
+                  Log in instead
+                </button>
+              </>
+            )}
+          </p>
+        )}
         <button
           type="button"
           onClick={submit}
@@ -5146,7 +5207,13 @@ function SignUpView({ onSignUp }) {
         >
           {busy ? "Creating account…" : "Create account"}
         </button>
-        <p className="text-[11px] text-center mt-4" style={{ color: "var(--ink-soft)" }}>
+        <p className="text-xs text-center mt-4" style={{ color: "var(--ink-soft)" }}>
+          Already have an account?{" "}
+          <button type="button" onClick={onSwitchToLogin} className="underline font-medium" style={{ color: "var(--primary)" }}>
+            Log in
+          </button>
+        </p>
+        <p className="text-[11px] text-center mt-3" style={{ color: "var(--ink-soft)" }}>
           Need help? Email{" "}
           <a href={`mailto:${SUPPORT_EMAIL}`} style={{ color: "var(--primary)" }}>{SUPPORT_EMAIL}</a>
         </p>
@@ -5155,9 +5222,10 @@ function SignUpView({ onSignUp }) {
   );
 }
 
-// Shown whenever an account already exists but this device isn't logged in
-// (e.g. after Log out, or a fresh browser).
-function LoginView({ account, onLogIn }) {
+// The default screen shown on first load and any time the owner isn't
+// logged in on this device — a normal login form, with a link over to
+// SignUpView for anyone who genuinely needs a new account.
+function LoginView({ account, onLogIn, onSwitchToSignUp }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
@@ -5167,9 +5235,9 @@ function LoginView({ account, onLogIn }) {
     if (busy) return;
     setError("");
     setBusy(true);
-    const ok = await onLogIn({ email, password });
+    const result = await onLogIn({ email, password });
     setBusy(false);
-    if (!ok) setError("Email or password is incorrect.");
+    if (result !== true) setError(result || "Email or password is incorrect.");
   };
   const onEnter = (e) => { if (e.key === "Enter") submit(); };
 
@@ -5208,6 +5276,12 @@ function LoginView({ account, onLogIn }) {
         >
           {busy ? "Logging in…" : "Log in"}
         </button>
+        <p className="text-xs text-center mt-4" style={{ color: "var(--ink-soft)" }}>
+          New here?{" "}
+          <button type="button" onClick={onSwitchToSignUp} className="underline font-medium" style={{ color: "var(--primary)" }}>
+            Create an account
+          </button>
+        </p>
       </div>
     </AuthCard>
   );
@@ -5287,10 +5361,13 @@ function AutoSaveField({ label, value, onSave, type = "text", placeholder, minLe
 // to "active" right away. There's no PayMongo webhook wired up here (see
 // supabase-schema.sql notes), so reconcile references against the PayMongo
 // dashboard periodically.
-function UpgradeView({ account, trialInfo, onConfirm, onClose, onLogOut }) {
+function UpgradeView({ account, trialInfo, onConfirm, onApplyCode, onClose, onLogOut }) {
   const [reference, setReference] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [code, setCode] = useState("");
+  const [codeBusy, setCodeBusy] = useState(false);
+  const [codeError, setCodeError] = useState("");
 
   const confirm = async () => {
     if (busy) return;
@@ -5303,7 +5380,19 @@ function UpgradeView({ account, trialInfo, onConfirm, onClose, onLogOut }) {
     else if (onClose) onClose();
   };
 
+  const applyCode = async () => {
+    if (codeBusy) return;
+    setCodeError("");
+    setCodeBusy(true);
+    const result = await onApplyCode(code);
+    setCodeBusy(false);
+    if (result !== true) setCodeError(result || "That code isn't valid.");
+    else setCode("");
+  };
+
   const discountPercent = account?.discountPercent || 0;
+  const fullPrice = MONTHLY_PRICE_PHP;
+  const discountedPrice = Math.round(fullPrice * (1 - discountPercent / 100));
 
   const body = (
     <div className="max-w-sm mx-auto">
@@ -5317,14 +5406,44 @@ function UpgradeView({ account, trialInfo, onConfirm, onClose, onLogOut }) {
           : "Subscribe any time to keep the counter running after your trial ends."}
       </p>
 
-      {discountPercent > 0 && (
-        <div
-          className="text-xs rounded-lg px-3 py-2 mb-4 text-center font-medium"
-          style={{ background: "#E4EFE7", color: "#2F6B45" }}
-        >
-          You have a {discountPercent}% discount applied to your account.
-        </div>
-      )}
+      {/* ---- Price ---- */}
+      <div className="rounded-xl border p-4 mb-4 text-center" style={{ borderColor: "var(--line)", background: "var(--bg)" }}>
+        {discountPercent > 0 ? (
+          <>
+            <div className="text-xs line-through" style={{ color: "var(--ink-soft)" }}>₱{fullPrice}/month</div>
+            <div className="display-font text-2xl" style={{ fontWeight: 600 }}>₱{discountedPrice}<span className="text-sm font-normal">/month</span></div>
+            <div className="text-[11px] mt-1 font-medium" style={{ color: "#2F6B45" }}>{discountPercent}% off applied</div>
+          </>
+        ) : (
+          <div className="display-font text-2xl" style={{ fontWeight: 600 }}>₱{fullPrice}<span className="text-sm font-normal">/month</span></div>
+        )}
+      </div>
+
+      {/* ---- Discount / referral code ---- */}
+      <div className="mb-4">
+        <Field label="Have a discount code?">
+          <div className="flex gap-2">
+            <input
+              value={code}
+              onChange={(e) => setCode(e.target.value.toUpperCase())}
+              onKeyDown={(e) => e.key === "Enter" && applyCode()}
+              placeholder="Enter code"
+              className="flex-1 border rounded-lg px-3 py-2 text-sm uppercase"
+              style={{ borderColor: "var(--line)" }}
+            />
+            <button
+              type="button"
+              onClick={applyCode}
+              disabled={codeBusy || !code.trim()}
+              className="px-3 py-2 rounded-lg text-xs font-medium border"
+              style={{ borderColor: "var(--primary)", color: "var(--primary)", opacity: codeBusy || !code.trim() ? 0.6 : 1 }}
+            >
+              {codeBusy ? "Applying…" : "Apply"}
+            </button>
+          </div>
+        </Field>
+        {codeError && <p className="text-xs mt-1.5" style={{ color: "var(--alert)" }}>{codeError}</p>}
+      </div>
 
       <a
         href={PAYMONGO_LINK}
