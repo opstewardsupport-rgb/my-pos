@@ -296,18 +296,21 @@ function purgeOldSales(salesArr) {
 
 // `zeroDecimal: true` currencies (JPY, IDR, VND) are conventionally shown
 // with no cents/decimal places — ₦4,061 not ₦4,061.00.
+// Alphabetical by currency name (not by code) — this is the order shown in
+// every currency picker in the app, including the one-time choice made at
+// sign-up (see SignUpView) which is permanent from then on.
 const CURRENCIES = [
-  { code: "PHP", symbol: "₱", label: "Philippine Peso (₱)" },
-  { code: "USD", symbol: "$", label: "US Dollar ($)" },
-  { code: "EUR", symbol: "€", label: "Euro (€)" },
-  { code: "GBP", symbol: "£", label: "British Pound (£)" },
-  { code: "JPY", symbol: "¥", label: "Japanese Yen (¥)", zeroDecimal: true },
   { code: "AUD", symbol: "A$", label: "Australian Dollar (A$)" },
-  { code: "SGD", symbol: "S$", label: "Singapore Dollar (S$)" },
-  { code: "MYR", symbol: "RM", label: "Malaysian Ringgit (RM)" },
+  { code: "GBP", symbol: "£", label: "British Pound (£)" },
+  { code: "EUR", symbol: "€", label: "Euro (€)" },
   { code: "INR", symbol: "₹", label: "Indian Rupee (₹)" },
   { code: "IDR", symbol: "Rp", label: "Indonesian Rupiah (Rp)", zeroDecimal: true },
+  { code: "JPY", symbol: "¥", label: "Japanese Yen (¥)", zeroDecimal: true },
+  { code: "MYR", symbol: "RM", label: "Malaysian Ringgit (RM)" },
+  { code: "PHP", symbol: "₱", label: "Philippine Peso (₱)" },
+  { code: "SGD", symbol: "S$", label: "Singapore Dollar (S$)" },
   { code: "THB", symbol: "฿", label: "Thai Baht (฿)" },
+  { code: "USD", symbol: "$", label: "US Dollar ($)" },
   { code: "VND", symbol: "₫", label: "Vietnamese Dong (₫)", zeroDecimal: true },
 ];
 
@@ -835,12 +838,6 @@ export default function CafePOS() {
     })();
   }, [authUser?.id]);
 
-  const changeCurrency = useCallback(async (code) => {
-    setCurrencyCode(code);
-    const ok = await safeSet(scopedKey(CURRENCY_KEY, authUserIdRef.current), code);
-    if (!ok) notify("Couldn't save the currency — check connection and try again.", "err");
-  }, []);
-
   CURRENT_SYMBOL = (CURRENCIES.find((c) => c.code === currencyCode) || CURRENCIES[0]).symbol;
 
   const notify = useCallback((msg, type = "ok") => {
@@ -859,7 +856,7 @@ export default function CafePOS() {
   // never a bare `false` — so the sign-up screen can actually tell the owner
   // what went wrong (e.g. "you already have an account, log in instead")
   // instead of a generic "something went wrong, try again."
-  const signUp = useCallback(async ({ businessName, email, password, referralCode }) => {
+  const signUp = useCallback(async ({ businessName, email, password, referralCode, currency }) => {
     const cleanEmail = email.trim();
     const { data, error } = await supabase.auth.signUp({ email: cleanEmail, password });
     if (error) {
@@ -882,6 +879,15 @@ export default function CafePOS() {
     if (bizErr) {
       notify("Account created, but saving your business details failed: " + bizErr.message, "err");
     }
+
+    // The currency chosen on the sign-up form is locked in right here, the
+    // moment the account is created — before there's even a session (email
+    // confirmation may still be pending below). There's no changeCurrency
+    // path left anywhere in the app after this, so this is the only place
+    // CURRENCY_KEY is ever written.
+    const chosenCurrency = (CURRENCIES.find((c) => c.code === currency) || CURRENCIES.find((c) => c.code === "PHP")).code;
+    await safeSet(scopedKey(CURRENCY_KEY, user.id), chosenCurrency);
+    setCurrencyCode(chosenCurrency);
 
     if (referralCode && referralCode.trim()) {
       const { error: refErr } = await supabase.rpc("redeem_referral", {
@@ -2160,7 +2166,6 @@ export default function CafePOS() {
           setConfirmReset={() => {}}
           resetAll={() => {}}
           currencyCode={currencyCode}
-          changeCurrency={() => {}}
           employees={[]}
           currentEmployee={null}
           selectEmployee={() => {}}
@@ -2188,7 +2193,6 @@ export default function CafePOS() {
         setConfirmReset={setConfirmReset}
         resetAll={resetAll}
         currencyCode={currencyCode}
-        changeCurrency={changeCurrency}
         employees={employees}
         currentEmployee={currentEmployee}
         selectEmployee={requestEmployeeChange}
@@ -2525,7 +2529,7 @@ function Shell({ children }) {
   );
 }
 
-function Header({ businessName, low, confirmReset, setConfirmReset, resetAll, currencyCode, changeCurrency, employees, currentEmployee, selectEmployee, openEmployeeModal }) {
+function Header({ businessName, low, confirmReset, setConfirmReset, resetAll, currencyCode, employees, currentEmployee, selectEmployee, openEmployeeModal }) {
   return (
     <header className="max-w-6xl mx-auto px-4 sm:px-6 pt-6 pb-3 flex items-start justify-between no-print">
       <div>
@@ -2556,15 +2560,13 @@ function Header({ businessName, low, confirmReset, setConfirmReset, resetAll, cu
             <AlertTriangle size={12} /> {low} low on stock
           </span>
         )}
-        <select
-          value={currencyCode}
-          onChange={(e) => changeCurrency(e.target.value)}
-          className="text-xs px-2 py-1.5 rounded-full border"
+        <span
+          className="text-xs px-2.5 py-1.5 rounded-full border"
           style={{ borderColor: "var(--line)", color: "var(--ink-soft)", background: "var(--surface)" }}
-          title="Currency"
+          title="Currency — chosen at sign-up, can't be changed"
         >
-          {CURRENCIES.map((c) => <option key={c.code} value={c.code}>{c.code} {c.symbol}</option>)}
-        </select>
+          {currencyCode} {(CURRENCIES.find((c) => c.code === currencyCode) || CURRENCIES[0]).symbol}
+        </span>
         <button
           onClick={() => (confirmReset ? resetAll() : setConfirmReset(true))}
           onBlur={() => setConfirmReset(false)}
@@ -5509,6 +5511,12 @@ function SignUpView({ onSignUp, onSwitchToLogin }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
+  // The billing/display currency is chosen once, right here, and can never
+  // be changed afterward (see changeCurrency having been removed from
+  // Header/Settings) — so the subscription price is only ever shown in the
+  // one currency the owner actually committed to at setup. Defaults to PHP
+  // since that's what PayMongo actually settles in.
+  const [currency, setCurrency] = useState("PHP");
   const [error, setError] = useState("");
   // True only when the error is specifically "this email already has an
   // account" — lets us show a one-click "Log in instead" link rather than
@@ -5527,7 +5535,7 @@ function SignUpView({ onSignUp, onSwitchToLogin }) {
     setBusy(true);
     // No referral code here — that's entered later, on the Subscribe popup,
     // alongside the price, once there's actually something to discount.
-    const result = await onSignUp({ businessName, email, password, referralCode: "" });
+    const result = await onSignUp({ businessName, email, password, referralCode: "", currency });
     setBusy(false);
     if (result !== true) {
       setError(result || "Couldn't create the account — check your connection and try again.");
@@ -5542,7 +5550,7 @@ function SignUpView({ onSignUp, onSwitchToLogin }) {
         <img src={LOGO_DATA_URL} alt="" className="h-14 w-auto mx-auto mb-4" style={{ objectFit: "contain" }} />
         <h1 className="display-font text-lg text-center mb-1" style={{ fontWeight: 600 }}>Set up your café</h1>
         <p className="text-xs text-center mb-5" style={{ color: "var(--ink-soft)" }}>
-          Create an owner account to get started. You can change any of this later in Settings.
+          Create an owner account to get started. Your business details can be changed later in Settings — your currency can't, so pick carefully.
         </p>
         <div className="space-y-3">
           <Field label="Business name">
@@ -5572,6 +5580,19 @@ function SignUpView({ onSignUp, onSwitchToLogin }) {
           </Field>
           <Field label="Confirm password">
             <PasswordInput value={confirm} onChange={setConfirm} onKeyDown={onEnter} placeholder="Retype password" />
+          </Field>
+          <Field label="Currency (permanent — can't be changed later)">
+            <select
+              value={currency}
+              onChange={(e) => setCurrency(e.target.value)}
+              className="w-full border rounded-lg px-3 py-2 text-sm"
+              style={{ borderColor: "var(--line)" }}
+            >
+              {CURRENCIES.map((c) => <option key={c.code} value={c.code}>{c.label}</option>)}
+            </select>
+            <p className="text-[11px] mt-1" style={{ color: "var(--ink-soft)" }}>
+              Your monthly subscription fee (and every price in your POS) will always be shown in this currency — it's locked in as soon as you create your account.
+            </p>
           </Field>
         </div>
         {error && (
