@@ -2680,6 +2680,27 @@ export default function CafePOS() {
     );
   }
 
+  // Safety net: every normal sign-up already saves a business name straight
+  // into `businesses.business_name` (see signUp()), so this should never
+  // actually fire for an account created the normal way. It exists purely
+  // to catch accounts that ended up with a blank name some other way (an
+  // older row from before this existed, a row inserted by hand, etc.) —
+  // instead of silently showing a blank name forever, the app stops here
+  // exactly once and asks for it, then never asks again. There's no way to
+  // dismiss this without entering something, and it takes priority over the
+  // trial/upgrade screen below so the name is always in place first.
+  if (!account?.businessName || !account.businessName.trim()) {
+    return (
+      <Shell>
+        <CompleteProfileView
+          account={account}
+          onSave={(name) => updateAccountField("businessName", name)}
+          onLogOut={logOut}
+        />
+      </Shell>
+    );
+  }
+
   // Trial expired and never upgraded: block the whole app behind the
   // upgrade screen. There's no dismiss button here (onClose is null) —
   // the owner has to either pay via PayMongo (PH) or PayPal (everywhere
@@ -6793,6 +6814,76 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
       </div>
       {checkoutModal}
     </div>
+  );
+}
+
+// One-time gate shown automatically whenever a signed-in account has no
+// business name saved on it yet (see the `!account?.businessName` check in
+// the main App render). Normal sign-ups never hit this — signUp() already
+// saves the name at account creation — this is only a catch-all for
+// accounts that somehow ended up without one (an older row, one created
+// outside the app's sign-up form, etc.). Saving here uses the exact same
+// updateAccountField("businessName", …) path as the Business name field in
+// Settings, so once it's filled in the app moves straight on into itself
+// and this screen never appears again for that account.
+function CompleteProfileView({ account, onSave, onLogOut }) {
+  const [name, setName] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  const submit = async () => {
+    const trimmed = name.trim();
+    if (!trimmed) { setError("Enter your business name to continue."); return; }
+    setError("");
+    setBusy(true);
+    const ok = await onSave(trimmed);
+    setBusy(false);
+    if (ok === false) setError("Couldn't save — check your connection and try again.");
+  };
+  const onEnter = (e) => { if (e.key === "Enter") submit(); };
+
+  return (
+    <AuthCard>
+      <div>
+        <img src={LOGO_DATA_URL} alt="" className="h-14 w-auto mx-auto mb-4" style={{ objectFit: "contain" }} />
+        <h1 className="display-font text-lg text-center mb-1" style={{ fontWeight: 600 }}>
+          One last thing
+        </h1>
+        <p className="text-xs text-center mb-5" style={{ color: "var(--ink-soft)" }}>
+          {account?.email ? `We're missing a business name for ${account.email}.` : "We're missing a business name for this account."} It'll show up on your receipts and dashboard.
+        </p>
+        <Field label="Business name">
+          <input
+            type="text"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            onKeyDown={onEnter}
+            placeholder="e.g. Sunrise Café"
+            autoFocus
+            className="w-full border rounded-lg px-3 py-2 text-sm"
+            style={{ borderColor: "var(--line)" }}
+          />
+        </Field>
+        {error && <p className="text-xs mt-3" style={{ color: "var(--alert)" }}>{error}</p>}
+        <button
+          type="button"
+          onClick={submit}
+          disabled={busy}
+          className="w-full mt-5 py-2.5 rounded-lg text-sm font-medium"
+          style={{ background: "var(--primary)", color: "#fff", opacity: busy ? 0.7 : 1 }}
+        >
+          {busy ? "Saving…" : "Continue"}
+        </button>
+        <button
+          type="button"
+          onClick={onLogOut}
+          className="w-full mt-3 text-xs text-center"
+          style={{ color: "var(--ink-soft)" }}
+        >
+          Log out instead
+        </button>
+      </div>
+    </AuthCard>
   );
 }
 
