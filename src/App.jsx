@@ -141,9 +141,45 @@
    --     emails, so this mainly catches a business row whose email field
    --     drifted out of sync with its auth email)
    --   - can only be redeemed once per account, ever
+   --   - can't redeem the SAME code with the SAME email twice, even across
+   --     deleting and recreating the account — this is enforced
+   --     permanently via referral_redemptions (see above), which is never
+   --     touched by delete_own_account(). A different code, or a genuinely
+   --     different email, isn't blocked by this.
    --   - can only be redeemed before your FIRST payment — it's a new-signup
    --     perk, not something you can retroactively apply once you're an
    --     active subscriber
+   -- Tracks every (email, code) redemption PERMANENTLY — deliberately its
+   -- own table, not a column on `businesses`, so this survives account
+   -- deletion. Without this, deleting your account (see
+   -- delete_own_account() above) and signing back up with the SAME email
+   -- would let you redeem the SAME referral code a second time, since the
+   -- only record of "this email already used this code" used to live on
+   -- the (now-deleted) businesses row. This table is keyed on email+code
+   -- specifically, not just email — a given email is blocked from reusing
+   -- a code it's already redeemed, but is free to redeem a DIFFERENT code
+   -- later (see redeem_referral() below, which checks and writes to this
+   -- table).
+   create table if not exists public.referral_redemptions (
+     id bigserial primary key,
+     email text not null,
+     code text not null,
+     redeemed_at timestamptz not null default now()
+   );
+
+   -- One (email, code) combination can only ever be redeemed once, for the
+   -- lifetime of that email address — enforced case-insensitively so
+   -- "Owner@X.com"/"owner@x.com" and "abcd"/"ABCD" can't slip past it.
+   create unique index if not exists referral_redemptions_email_code_idx
+     on public.referral_redemptions (lower(email), upper(code));
+
+   -- No direct grants for this table — it's only ever touched from inside
+   -- redeem_referral() below, which runs as SECURITY DEFINER. RLS is
+   -- enabled with no policies, so nothing can read or write it directly
+   -- (including the browser's anon key); only the SECURITY DEFINER
+   -- function can.
+   alter table public.referral_redemptions enable row level security;
+
    create or replace function redeem_referral(p_code text)
    returns void
    language plpgsql
@@ -178,6 +214,18 @@
        raise exception 'You''ve already redeemed a referral code.';
      end if;
 
+     -- Permanent, email-scoped re-use check — this is what actually
+     -- survives account deletion (see referral_redemptions above). Blocks
+     -- this exact (email, code) pair only; the same email can still
+     -- redeem a DIFFERENT code later.
+     if v_caller_email is not null and exists (
+       select 1 from public.referral_redemptions
+       where lower(email) = lower(v_caller_email)
+         and upper(code) = upper(trim(p_code))
+     ) then
+       raise exception 'This code has already been used for this email. Use another code.';
+     end if;
+
      select id, email, subscription_status, subscription_period_end
        into v_referrer_id, v_referrer_email, v_referrer_status, v_referrer_period_end
        from public.businesses
@@ -204,6 +252,14 @@
      update public.businesses
        set discount_percent = 25, referred_by = v_referrer_id
        where id = v_caller_id;
+
+     -- Written AFTER the discount is granted, and never removed by
+     -- delete_own_account() (it's a separate table, not part of
+     -- `businesses`) — this is the permanent record that blocks this
+     -- email from redeeming this same code again, even after the account
+     -- itself is deleted and recreated.
+     insert into public.referral_redemptions (email, code)
+       values (v_caller_email, upper(trim(p_code)));
 
      if v_referrer_is_eligible then
        update public.businesses
@@ -1300,9 +1356,14 @@ export default function CafePOS() {
     if (!ok) notify("Couldn't save — check connection and try again.", "err");
   }, [notify]);
 
+  // Purges anything older than RETENTION_MONTHS on every single save (not
+  // just on initial page load) — so if the POS is left open across a
+  // month-end, older sales still get dropped promptly instead of quietly
+  // piling up until the next reload.
   const persistSales = useCallback(async (next) => {
-    setSales(next);
-    const ok = await safeSet(scopedKey(SALES_KEY, authUserIdRef.current), next);
+    const trimmed = purgeOldSales(next);
+    setSales(trimmed);
+    const ok = await safeSet(scopedKey(SALES_KEY, authUserIdRef.current), trimmed);
     if (!ok) notify("Couldn't save the sale — check connection and try again.", "err");
   }, [notify]);
 
