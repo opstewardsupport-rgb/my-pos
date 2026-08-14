@@ -478,6 +478,56 @@
    alter table public.businesses
      add column if not exists referral_reward_granted boolean not null default false;
 
+   -- FIX: some signups ended up with an auth.users account but NO row in
+   -- businesses at all (Settings showed blank Business name / Email because
+   -- there was nothing to read). Root cause: the ONLY thing that ever
+   -- created a businesses row was the client-side insert()/upsert() call in
+   -- signUp() below. If there's no active session at that exact moment —
+   -- e.g. "Confirm email" is ON in Authentication -> Providers -> Email, so
+   -- signUp() returns a user but no session until they click the
+   -- confirmation link — that call runs unauthenticated and Row Level
+   -- Security silently blocks it. This trigger creates the row on the
+   -- SERVER instead, the moment ANY new auth.users row is created, via
+   -- SECURITY DEFINER — so it works regardless of session/RLS state.
+   -- business_name and currency_code come from the signup metadata (see
+   -- `options: { data: {...} }` on the supabase.auth.signUp() call below).
+   drop function if exists public.handle_new_user() cascade;
+   create or replace function public.handle_new_user()
+   returns trigger
+   language plpgsql
+   security definer
+   set search_path = public
+   as $$
+   begin
+     insert into public.businesses (id, business_name, email, trial_start_date, currency_code)
+     values (
+       new.id,
+       coalesce(new.raw_user_meta_data->>'business_name', ''),
+       new.email,
+       now(),
+       coalesce(new.raw_user_meta_data->>'currency_code', 'PHP')
+     )
+     on conflict (id) do nothing;
+     return new;
+   end;
+   $$;
+
+   drop trigger if exists on_auth_user_created on auth.users;
+   create trigger on_auth_user_created
+     after insert on auth.users
+     for each row execute function public.handle_new_user();
+
+   -- ONE-TIME BACKFILL: repairs any EXISTING auth.users account that's
+   -- missing a businesses row. business_name is left blank (fill it back in
+   -- from Settings); currency_code defaults to PHP; trial_start_date is set
+   -- to right now so affected accounts get a fresh full trial. Safe to
+   -- re-run — only touches accounts still missing a row.
+   insert into public.businesses (id, business_name, email, trial_start_date, currency_code)
+   select u.id, '', u.email, now(), 'PHP'
+   from auth.users u
+   left join public.businesses b on b.id = u.id
+   where b.id is null;
+
    ---- END: paste into Supabase SQL Editor ----
 ============================================================================= */
 
@@ -1223,7 +1273,29 @@ export default function CafePOS() {
   // instead of a generic "something went wrong, try again."
   const signUp = useCallback(async ({ businessName, email, password, currencyCode, referralCode }) => {
     const cleanEmail = email.trim();
-    const { data, error } = await supabase.auth.signUp({ email: cleanEmail, password });
+    const cleanBusinessName = businessName.trim();
+
+    // Currency is chosen once, right here, and never changes afterward — it
+    // drives both POS totals and the subscription price shown in Settings.
+    // Computed BEFORE signUp() now, so it can be passed as metadata below —
+    // the server-side trigger (see handle_new_user() in supabase-schema.sql)
+    // needs it available the instant the auth user is created, not after.
+    const chosenCurrency = CURRENCIES.some((c) => c.code === currencyCode) ? currencyCode : "PHP";
+
+    // business_name/currency_code are passed via `options.data` so they land
+    // in auth.users.raw_user_meta_data. A database trigger reads them from
+    // there to create the businesses row SERVER-SIDE, the instant the auth
+    // account is created — regardless of whether a session exists yet. This
+    // matters because if "Confirm email" is turned on in your Supabase
+    // project, signUp() returns a user but no session until they click the
+    // confirmation link, and the client-side insert below would otherwise be
+    // silently blocked by Row Level Security (no session = no auth.uid()),
+    // leaving the account with no business/trial row at all.
+    const { data, error } = await supabase.auth.signUp({
+      email: cleanEmail,
+      password,
+      options: { data: { business_name: cleanBusinessName, currency_code: chosenCurrency } },
+    });
     if (error) {
       if (error.code === "user_already_exists" || /already registered/i.test(error.message || "")) {
         return "An account with this email already exists. Log in instead.";
@@ -1235,18 +1307,25 @@ export default function CafePOS() {
       return "Couldn't create the account — please try again.";
     }
 
-    // Currency is chosen once, right here, and never changes afterward — it
-    // drives both POS totals and the subscription price shown in Settings.
-    const chosenCurrency = CURRENCIES.some((c) => c.code === currencyCode) ? currencyCode : "PHP";
-
-    const { error: bizErr } = await supabase.from("businesses").insert({
-      id: user.id,
-      business_name: businessName.trim(),
-      email: cleanEmail,
-      trial_start_date: new Date().toISOString(),
-      currency_code: chosenCurrency,
-    });
+    // Fallback / fast-path only — the trigger above is what actually
+    // guarantees the row exists. This upsert just means that when a session
+    // DOES exist immediately (the common case, "Confirm email" off), the row
+    // is ready the instant we call fetchBusiness() below, without waiting on
+    // trigger timing. onConflict: "id" makes this safe to run whether or not
+    // the trigger already created the row — it merges instead of erroring.
+    const { error: bizErr } = await supabase.from("businesses").upsert(
+      {
+        id: user.id,
+        business_name: cleanBusinessName,
+        email: cleanEmail,
+        trial_start_date: new Date().toISOString(),
+        currency_code: chosenCurrency,
+      },
+      { onConflict: "id" }
+    );
     if (bizErr) {
+      // No longer fatal to the account existing — the trigger already
+      // guarantees a row is there — but still worth surfacing.
       notify("Account created, but saving your business details failed: " + bizErr.message, "err");
     }
     // Seed this device's local copy immediately too, so the very first
