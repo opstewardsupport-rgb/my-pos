@@ -233,7 +233,7 @@ import {
   Trash2, AlertTriangle, RotateCcw, Pencil, Check, Receipt as ReceiptIcon,
   Tag, Banknote, CreditCard, ImagePlus, Loader2, Camera, History as HistoryIcon,
   Ban, Undo2, ChevronDown, ChevronUp, StickyNote, Coins, ChefHat, Circle, CheckCircle2,
-  Settings as SettingsIcon, LogOut, Eye, EyeOff, Store,
+  Settings as SettingsIcon, LogOut, Eye, EyeOff, Store, ArrowRight,
 } from "lucide-react";
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell,
@@ -301,6 +301,23 @@ const PAYMONGO_LINK = "https://pm.link/org-KtaTpiR8vpcqBk2K2zkWjuxr/1VfePGD";
 // cosmetic and they'd still get charged full price at checkout.
 const PAYMONGO_LINK_REFERRAL = "https://pm.link/org-KtaTpiR8vpcqBk2K2zkWjuxr/REPLACE_WITH_DISCOUNTED_LINK";
 
+// PayMongo only settles Philippine payment methods (GCash, Maya, PH bank
+// transfer) and is only shown to subscribers billed in PHP. Everyone else
+// (any other currency in CURRENCIES) pays via PayPal instead — see
+// isPHCustomer/PAYPAL_LINK below in UpgradeView.
+//
+// EDIT ME: your PayPal.me link (or a PayPal Payment Link from
+// paypal.com/paypalme or the Buy Now button flow) for a FULL-PRICE payment.
+const PAYPAL_LINK = "https://www.paypal.com/paypalme/REPLACE_WITH_YOUR_PAYPAL_LINK";
+
+// EDIT ME: a SECOND PayPal link, created/priced at the referral-discounted
+// amount (25% off MONTHLY_PRICE_PHP's equivalent in the subscriber's
+// currency — see LOCKED_SUBSCRIPTION_PRICE_PHP below). Same reasoning as
+// PAYMONGO_LINK_REFERRAL: a fixed payment link can't apply a % discount on
+// its own, so the discounted price shown in the app has to be backed by a
+// real link at that exact amount.
+const PAYPAL_LINK_REFERRAL = "https://www.paypal.com/paypalme/REPLACE_WITH_YOUR_DISCOUNTED_PAYPAL_LINK";
+
 // EDIT ME: your actual monthly subscription price, shown on the Subscribe
 // popup. This is just a display number — it doesn't charge anything by
 // itself, PayMongo's own checkout page (opened via PAYMONGO_LINK above)
@@ -350,8 +367,10 @@ const MAX_REWARD_CREDIT_PERCENT = 60;
 // charged through a static link without a backend that talks to PayMongo's
 // API directly. Until you build that, collect these payments manually
 // (GCash, bank transfer, in person) for the exact discounted amount shown.
-const MANUAL_PAYMENT_NOTE =
+const MANUAL_PAYMENT_NOTE_PH =
   "This discount doesn't match a fixed PayMongo link, so pay this exact amount via GCash or bank transfer, then enter your reference below.";
+const MANUAL_PAYMENT_NOTE_INTL =
+  "This discount doesn't match a fixed PayPal link, so pay this exact amount via PayPal, then enter your reference below.";
 // Order numbers must never repeat, even after old sales are purged from
 // RETENTION_MONTHS — so this counter is tracked independently of sales.length
 // (which would otherwise shrink and start reissuing old numbers).
@@ -2251,8 +2270,8 @@ export default function CafePOS() {
 
   // Trial expired and never upgraded: block the whole app behind the
   // upgrade screen. There's no dismiss button here (onClose is null) —
-  // the owner has to either pay via the PayMongo link and self-report it,
-  // or log out.
+  // the owner has to either pay via PayMongo (PH) or PayPal (everywhere
+  // else) and self-report it, or log out.
   if (trialInfo.expired && !trialInfo.isSubscribed) {
     return (
       <Shell>
@@ -5620,7 +5639,11 @@ function SignUpView({ onSignUp, onSwitchToLogin }) {
   // Settings; the subscription price is only ever shown in this one
   // currency going forward, so switching currencies to "shop" for a
   // cheaper-looking price isn't possible.
-  const [currencyCode, setCurrencyCode] = useState("PHP");
+  // Starts BLANK on purpose — an owner has to actively pick a currency
+  // rather than silently inheriting a PHP default they may not have
+  // noticed. See the "Select a currency" placeholder option below and the
+  // validation in submit().
+  const [currencyCode, setCurrencyCode] = useState("");
   const [error, setError] = useState("");
   // True only when the error is specifically "this email already has an
   // account" — lets us show a one-click "Log in instead" link rather than
@@ -5635,6 +5658,7 @@ function SignUpView({ onSignUp, onSwitchToLogin }) {
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) { setError("Enter a valid email address."); return; }
     if (password.length < 6) { setError("Password must be at least 6 characters."); return; }
     if (password !== confirm) { setError("Passwords don't match."); return; }
+    if (!currencyCode) { setError("Please select a currency."); return; }
     setError("");
     setBusy(true);
     // No referral code here — that's entered later, on the Subscribe popup,
@@ -5690,8 +5714,9 @@ function SignUpView({ onSignUp, onSwitchToLogin }) {
               value={currencyCode}
               onChange={(e) => setCurrencyCode(e.target.value)}
               className="w-full border rounded-lg px-3 py-2 text-sm"
-              style={{ borderColor: "var(--line)" }}
+              style={{ borderColor: "var(--line)", color: currencyCode ? "inherit" : "var(--ink-soft)" }}
             >
+              <option value="" disabled>Select a currency…</option>
               {CURRENCIES_ALPHABETICAL.map((c) => <option key={c.code} value={c.code}>{c.label}</option>)}
             </select>
             <p className="text-[10px] mt-1" style={{ color: "var(--ink-soft)" }}>
@@ -6037,15 +6062,17 @@ function AutoSaveField({ label, value, onSave, type = "text", placeholder, minLe
 
 // Shown either as a full-page block (trial expired, onClose === null) or as
 // a dismissable modal (owner opened it voluntarily from the trial banner or
-// Settings, onClose is a function). Sends the owner to the PayMongo link —
-// which accepts GCash/Maya/local cards as well as international cards.
+// Settings, onClose is a function). Sends the owner to PayMongo (GCash/
+// Maya/local cards) if they're billed in PHP, or to PayPal if they're
+// billed in any other currency — see isPHCustomer below.
 // NOTE: the old self-report "I've paid — activate my account" button/flow
-// has been removed. There's no PayMongo webhook wired up (see
+// has been removed. There's no PayMongo/PayPal webhook wired up (see
 // supabase-schema.sql notes), so `onConfirm`/markSubscriptionActive — which
 // still flips subscription_status to "active" and resets reward credits for
 // the new billing cycle — now needs to be triggered another way (e.g. an
 // admin/back-office action, or a webhook you add later) once you've
-// reconciled a payment against the PayMongo dashboard or a manual transfer.
+// reconciled a payment against the PayMongo/PayPal dashboard or a manual
+// transfer.
 function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onApplyCode, onClose, onLogOut }) {
   const [code, setCode] = useState("");
   const [codeBusy, setCodeBusy] = useState(false);
@@ -6086,19 +6113,29 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
   const phpFullPrice = MONTHLY_PRICE_PHP;
   const phpDiscountAmount = phpFullPrice * (discountPercent / 100);
   const phpFinalPrice = Math.round(phpFullPrice - phpDiscountAmount);
-  const isForeignCurrency = currencyCode !== "PHP";
   const fmt = (n) => formatSubscriptionAmount(n, currencyCode);
   const fmtPhp = (n) => formatSubscriptionAmount(n, "PHP");
 
-  // PayMongo Payment Links are a fixed PHP price each — there's no way to
-  // charge an arbitrary % off, or a foreign currency, through one. We only
-  // have a real link for two exact PHP prices: full price, and the flat
+  // ---- Payment provider: PayMongo (Philippines) vs PayPal (everywhere
+  // else) ----
+  // PayMongo only settles Philippine payment methods, so it's only offered
+  // to subscribers billed in PHP. Every other currency uses PayPal instead
+  // — there's no PayMongo option shown to them at all.
+  const isPHCustomer = currencyCode === "PHP";
+
+  // Payment Links (both PayMongo's and PayPal's) are a fixed price each —
+  // there's no way to charge an arbitrary % off through one. We only have a
+  // real link for two exact prices per provider: full price, and the flat
   // one-time referral-signup price. Any other amount (a renewal discounted
   // by an ever-changing reward-credit %) has to be collected manually so
   // the amount actually charged matches what's shown here.
   const usesReferralLink = !hasSubscribedBefore && discountPercent === REFERRAL_DISCOUNT_PERCENT;
   const needsManualPayment = discountPercent > 0 && !usesReferralLink;
-  const payLink = usesReferralLink ? PAYMONGO_LINK_REFERRAL : PAYMONGO_LINK;
+  const payLink = isPHCustomer
+    ? (usesReferralLink ? PAYMONGO_LINK_REFERRAL : PAYMONGO_LINK)
+    : (usesReferralLink ? PAYPAL_LINK_REFERRAL : PAYPAL_LINK);
+  const manualPaymentNote = isPHCustomer ? MANUAL_PAYMENT_NOTE_PH : MANUAL_PAYMENT_NOTE_INTL;
+  const manualPaymentAmount = isPHCustomer ? fmtPhp(phpFinalPrice) : fmt(finalPrice);
 
   const headline = trialInfo?.renewalDue
     ? "Time to renew"
@@ -6150,10 +6187,18 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
           <span className="text-sm font-medium">{hasSubscribedBefore ? "Updated remaining bill" : "Final balance due"}</span>
           <span className="display-font text-2xl" style={{ fontWeight: 600 }}>{fmt(finalPrice)}<span className="text-sm font-normal">/month</span></span>
         </div>
-        {isForeignCurrency && (
-          <p className="text-[10px] mt-2" style={{ color: "var(--ink-soft)" }}>
-            Locked at today's rate for {currencyCode} — this amount won't change with daily exchange rates. Charged in PHP ({fmtPhp(phpFinalPrice)}) via PayMongo.
-          </p>
+        {/* ---- Clear "from → to" summary. Recomputes instantly (no reload
+            needed) any time discountPercent changes — i.e. the moment a
+            referral code is applied, or the moment reward credits change —
+            because it's derived straight from the account state React
+            already re-renders this view with. ---- */}
+        {discountPercent > 0 && (
+          <div className="flex items-center justify-center gap-2 mt-3 pt-3 text-xs" style={{ borderTop: "1px solid var(--line)" }}>
+            <span style={{ color: "var(--ink-soft)", textDecoration: "line-through" }}>{fmt(fullPrice)}</span>
+            <ArrowRight size={12} style={{ color: "var(--ink-soft)" }} />
+            <span className="font-semibold" style={{ color: "var(--primary)" }}>{fmt(finalPrice)}</span>
+            <span style={{ color: "var(--ink-soft)" }}>({discountPercent}% off)</span>
+          </div>
         )}
       </div>
 
@@ -6201,8 +6246,8 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
 
       {needsManualPayment ? (
         <div className="rounded-lg border p-3 text-xs" style={{ borderColor: "var(--line)" }}>
-          <div className="font-medium mb-1">Pay {fmtPhp(phpFinalPrice)} to activate</div>
-          <p style={{ color: "var(--ink-soft)" }}>{MANUAL_PAYMENT_NOTE}</p>
+          <div className="font-medium mb-1">Pay {manualPaymentAmount} to activate</div>
+          <p style={{ color: "var(--ink-soft)" }}>{manualPaymentNote}</p>
         </div>
       ) : (
         <>
@@ -6215,7 +6260,9 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
             <CreditCard size={15} /> Pay now
           </button>
           <p className="text-[11px] text-center mt-2" style={{ color: "var(--ink-soft)" }}>
-            Accepts GCash, Maya, and local or international cards — pay right here, you won't leave the app.
+            {isPHCustomer
+              ? "Accepts GCash, Maya, and local or international cards — pay right here, you won't leave the app."
+              : "Pay securely via PayPal — pay right here, you won't leave the app."}
           </p>
         </>
       )}
@@ -6238,16 +6285,18 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
   );
 
   // ---- In-app payment overlay ----
-  // Renders the PayMongo checkout inside an embedded frame, on top of
-  // everything else, so the owner pays without ever leaving the POS or
-  // opening a new browser tab/site. Note: some hosted checkout pages block
-  // being embedded this way for their own anti-clickjacking security (an
-  // X-Frame-Options / CSP header PayMongo controls, not this app) — if that
-  // ever happens the frame will just show blank/refuse to load, in which
-  // case the "Open in a new tab instead" link below is the fallback. A
-  // fully native in-app card form (no iframe at all) would need a backend
-  // holding your PayMongo secret key to create payment intents securely —
-  // that key can never live in this browser-side file.
+  // Renders the checkout (PayMongo for PHP subscribers, PayPal for every
+  // other currency — see isPHCustomer/payLink above) inside an embedded
+  // frame, on top of everything else, so the owner pays without ever
+  // leaving the POS or opening a new browser tab/site. Note: some hosted
+  // checkout pages block being embedded this way for their own
+  // anti-clickjacking security (an X-Frame-Options / CSP header the
+  // provider controls, not this app) — if that ever happens the frame will
+  // just show blank/refuse to load, in which case the "Open in a new tab
+  // instead" link below is the fallback. A fully native in-app card form
+  // (no iframe at all) would need a backend holding your PayMongo/PayPal
+  // secret key to create payment intents securely — that key can never
+  // live in this browser-side file.
   const checkoutModal = showCheckout && (
     <div className="fixed inset-0 z-[60] flex flex-col" style={{ background: "rgba(43,36,32,0.55)" }}>
       <div className="flex items-center justify-between px-4 py-3" style={{ background: "var(--surface)", borderBottom: "1px solid var(--line)" }}>
