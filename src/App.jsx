@@ -29,6 +29,7 @@
 
    ---- START: paste into Supabase SQL Editor ----
 
+   drop function if exists delete_own_account() cascade;
    create or replace function delete_own_account()
    returns void
    language plpgsql
@@ -73,6 +74,14 @@
    -- automatically going forward — the code exists from day one, it's just
    -- kept hidden in the UI (see SettingsView's isSubscriber check) until
    -- the account actually subscribes.
+   --
+   -- The DROP first is needed because Postgres refuses to change an
+   -- existing function's return type via CREATE OR REPLACE (error 42P13)
+   -- — it can only be dropped and recreated. Harmless if this function
+   -- doesn't exist yet; CASCADE also drops the trg_set_referral_code
+   -- trigger below if it already exists, which gets recreated further
+   -- down in this same script anyway.
+   drop function if exists generate_referral_code() cascade;
    create or replace function generate_referral_code()
    returns text
    language plpgsql
@@ -110,6 +119,7 @@
    end;
    $$;
 
+   drop function if exists set_referral_code_on_insert() cascade;
    create or replace function set_referral_code_on_insert()
    returns trigger
    language plpgsql
@@ -136,33 +146,55 @@
      set referral_code = generate_referral_code()
      where referral_code is null;
 
-   -- Redeems someone else's referral code: gives the CALLER a one-time 25%
-   -- discount on their first payment (first month only), and — ONLY if the
-   -- code owner is currently an active, paying, non-lapsed subscriber —
-   -- gives the CODE OWNER a 3% reward credit toward their CURRENT billing
-   -- cycle. Reward credits earned this way accumulate only within the
-   -- current billing month; the app resets reward_credits back to 0 every
-   -- time a subscriber's period renews (see markSubscriptionActive in the
-   -- app code), so a discount earned this month never carries into next
-   -- month's bill. If the code owner is on a free trial or their paid
-   -- period has lapsed, the code still works for the new sign-up's 25%
-   -- discount, but no reward credit is recorded for the owner (this mirrors
-   -- the app hiding an owner's code entirely while they're on a free trial
-   -- — see "Subscriber-Only Eligibility" — and is enforced here too, in
-   -- case a code ever gets shared before that gating existed / by mistake).
+   -- Holds a referral code the caller has TYPED AND CLICKED APPLY ON, but
+   -- hasn't paid for yet. Nothing about a code is permanent (not the
+   -- referrer's count, not the redemption record) until the caller's FIRST
+   -- payment is actually confirmed — see finalize_referral_redemption()
+   -- below. Until then this is just a "what code is currently queued up"
+   -- pointer, and applying a code (or a different code) can be done as many
+   -- times as the caller likes with zero side effects on the referrer. Safe
+   -- to run even if this column already exists.
+   alter table public.businesses
+     add column if not exists pending_referral_code text;
+
+   -- Applies a referral/discount code the caller typed in: shows them the
+   -- 25% first-payment price immediately (good UX — they should see the
+   -- discounted price before paying), but does NOT yet touch anything
+   -- permanent. Previously this function committed the redemption the
+   -- instant "Apply" was clicked — writing referred_by, inserting into
+   -- referral_redemptions, and incrementing the referrer's referral_count
+   -- — all before the caller had paid a cent. That meant someone who
+   -- clicked Apply and then closed the tab without paying had already
+   -- "used" the code: referred_by was set, which made every later attempt
+   -- (by them, including a genuine retry) fail with "You've already
+   -- redeemed a referral code", even though no discount had actually been
+   -- honored yet. Now, applying a code only ever sets discount_percent (for
+   -- the price preview) and pending_referral_code (a note of which code is
+   -- queued up) — both freely overwritable, right up until the caller's
+   -- first payment is confirmed. The code is only actually "spent" — for
+   -- both the caller and the referrer — by finalize_referral_redemption()
+   -- below, which the app calls the moment payment is confirmed (see
+   -- markSubscriptionActive() in the app code). If the caller never pays,
+   -- nothing here was ever permanent: the same code (or a different one)
+   -- can be applied again later with no penalty.
    -- Guards against every way someone could try to farm their own code:
    --   - can't redeem your own code (by account id)
    --   - can't redeem a code whose owner shares your account's email either
    --     (belt-and-suspenders — Supabase Auth already blocks duplicate
    --     emails, so this mainly catches a business row whose email field
    --     drifted out of sync with its auth email)
-   --   - can only be redeemed once per account, ever
+   --   - can only be redeemed once per account, ever — but that "once" is
+   --     now measured by an actual completed, PAID redemption (referred_by
+   --     being set by finalize_referral_redemption() below), not by merely
+   --     having clicked Apply
    --   - can't redeem the SAME code with the SAME email twice, even across
    --     deleting and recreating the account — this is enforced
    --     permanently via referral_redemptions (see above), which is never
    --     touched by delete_own_account(). A different code, or a genuinely
-   --     different email, isn't blocked by this.
-   --   - can only be redeemed before your FIRST payment — it's a new-signup
+   --     different email, isn't blocked by this. This check only looks at
+   --     COMPLETED redemptions, so it never blocks re-applying a code you
+   --     applied but never paid for.
+   --   - can only be applied before your FIRST payment — it's a new-signup
    --     perk, not something you can retroactively apply once you're an
    --     active subscriber
    -- Tracks every (email, code) redemption PERMANENTLY — deliberately its
@@ -173,9 +205,10 @@
    -- only record of "this email already used this code" used to live on
    -- the (now-deleted) businesses row. This table is keyed on email+code
    -- specifically, not just email — a given email is blocked from reusing
-   -- a code it's already redeemed, but is free to redeem a DIFFERENT code
-   -- later (see redeem_referral() below, which checks and writes to this
-   -- table).
+   -- a code it's already completed a paid redemption with, but is free to
+   -- apply a DIFFERENT code later (see redeem_referral() below, which
+   -- checks this table, and finalize_referral_redemption() below, which
+   -- writes to it).
    create table if not exists public.referral_redemptions (
      id bigserial primary key,
      email text not null,
@@ -190,12 +223,13 @@
      on public.referral_redemptions (lower(email), upper(code));
 
    -- No direct grants for this table — it's only ever touched from inside
-   -- redeem_referral() below, which runs as SECURITY DEFINER. RLS is
-   -- enabled with no policies, so nothing can read or write it directly
-   -- (including the browser's anon key); only the SECURITY DEFINER
-   -- function can.
+   -- redeem_referral() and finalize_referral_redemption() below, both of
+   -- which run as SECURITY DEFINER. RLS is enabled with no policies, so
+   -- nothing can read or write it directly (including the browser's anon
+   -- key); only those SECURITY DEFINER functions can.
    alter table public.referral_redemptions enable row level security;
 
+   drop function if exists redeem_referral(text) cascade;
    create or replace function redeem_referral(p_code text)
    returns void
    language plpgsql
@@ -219,18 +253,49 @@
        from public.businesses
        where id = v_caller_id;
 
+     -- Fallback: some accounts (e.g. rows created or edited by hand in the
+     -- Supabase Table Editor rather than through normal sign-up) can end
+     -- up with a null email on their businesses row, even though every
+     -- real Supabase Auth user always has one. Without this fallback, the
+     -- referral_redemptions insert made later by finalize_referral_redemption()
+     -- fails with a generic "null value in column email violates not-null
+     -- constraint" instead of a clear, actionable message — and worse,
+     -- silently skips recording the redemption at all. Pull it from
+     -- auth.users as a backstop so this only ever fails with the explicit
+     -- exception below, if it's truly unknown everywhere.
+     if v_caller_email is null then
+       select email into v_caller_email from auth.users where id = v_caller_id;
+       -- Quietly repair the businesses row now that we know the real
+       -- email, so this fallback doesn't need to run again for this
+       -- account next time.
+       if v_caller_email is not null then
+         update public.businesses set email = v_caller_email where id = v_caller_id;
+       end if;
+     end if;
+
+     if v_caller_email is null then
+       raise exception 'Your account is missing an email address, so a referral code can''t be recorded. Contact support to fix this.';
+     end if;
+
      if v_caller_status = 'active' then
        raise exception 'Referral codes can only be used before your first payment.';
      end if;
 
+     -- referred_by is only ever set by finalize_referral_redemption() below,
+     -- once a payment actually clears — so this only blocks someone who has
+     -- already completed one paid referral discount before. Merely having
+     -- applied-but-not-paid a code before does NOT set referred_by, so it
+     -- never blocks a genuine retry or a switch to a different code.
      if v_caller_referred_by is not null then
        raise exception 'You''ve already redeemed a referral code.';
      end if;
 
      -- Permanent, email-scoped re-use check — this is what actually
      -- survives account deletion (see referral_redemptions above). Blocks
-     -- this exact (email, code) pair only; the same email can still
-     -- redeem a DIFFERENT code later.
+     -- this exact (email, code) pair only, and only once that pair has
+     -- actually completed a paid redemption via finalize_referral_redemption()
+     -- below; the same email can still apply a DIFFERENT code, or retry
+     -- this same code, any time before paying.
      if v_caller_email is not null and exists (
        select 1 from public.referral_redemptions
        where lower(email) = lower(v_caller_email)
@@ -254,61 +319,55 @@
        raise exception 'You can''t use your own referral code.';
      end if;
 
-     -- NOTE: the 3% reward credit is intentionally NOT granted here
-     -- anymore. It used to be granted the instant a code was redeemed —
-     -- before the new sign-up had actually paid anything. That meant a
-     -- referrer could be credited for someone who applied a code and then
-     -- never subscribed at all. The reward is now granted exactly once,
-     -- later, by grant_referral_reward_on_payment() below — which only
-     -- runs when the referred person's FIRST payment is actually
-     -- confirmed (see markSubscriptionActive() in the app code). This
-     -- function still records who referred whom and the referral count
-     -- immediately, since those are just informational, not money.
+     -- Nothing permanent yet: just the price-preview discount and a note of
+     -- which code is queued up. referred_by, the referral_redemptions row,
+     -- and the referrer's referral_count are all written later, only once
+     -- this payment is actually confirmed — see finalize_referral_redemption()
+     -- below. That's what lets this same code (or a different one) be
+     -- applied again with zero penalty if the caller never ends up paying.
      update public.businesses
-       set discount_percent = 25, referred_by = v_referrer_id
+       set discount_percent = 25, pending_referral_code = upper(trim(p_code))
        where id = v_caller_id;
-
-     -- Written AFTER the discount is granted, and never removed by
-     -- delete_own_account() (it's a separate table, not part of
-     -- `businesses`) — this is the permanent record that blocks this
-     -- email from redeeming this same code again, even after the account
-     -- itself is deleted and recreated.
-     insert into public.referral_redemptions (email, code)
-       values (v_caller_email, upper(trim(p_code)));
-
-     -- Referral count is a stat, not money — safe to count immediately,
-     -- regardless of whether the referrer is currently an eligible
-     -- subscriber, and regardless of whether the new sign-up ever pays.
-     update public.businesses
-       set referral_count = coalesce(referral_count, 0) + 1
-       where id = v_referrer_id;
    end;
    $$;
 
    grant execute on function redeem_referral(text) to authenticated;
 
-   -- Grants the CALLER's referrer their one-time 3% reward credit for
-   -- having referred the caller — but ONLY the first time this is called
-   -- for a given caller, and ONLY if the caller actually has a referrer
-   -- (i.e. they redeemed a code via redeem_referral() above). Call this
-   -- from the app the moment the caller's FIRST payment is confirmed
-   -- (see markSubscriptionActive() in the app code) — never at signup or
-   -- code-redemption time. This is what makes the reward reflect a real
+   -- Actually "spends" a referral code — called from the app the moment the
+   -- caller's FIRST payment is confirmed (see markSubscriptionActive() in
+   -- the app code), never at code-apply time. This is the ONLY place a code
+   -- is ever marked used: it's what writes the permanent
+   -- referral_redemptions row, sets referred_by, and bumps the referrer's
+   -- referral_count — so someone who clicked Apply and then never paid
+   -- never counts as having "used" a code at all, for either side.
+   --
+   -- Also grants the referrer their one-time 3% reward credit for having
+   -- referred the caller — but ONLY the first time this runs for a given
+   -- caller, and ONLY if the caller actually has a code queued up or
+   -- already finalized. This is what makes the reward reflect a real
    -- paying referral instead of just someone typing in a code and
    -- abandoning the upgrade screen.
    --
-   -- Guards against ever double-crediting the same referral:
+   -- Guards against ever double-crediting or double-counting the same
+   -- referral:
    --   - referral_reward_granted on the CALLER's row flips to true the
    --     first time this runs for them and is checked up front, so a
    --     second call (e.g. a renewal, or the confirm button being pressed
    --     twice) is a safe no-op.
-   -- Mirrors the same subscriber-only eligibility redeem_referral() used
-   -- to check inline: the referrer only actually receives the 3% if
-   -- THEY are currently an active, non-lapsed subscriber at the moment
-   -- their referral pays — if not, the referral still gets marked as
-   -- "granted" (so it's never retried later once the referrer's status
-   -- changes), it just doesn't add any credit.
-   create or replace function grant_referral_reward_on_payment()
+   --   - pending_referral_code is cleared the moment it's finalized (or
+   --     found unusable), so it's never finalized twice.
+   --   - the same permanent referral_redemptions uniqueness redeem_referral()
+   --     checks before allowing an apply is re-checked here too, so a race
+   --     between two tabs both applying-then-paying can't double-insert.
+   -- Mirrors the same subscriber-only eligibility redeem_referral() checks:
+   -- the referrer only actually receives the 3% if THEY are currently an
+   -- active, non-lapsed subscriber at the moment their referral pays — if
+   -- not, the referral still gets marked as "granted" (so it's never
+   -- retried later once the referrer's status changes), it just doesn't
+   -- add any credit.
+   drop function if exists grant_referral_reward_on_payment() cascade;
+   drop function if exists finalize_referral_redemption() cascade;
+   create or replace function finalize_referral_redemption()
    returns void
    language plpgsql
    security definer
@@ -316,8 +375,12 @@
    as $$
    declare
      v_caller_id uuid := auth.uid();
-     v_referrer_id uuid;
+     v_caller_email text;
+     v_pending_code text;
+     v_referred_by uuid;
      v_already_granted boolean;
+     v_referrer_id uuid;
+     v_referrer_email text;
      v_referrer_status text;
      v_referrer_period_end timestamptz;
      v_referrer_is_eligible boolean;
@@ -326,21 +389,66 @@
        return;
      end if;
 
-     select referred_by, coalesce(referral_reward_granted, false)
-       into v_referrer_id, v_already_granted
+     select email, pending_referral_code, referred_by, coalesce(referral_reward_granted, false)
+       into v_caller_email, v_pending_code, v_referred_by, v_already_granted
        from public.businesses
        where id = v_caller_id;
 
-     -- Nothing to do: this account was never referred, or this exact
+     -- A code was applied but never finalized before — spend it now, for
+     -- real, since this is the first confirmed payment. Only runs if
+     -- referred_by isn't already set (i.e. this hasn't been finalized
+     -- before), so it can never run twice for the same code.
+     if v_pending_code is not null and v_referred_by is null then
+       select id, email
+         into v_referrer_id, v_referrer_email
+         from public.businesses
+         where upper(referral_code) = v_pending_code;
+
+       -- The code's owner account is gone or the code changed somehow
+       -- between apply-time and now — nothing to credit, just clear the
+       -- stale pointer and move on with the payment.
+       if v_referrer_id is null
+          or v_referrer_id = v_caller_id
+          or (v_referrer_email is not null and v_caller_email is not null
+              and lower(v_referrer_email) = lower(v_caller_email)) then
+         update public.businesses set pending_referral_code = null where id = v_caller_id;
+       elsif v_caller_email is not null and exists (
+         select 1 from public.referral_redemptions
+         where lower(email) = lower(v_caller_email)
+           and upper(code) = v_pending_code
+       ) then
+         -- Already recorded by a previous call (e.g. a duplicate click) —
+         -- just clear the pointer, don't insert a second row.
+         update public.businesses set pending_referral_code = null where id = v_caller_id;
+       else
+         insert into public.referral_redemptions (email, code)
+           values (v_caller_email, v_pending_code);
+
+         update public.businesses
+           set referred_by = v_referrer_id, pending_referral_code = null
+           where id = v_caller_id;
+
+         -- Referral count is a stat, safe to count now that the referral
+         -- has genuinely resulted in a paid subscription.
+         update public.businesses
+           set referral_count = coalesce(referral_count, 0) + 1
+           where id = v_referrer_id;
+
+         v_referred_by := v_referrer_id;
+       end if;
+     end if;
+
+     -- Nothing to reward: this account was never referred (no code was
+     -- ever applied, or it turned out unusable above), or this exact
      -- referral has already been credited once before.
-     if v_referrer_id is null or v_already_granted then
+     if v_referred_by is null or v_already_granted then
        return;
      end if;
 
      select subscription_status, subscription_period_end
        into v_referrer_status, v_referrer_period_end
        from public.businesses
-       where id = v_referrer_id;
+       where id = v_referred_by;
 
      v_referrer_is_eligible := (v_referrer_status = 'active')
        and (v_referrer_period_end is null or v_referrer_period_end > now());
@@ -348,7 +456,7 @@
      if v_referrer_is_eligible then
        update public.businesses
          set reward_credits = coalesce(reward_credits, 0) + 3
-         where id = v_referrer_id;
+         where id = v_referred_by;
      end if;
 
      -- Marked granted regardless of the eligibility outcome above, so this
@@ -361,10 +469,10 @@
    end;
    $$;
 
-   grant execute on function grant_referral_reward_on_payment() to authenticated;
+   grant execute on function finalize_referral_redemption() to authenticated;
 
    -- Tracks whether THIS account's referral reward (the 3% it owes its
-   -- referrer) has already been granted, so grant_referral_reward_on_payment()
+   -- referrer) has already been granted, so finalize_referral_redemption()
    -- above can never fire twice for the same referral. Safe to run even if
    -- this column already exists.
    alter table public.businesses
@@ -1343,21 +1451,25 @@ export default function CafePOS() {
     accountRef.current = next;
     setAccount(next);
 
-    // Credit this person's referrer (if any) with their one-time 3% reward
-    // — but only now, on an actual confirmed FIRST payment, never at
-    // code-redemption time. See grant_referral_reward_on_payment() in the
-    // SQL setup block at the top of this file, which is also the real
-    // enforcement: it's a no-op if this account was never referred, and a
-    // safe no-op if this exact referral was somehow already credited
-    // before (so this can never double-credit a referrer, even if this
-    // function ever runs twice for the same first payment). Deliberately
-    // fire-and-forget with respect to the UI: if this call fails, the
-    // subscriber's own upgrade has still fully succeeded above, so we log
-    // the failure for debugging rather than showing the subscriber an
-    // error about someone else's reward credit.
+    // Actually "spend" any referral code that was applied-but-not-yet-paid
+    // (pending_referral_code) — this is the ONLY moment a code is ever
+    // marked used, for both this account and the referrer, and it's why a
+    // code clicked "Apply" and then abandoned never blocks a later, real
+    // attempt. Also credits this person's referrer (if any) with their
+    // one-time 3% reward — but only now, on an actual confirmed FIRST
+    // payment, never at code-apply time. See finalize_referral_redemption()
+    // in the SQL setup block at the top of this file, which is also the
+    // real enforcement: it's a no-op if this account never applied a code,
+    // and a safe no-op if this exact referral was somehow already finalized
+    // before (so this can never double-credit a referrer or double-count a
+    // redemption, even if this function ever runs twice for the same first
+    // payment). Deliberately fire-and-forget with respect to the UI: if
+    // this call fails, the subscriber's own upgrade has still fully
+    // succeeded above, so we log the failure for debugging rather than
+    // showing the subscriber an error about someone else's reward credit.
     if (isFirstPayment) {
-      supabase.rpc("grant_referral_reward_on_payment").then(({ error: rewardErr }) => {
-        if (rewardErr) console.error("grant_referral_reward_on_payment failed:", rewardErr);
+      supabase.rpc("finalize_referral_redemption").then(({ error: rewardErr }) => {
+        if (rewardErr) console.error("finalize_referral_redemption failed:", rewardErr);
       });
     }
 
@@ -1371,6 +1483,13 @@ export default function CafePOS() {
   // before that first payment; see redeem_referral() in the SQL setup block
   // at the top of this file, which is the actual source of truth for all of
   // this, since a client can't be trusted to award itself a discount).
+  // Applying a code only ever previews the discount and queues the code up
+  // (pending_referral_code) — it does NOT "use up" the code. The code is
+  // only actually spent, for the caller and the referrer, once payment is
+  // confirmed (see finalize_referral_redemption(), called from
+  // markSubscriptionActive() below). That means this can be called again
+  // freely — the same code or a different one — any number of times before
+  // the owner actually pays, with zero side effects either way.
   // Returns `true` on success, or an error STRING the popup can show
   // directly (e.g. "Invalid referral code").
   const applyReferralCode = useCallback(async (code) => {
@@ -1396,8 +1515,9 @@ export default function CafePOS() {
       const { error } = await supabase.rpc("redeem_referral", { p_code: clean.toUpperCase() });
       if (error) return error.message || "That code isn't valid.";
 
-      // The RPC just committed discount_percent = 25 server-side (see
-      // redeem_referral() in the SQL setup block) — that part is already a
+      // The RPC just committed discount_percent = 25 (a preview only — the
+      // code itself isn't spent yet, see redeem_referral() in the SQL setup
+      // block) server-side — that part is already a
       // known, guaranteed fact the instant this line runs. Reflect it in the
       // UI right away instead of waiting on a second network round-trip
       // (fetchBusiness below) to tell us what we already know. Previously,
@@ -1428,7 +1548,7 @@ export default function CafePOS() {
         accountRef.current = biz;
         setAccount(biz);
       }
-      notify(`Code applied — you'll get ${biz?.discountPercent || REFERRAL_DISCOUNT_PERCENT}% off your first payment.`);
+      notify(`Code applied — you'll get ${biz?.discountPercent || REFERRAL_DISCOUNT_PERCENT}% off your first payment. This is confirmed once you complete payment.`);
       return true;
     } catch (err) {
       console.error("applyReferralCode failed:", err);
