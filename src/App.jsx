@@ -78,17 +78,33 @@
    language plpgsql
    as $$
    declare
-     v_chars text := 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; -- no 0/O/1/I, avoids confusing codes
+     v_letters text := 'ABCDEFGHJKLMNPQRSTUVWXYZ'; -- no I/O, avoids confusing codes
+     v_digits text := '23456789'; -- no 0/1, avoids confusing codes
+     v_chars text := v_letters || v_digits;
      v_code text;
-     v_exists boolean;
+     v_has_letter boolean;
+     v_has_digit boolean;
+     v_c text;
    begin
      loop
        v_code := '';
+       v_has_letter := false;
+       v_has_digit := false;
        for i in 1..6 loop
-         v_code := v_code || substr(v_chars, floor(random() * length(v_chars) + 1)::int, 1);
+         v_c := substr(v_chars, floor(random() * length(v_chars) + 1)::int, 1);
+         v_code := v_code || v_c;
+         if strpos(v_letters, v_c) > 0 then
+           v_has_letter := true;
+         else
+           v_has_digit := true;
+         end if;
        end loop;
-       select exists(select 1 from public.businesses where referral_code = v_code) into v_exists;
-       exit when not v_exists;
+       -- Every code is guaranteed to mix at least one letter AND one digit
+       -- (not left to pure chance) — reroll all 6 characters until both
+       -- are present, so a code never comes out as, say, all letters.
+       exit when v_has_letter and v_has_digit and not exists(
+         select 1 from public.businesses where referral_code = v_code
+       );
      end loop;
      return v_code;
    end;
