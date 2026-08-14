@@ -78,33 +78,17 @@
    language plpgsql
    as $$
    declare
-     v_letters text := 'ABCDEFGHJKLMNPQRSTUVWXYZ'; -- no I/O, avoids confusing codes
-     v_digits text := '23456789'; -- no 0/1, avoids confusing codes
-     v_chars text := v_letters || v_digits;
+     v_chars text := 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; -- no 0/O/1/I, avoids confusing codes
      v_code text;
-     v_has_letter boolean;
-     v_has_digit boolean;
-     v_c text;
+     v_exists boolean;
    begin
      loop
        v_code := '';
-       v_has_letter := false;
-       v_has_digit := false;
        for i in 1..6 loop
-         v_c := substr(v_chars, floor(random() * length(v_chars) + 1)::int, 1);
-         v_code := v_code || v_c;
-         if strpos(v_letters, v_c) > 0 then
-           v_has_letter := true;
-         else
-           v_has_digit := true;
-         end if;
+         v_code := v_code || substr(v_chars, floor(random() * length(v_chars) + 1)::int, 1);
        end loop;
-       -- Every code is guaranteed to mix at least one letter AND one digit
-       -- (not left to pure chance) — reroll all 6 characters until both
-       -- are present, so a code never comes out as, say, all letters.
-       exit when v_has_letter and v_has_digit and not exists(
-         select 1 from public.businesses where referral_code = v_code
-       );
+       select exists(select 1 from public.businesses where referral_code = v_code) into v_exists;
+       exit when not v_exists;
      end loop;
      return v_code;
    end;
@@ -157,45 +141,9 @@
    --     emails, so this mainly catches a business row whose email field
    --     drifted out of sync with its auth email)
    --   - can only be redeemed once per account, ever
-   --   - can't redeem the SAME code with the SAME email twice, even across
-   --     deleting and recreating the account — this is enforced
-   --     permanently via referral_redemptions (see above), which is never
-   --     touched by delete_own_account(). A different code, or a genuinely
-   --     different email, isn't blocked by this.
    --   - can only be redeemed before your FIRST payment — it's a new-signup
    --     perk, not something you can retroactively apply once you're an
    --     active subscriber
-   -- Tracks every (email, code) redemption PERMANENTLY — deliberately its
-   -- own table, not a column on `businesses`, so this survives account
-   -- deletion. Without this, deleting your account (see
-   -- delete_own_account() above) and signing back up with the SAME email
-   -- would let you redeem the SAME referral code a second time, since the
-   -- only record of "this email already used this code" used to live on
-   -- the (now-deleted) businesses row. This table is keyed on email+code
-   -- specifically, not just email — a given email is blocked from reusing
-   -- a code it's already redeemed, but is free to redeem a DIFFERENT code
-   -- later (see redeem_referral() below, which checks and writes to this
-   -- table).
-   create table if not exists public.referral_redemptions (
-     id bigserial primary key,
-     email text not null,
-     code text not null,
-     redeemed_at timestamptz not null default now()
-   );
-
-   -- One (email, code) combination can only ever be redeemed once, for the
-   -- lifetime of that email address — enforced case-insensitively so
-   -- "Owner@X.com"/"owner@x.com" and "abcd"/"ABCD" can't slip past it.
-   create unique index if not exists referral_redemptions_email_code_idx
-     on public.referral_redemptions (lower(email), upper(code));
-
-   -- No direct grants for this table — it's only ever touched from inside
-   -- redeem_referral() below, which runs as SECURITY DEFINER. RLS is
-   -- enabled with no policies, so nothing can read or write it directly
-   -- (including the browser's anon key); only the SECURITY DEFINER
-   -- function can.
-   alter table public.referral_redemptions enable row level security;
-
    create or replace function redeem_referral(p_code text)
    returns void
    language plpgsql
@@ -230,18 +178,6 @@
        raise exception 'You''ve already redeemed a referral code.';
      end if;
 
-     -- Permanent, email-scoped re-use check — this is what actually
-     -- survives account deletion (see referral_redemptions above). Blocks
-     -- this exact (email, code) pair only; the same email can still
-     -- redeem a DIFFERENT code later.
-     if v_caller_email is not null and exists (
-       select 1 from public.referral_redemptions
-       where lower(email) = lower(v_caller_email)
-         and upper(code) = upper(trim(p_code))
-     ) then
-       raise exception 'This code has already been used for this email. Use another code.';
-     end if;
-
      select id, email, subscription_status, subscription_period_end
        into v_referrer_id, v_referrer_email, v_referrer_status, v_referrer_period_end
        from public.businesses
@@ -268,14 +204,6 @@
      update public.businesses
        set discount_percent = 25, referred_by = v_referrer_id
        where id = v_caller_id;
-
-     -- Written AFTER the discount is granted, and never removed by
-     -- delete_own_account() (it's a separate table, not part of
-     -- `businesses`) — this is the permanent record that blocks this
-     -- email from redeeming this same code again, even after the account
-     -- itself is deleted and recreated.
-     insert into public.referral_redemptions (email, code)
-       values (v_caller_email, upper(trim(p_code)));
 
      if v_referrer_is_eligible then
        update public.businesses
@@ -305,7 +233,7 @@ import {
   Trash2, AlertTriangle, RotateCcw, Pencil, Check, Receipt as ReceiptIcon,
   Tag, Banknote, CreditCard, ImagePlus, Loader2, Camera, History as HistoryIcon,
   Ban, Undo2, ChevronDown, ChevronUp, StickyNote, Coins, ChefHat, Circle, CheckCircle2,
-  Settings as SettingsIcon, LogOut, Eye, EyeOff, Store, ArrowRight,
+  Settings as SettingsIcon, LogOut, Eye, EyeOff, Store,
 } from "lucide-react";
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell,
@@ -373,22 +301,15 @@ const PAYMONGO_LINK = "https://pm.link/org-KtaTpiR8vpcqBk2K2zkWjuxr/1VfePGD";
 // cosmetic and they'd still get charged full price at checkout.
 const PAYMONGO_LINK_REFERRAL = "https://pm.link/org-KtaTpiR8vpcqBk2K2zkWjuxr/REPLACE_WITH_DISCOUNTED_LINK";
 
-// PayMongo only settles Philippine payment methods (GCash, Maya, PH bank
-// transfer) and is only shown to subscribers billed in PHP. Everyone else
-// (any other currency in CURRENCIES) pays via PayPal instead — see
-// isPHCustomer/PAYPAL_LINK below in UpgradeView.
-//
-// EDIT ME: your PayPal.me link (or a PayPal Payment Link from
-// paypal.com/paypalme or the Buy Now button flow) for a FULL-PRICE payment.
-const PAYPAL_LINK = "https://www.paypal.com/paypalme/REPLACE_WITH_YOUR_PAYPAL_LINK";
-
-// EDIT ME: a SECOND PayPal link, created/priced at the referral-discounted
-// amount (25% off MONTHLY_PRICE_PHP's equivalent in the subscriber's
-// currency — see LOCKED_SUBSCRIPTION_PRICE_PHP below). Same reasoning as
-// PAYMONGO_LINK_REFERRAL: a fixed payment link can't apply a % discount on
-// its own, so the discounted price shown in the app has to be backed by a
-// real link at that exact amount.
-const PAYPAL_LINK_REFERRAL = "https://www.paypal.com/paypalme/REPLACE_WITH_YOUR_DISCOUNTED_PAYPAL_LINK";
+// EDIT ME: your PayPal.me username (just the username, no URL/slashes) —
+// https://paypal.me/<this>. PayMongo is PHP-only (it's a Philippine payment
+// processor), so every non-PHP subscriber is routed to PayPal instead, never
+// to PayMongo. PayPal.me links support an amount + currency code appended
+// right onto the URL (e.g. paypal.me/yourname/35.00USD), so — unlike the two
+// fixed PayMongo links above — the exact discounted price can be built
+// dynamically for any subscriber, in their own currency, without needing a
+// separate link per price point.
+const PAYPAL_ME_USERNAME = "REPLACE_WITH_YOUR_PAYPAL_ME_USERNAME";
 
 // EDIT ME: your actual monthly subscription price, shown on the Subscribe
 // popup. This is just a display number — it doesn't charge anything by
@@ -439,10 +360,8 @@ const MAX_REWARD_CREDIT_PERCENT = 60;
 // charged through a static link without a backend that talks to PayMongo's
 // API directly. Until you build that, collect these payments manually
 // (GCash, bank transfer, in person) for the exact discounted amount shown.
-const MANUAL_PAYMENT_NOTE_PH =
+const MANUAL_PAYMENT_NOTE =
   "This discount doesn't match a fixed PayMongo link, so pay this exact amount via GCash or bank transfer, then enter your reference below.";
-const MANUAL_PAYMENT_NOTE_INTL =
-  "This discount doesn't match a fixed PayPal link, so pay this exact amount via PayPal, then enter your reference below.";
 // Order numbers must never repeat, even after old sales are purged from
 // RETENTION_MONTHS — so this counter is tracked independently of sales.length
 // (which would otherwise shrink and start reissuing old numbers).
@@ -1039,6 +958,13 @@ export default function CafePOS() {
   // what went wrong (e.g. "you already have an account, log in instead")
   // instead of a generic "something went wrong, try again."
   const signUp = useCallback(async ({ businessName, email, password, currencyCode, referralCode }) => {
+    // Validate the currency BEFORE creating the auth account — this is the
+    // account's permanent billing/display currency (see fetchBusiness /
+    // markSubscriptionActive), so a blank or bogus value here should stop
+    // sign-up entirely rather than quietly falling back to PHP.
+    if (!CURRENCIES.some((c) => c.code === currencyCode)) {
+      return "Select your currency.";
+    }
     const cleanEmail = email.trim();
     const { data, error } = await supabase.auth.signUp({ email: cleanEmail, password });
     if (error) {
@@ -1052,16 +978,12 @@ export default function CafePOS() {
       return "Couldn't create the account — please try again.";
     }
 
-    // Currency is chosen once, right here, and never changes afterward — it
-    // drives both POS totals and the subscription price shown in Settings.
-    const chosenCurrency = CURRENCIES.some((c) => c.code === currencyCode) ? currencyCode : "PHP";
-
     const { error: bizErr } = await supabase.from("businesses").insert({
       id: user.id,
       business_name: businessName.trim(),
       email: cleanEmail,
       trial_start_date: new Date().toISOString(),
-      currency_code: chosenCurrency,
+      currency_code: currencyCode,
     });
     if (bizErr) {
       notify("Account created, but saving your business details failed: " + bizErr.message, "err");
@@ -1069,7 +991,7 @@ export default function CafePOS() {
     // Seed this device's local copy immediately too, so the very first
     // render (before fetchBusiness round-trips) already shows the right
     // currency instead of a brief flash of PHP.
-    await safeSet(scopedKey(CURRENCY_KEY, user.id), chosenCurrency);
+    await safeSet(scopedKey(CURRENCY_KEY, user.id), currencyCode);
 
     if (referralCode && referralCode.trim()) {
       const { error: refErr } = await supabase.rpc("redeem_referral", {
@@ -1372,14 +1294,9 @@ export default function CafePOS() {
     if (!ok) notify("Couldn't save — check connection and try again.", "err");
   }, [notify]);
 
-  // Purges anything older than RETENTION_MONTHS on every single save (not
-  // just on initial page load) — so if the POS is left open across a
-  // month-end, older sales still get dropped promptly instead of quietly
-  // piling up until the next reload.
   const persistSales = useCallback(async (next) => {
-    const trimmed = purgeOldSales(next);
-    setSales(trimmed);
-    const ok = await safeSet(scopedKey(SALES_KEY, authUserIdRef.current), trimmed);
+    setSales(next);
+    const ok = await safeSet(scopedKey(SALES_KEY, authUserIdRef.current), next);
     if (!ok) notify("Couldn't save the sale — check connection and try again.", "err");
   }, [notify]);
 
@@ -2347,8 +2264,8 @@ export default function CafePOS() {
 
   // Trial expired and never upgraded: block the whole app behind the
   // upgrade screen. There's no dismiss button here (onClose is null) —
-  // the owner has to either pay via PayMongo (PH) or PayPal (everywhere
-  // else) and self-report it, or log out.
+  // the owner has to either pay via the PayMongo link and self-report it,
+  // or log out.
   if (trialInfo.expired && !trialInfo.isSubscribed) {
     return (
       <Shell>
@@ -5711,15 +5628,12 @@ function SignUpView({ onSignUp, onSwitchToLogin }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
-  // Chosen once, here, at setup — this becomes the account's permanent
-  // billing/display currency. There's no way to change it later in
-  // Settings; the subscription price is only ever shown in this one
-  // currency going forward, so switching currencies to "shop" for a
-  // cheaper-looking price isn't possible.
-  // Starts BLANK on purpose — an owner has to actively pick a currency
-  // rather than silently inheriting a PHP default they may not have
-  // noticed. See the "Select a currency" placeholder option below and the
-  // validation in submit().
+  // Blank by default — the owner must actively pick one, rather than
+  // silently inheriting a default they didn't choose. Becomes the
+  // account's permanent billing/display currency once set: there's no way
+  // to change it later in Settings, and the subscription price is only
+  // ever shown in this one currency going forward, so switching currencies
+  // to "shop" for a cheaper-looking price isn't possible.
   const [currencyCode, setCurrencyCode] = useState("");
   const [error, setError] = useState("");
   // True only when the error is specifically "this email already has an
@@ -5735,7 +5649,7 @@ function SignUpView({ onSignUp, onSwitchToLogin }) {
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) { setError("Enter a valid email address."); return; }
     if (password.length < 6) { setError("Password must be at least 6 characters."); return; }
     if (password !== confirm) { setError("Passwords don't match."); return; }
-    if (!currencyCode) { setError("Please select a currency."); return; }
+    if (!currencyCode) { setError("Select your currency."); return; }
     setError("");
     setBusy(true);
     // No referral code here — that's entered later, on the Subscribe popup,
@@ -5793,7 +5707,7 @@ function SignUpView({ onSignUp, onSwitchToLogin }) {
               className="w-full border rounded-lg px-3 py-2 text-sm"
               style={{ borderColor: "var(--line)", color: currencyCode ? "inherit" : "var(--ink-soft)" }}
             >
-              <option value="" disabled>Select a currency…</option>
+              <option value="" disabled>Select your currency…</option>
               {CURRENCIES_ALPHABETICAL.map((c) => <option key={c.code} value={c.code}>{c.label}</option>)}
             </select>
             <p className="text-[10px] mt-1" style={{ color: "var(--ink-soft)" }}>
@@ -6139,17 +6053,15 @@ function AutoSaveField({ label, value, onSave, type = "text", placeholder, minLe
 
 // Shown either as a full-page block (trial expired, onClose === null) or as
 // a dismissable modal (owner opened it voluntarily from the trial banner or
-// Settings, onClose is a function). Sends the owner to PayMongo (GCash/
-// Maya/local cards) if they're billed in PHP, or to PayPal if they're
-// billed in any other currency — see isPHCustomer below.
+// Settings, onClose is a function). Sends the owner to the PayMongo link —
+// which accepts GCash/Maya/local cards as well as international cards.
 // NOTE: the old self-report "I've paid — activate my account" button/flow
-// has been removed. There's no PayMongo/PayPal webhook wired up (see
+// has been removed. There's no PayMongo webhook wired up (see
 // supabase-schema.sql notes), so `onConfirm`/markSubscriptionActive — which
 // still flips subscription_status to "active" and resets reward credits for
 // the new billing cycle — now needs to be triggered another way (e.g. an
 // admin/back-office action, or a webhook you add later) once you've
-// reconciled a payment against the PayMongo/PayPal dashboard or a manual
-// transfer.
+// reconciled a payment against the PayMongo dashboard or a manual transfer.
 function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onApplyCode, onClose, onLogOut }) {
   const [code, setCode] = useState("");
   const [codeBusy, setCodeBusy] = useState(false);
@@ -6158,10 +6070,6 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
   // now happens inside the POS in an embedded frame instead of opening
   // PayMongo's checkout in a new browser tab.
   const [showCheckout, setShowCheckout] = useState(false);
-  // Briefly true right after a code is successfully applied, so the price
-  // box can flash/highlight and make the before → after change obvious
-  // instead of just silently re-rendering with new numbers.
-  const [justApplied, setJustApplied] = useState(false);
 
   const applyCode = async () => {
     if (codeBusy) return;
@@ -6169,14 +6077,8 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
     setCodeBusy(true);
     const result = await onApplyCode(code);
     setCodeBusy(false);
-    if (result !== true) {
-      setCodeError(result || "That code isn't valid.");
-    } else {
-      setCode("");
-      // Trigger the highlight; auto-clear so it doesn't stay on forever.
-      setJustApplied(true);
-      window.setTimeout(() => setJustApplied(false), 1600);
-    }
+    if (result !== true) setCodeError(result || "That code isn't valid.");
+    else setCode("");
   };
 
   // Has this account ever paid before? Only a renewal (true) earns reward
@@ -6200,29 +6102,30 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
   const phpFullPrice = MONTHLY_PRICE_PHP;
   const phpDiscountAmount = phpFullPrice * (discountPercent / 100);
   const phpFinalPrice = Math.round(phpFullPrice - phpDiscountAmount);
+  const isForeignCurrency = currencyCode !== "PHP";
   const fmt = (n) => formatSubscriptionAmount(n, currencyCode);
   const fmtPhp = (n) => formatSubscriptionAmount(n, "PHP");
 
-  // ---- Payment provider: PayMongo (Philippines) vs PayPal (everywhere
-  // else) ----
-  // PayMongo only settles Philippine payment methods, so it's only offered
-  // to subscribers billed in PHP. Every other currency uses PayPal instead
-  // — there's no PayMongo option shown to them at all.
-  const isPHCustomer = currencyCode === "PHP";
-
-  // Payment Links (both PayMongo's and PayPal's) are a fixed price each —
-  // there's no way to charge an arbitrary % off through one. We only have a
-  // real link for two exact prices per provider: full price, and the flat
-  // one-time referral-signup price. Any other amount (a renewal discounted
-  // by an ever-changing reward-credit %) has to be collected manually so
-  // the amount actually charged matches what's shown here.
-  const usesReferralLink = !hasSubscribedBefore && discountPercent === REFERRAL_DISCOUNT_PERCENT;
-  const needsManualPayment = discountPercent > 0 && !usesReferralLink;
-  const payLink = isPHCustomer
-    ? (usesReferralLink ? PAYMONGO_LINK_REFERRAL : PAYMONGO_LINK)
-    : (usesReferralLink ? PAYPAL_LINK_REFERRAL : PAYPAL_LINK);
-  const manualPaymentNote = isPHCustomer ? MANUAL_PAYMENT_NOTE_PH : MANUAL_PAYMENT_NOTE_INTL;
-  const manualPaymentAmount = isPHCustomer ? fmtPhp(phpFinalPrice) : fmt(finalPrice);
+  // ---- Payment routing: PayMongo (PHP only) vs PayPal (everyone else) ----
+  // PayMongo is a Philippine payment processor — it isn't offered to
+  // international subscribers at all, only PHP ones. Every other currency
+  // goes to PayPal instead.
+  //   PHP → PayMongo. Payment Links are a fixed price each, so we only have
+  //   real links for two exact PHP prices (full price, and the flat
+  //   one-time referral-signup price). Any other PHP amount (a renewal
+  //   discounted by an ever-changing reward-credit %) has to be collected
+  //   manually so the amount actually charged matches what's shown here.
+  //   Non-PHP → PayPal. A PayPal.me link takes an amount + currency code
+  //   right in the URL, so it can always be built for the exact discounted
+  //   price on the fly — no manual-payment fallback needed for these.
+  const usesReferralLink = !isForeignCurrency && !hasSubscribedBefore && discountPercent === REFERRAL_DISCOUNT_PERCENT;
+  const needsManualPayment = !isForeignCurrency && discountPercent > 0 && !usesReferralLink;
+  const payMongoLink = usesReferralLink ? PAYMONGO_LINK_REFERRAL : PAYMONGO_LINK;
+  const currencyMeta = CURRENCIES.find((c) => c.code === currencyCode);
+  const paypalAmount = currencyMeta?.zeroDecimal ? Math.round(finalPrice).toString() : finalPrice.toFixed(2);
+  const paypalLink = `https://paypal.me/${PAYPAL_ME_USERNAME}/${paypalAmount}${currencyCode}`;
+  const payLink = isForeignCurrency ? paypalLink : payMongoLink;
+  const payProviderName = isForeignCurrency ? "PayPal" : "PayMongo";
 
   const headline = trialInfo?.renewalDue
     ? "Time to renew"
@@ -6252,14 +6155,7 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
           Reward Credit / Updated Remaining Bill Amount. Same three-line
           shape either way — just different labels for the middle/last
           rows, per the two scenarios. */}
-      <div
-        className="rounded-xl border p-4 mb-4 transition-all duration-500"
-        style={{
-          borderColor: justApplied ? "#2F6B45" : "var(--line)",
-          background: "var(--bg)",
-          boxShadow: justApplied ? "0 0 0 3px rgba(47,107,69,0.15)" : "none",
-        }}
-      >
+      <div className="rounded-xl border p-4 mb-4" style={{ borderColor: "var(--line)", background: "var(--bg)" }}>
         <div className="flex items-center justify-between text-sm">
           <span style={{ color: "var(--ink-soft)" }}>{hasSubscribedBefore ? "Next bill amount" : "Original price"}</span>
           <span className={discountPercent > 0 ? "line-through" : ""} style={{ color: discountPercent > 0 ? "var(--ink-soft)" : "inherit" }}>
@@ -6281,19 +6177,6 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
           <span className="text-sm font-medium">{hasSubscribedBefore ? "Updated remaining bill" : "Final balance due"}</span>
           <span className="display-font text-2xl" style={{ fontWeight: 600 }}>{fmt(finalPrice)}<span className="text-sm font-normal">/month</span></span>
         </div>
-        {/* ---- Clear "from → to" summary. Recomputes instantly (no reload
-            needed) any time discountPercent changes — i.e. the moment a
-            referral code is applied, or the moment reward credits change —
-            because it's derived straight from the account state React
-            already re-renders this view with. ---- */}
-        {discountPercent > 0 && (
-          <div className="flex items-center justify-center gap-2 mt-3 pt-3 text-xs" style={{ borderTop: "1px solid var(--line)" }}>
-            <span style={{ color: "var(--ink-soft)", textDecoration: "line-through" }}>{fmt(fullPrice)}</span>
-            <ArrowRight size={12} style={{ color: "var(--ink-soft)" }} />
-            <span className="font-semibold" style={{ color: "var(--primary)" }}>{fmt(finalPrice)}</span>
-            <span style={{ color: "var(--ink-soft)" }}>({discountPercent}% off)</span>
-          </div>
-        )}
       </div>
 
       {/* ---- Discount / referral code — only for a first-ever payment; a
@@ -6340,8 +6223,8 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
 
       {needsManualPayment ? (
         <div className="rounded-lg border p-3 text-xs" style={{ borderColor: "var(--line)" }}>
-          <div className="font-medium mb-1">Pay {manualPaymentAmount} to activate</div>
-          <p style={{ color: "var(--ink-soft)" }}>{manualPaymentNote}</p>
+          <div className="font-medium mb-1">Pay {fmtPhp(phpFinalPrice)} to activate</div>
+          <p style={{ color: "var(--ink-soft)" }}>{MANUAL_PAYMENT_NOTE}</p>
         </div>
       ) : (
         <>
@@ -6354,9 +6237,9 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
             <CreditCard size={15} /> Pay now
           </button>
           <p className="text-[11px] text-center mt-2" style={{ color: "var(--ink-soft)" }}>
-            {isPHCustomer
-              ? "Accepts GCash, Maya, and local or international cards — pay right here, you won't leave the app."
-              : "Pay securely via PayPal — pay right here, you won't leave the app."}
+            {isForeignCurrency
+              ? "Pays via PayPal — right here, you won't leave the app."
+              : "Accepts GCash, Maya, and local or international cards via PayMongo — pay right here, you won't leave the app."}
           </p>
         </>
       )}
@@ -6379,23 +6262,23 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
   );
 
   // ---- In-app payment overlay ----
-  // Renders the checkout (PayMongo for PHP subscribers, PayPal for every
-  // other currency — see isPHCustomer/payLink above) inside an embedded
-  // frame, on top of everything else, so the owner pays without ever
-  // leaving the POS or opening a new browser tab/site. Note: some hosted
-  // checkout pages block being embedded this way for their own
-  // anti-clickjacking security (an X-Frame-Options / CSP header the
-  // provider controls, not this app) — if that ever happens the frame will
-  // just show blank/refuse to load, in which case the "Open in a new tab
-  // instead" link below is the fallback. A fully native in-app card form
-  // (no iframe at all) would need a backend holding your PayMongo/PayPal
-  // secret key to create payment intents securely — that key can never
-  // live in this browser-side file.
+  // Renders the checkout (PayMongo for PHP, PayPal for every other
+  // currency — see payLink above) inside an embedded frame, on top of
+  // everything else, so the owner pays without ever leaving the POS or
+  // opening a new browser tab/site. Note: some hosted checkout pages block
+  // being embedded this way for their own anti-clickjacking security (an
+  // X-Frame-Options / CSP header the payment provider controls, not this
+  // app — PayPal in particular often does this) — if that ever happens the
+  // frame will just show blank/refuse to load, in which case the "Open in a
+  // new tab instead" link below is the fallback. A fully native in-app card
+  // form (no iframe at all, for either provider) would need a backend
+  // holding your provider's secret/API key to create charges securely —
+  // that key can never live in this browser-side file.
   const checkoutModal = showCheckout && (
     <div className="fixed inset-0 z-[60] flex flex-col" style={{ background: "rgba(43,36,32,0.55)" }}>
       <div className="flex items-center justify-between px-4 py-3" style={{ background: "var(--surface)", borderBottom: "1px solid var(--line)" }}>
         <div className="flex items-center gap-2 text-sm font-medium">
-          <CreditCard size={15} /> Secure payment
+          <CreditCard size={15} /> Secure payment — {payProviderName}
         </div>
         <button onClick={() => setShowCheckout(false)} className="flex items-center gap-1 text-xs px-2 py-1 rounded-lg" style={{ color: "var(--ink-soft)" }}>
           <X size={14} /> Close
