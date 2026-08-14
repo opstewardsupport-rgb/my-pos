@@ -6158,6 +6158,10 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
   // now happens inside the POS in an embedded frame instead of opening
   // PayMongo's checkout in a new browser tab.
   const [showCheckout, setShowCheckout] = useState(false);
+  // Briefly true right after a code is successfully applied, so the price
+  // box can flash/highlight and make the before → after change obvious
+  // instead of just silently re-rendering with new numbers.
+  const [justApplied, setJustApplied] = useState(false);
 
   const applyCode = async () => {
     if (codeBusy) return;
@@ -6165,8 +6169,14 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
     setCodeBusy(true);
     const result = await onApplyCode(code);
     setCodeBusy(false);
-    if (result !== true) setCodeError(result || "That code isn't valid.");
-    else setCode("");
+    if (result !== true) {
+      setCodeError(result || "That code isn't valid.");
+    } else {
+      setCode("");
+      // Trigger the highlight; auto-clear so it doesn't stay on forever.
+      setJustApplied(true);
+      window.setTimeout(() => setJustApplied(false), 1600);
+    }
   };
 
   // Has this account ever paid before? Only a renewal (true) earns reward
@@ -6242,7 +6252,14 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
           Reward Credit / Updated Remaining Bill Amount. Same three-line
           shape either way — just different labels for the middle/last
           rows, per the two scenarios. */}
-      <div className="rounded-xl border p-4 mb-4" style={{ borderColor: "var(--line)", background: "var(--bg)" }}>
+      <div
+        className="rounded-xl border p-4 mb-4 transition-all duration-500"
+        style={{
+          borderColor: justApplied ? "#2F6B45" : "var(--line)",
+          background: "var(--bg)",
+          boxShadow: justApplied ? "0 0 0 3px rgba(47,107,69,0.15)" : "none",
+        }}
+      >
         <div className="flex items-center justify-between text-sm">
           <span style={{ color: "var(--ink-soft)" }}>{hasSubscribedBefore ? "Next bill amount" : "Original price"}</span>
           <span className={discountPercent > 0 ? "line-through" : ""} style={{ color: discountPercent > 0 ? "var(--ink-soft)" : "inherit" }}>
