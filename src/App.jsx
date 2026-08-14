@@ -609,19 +609,49 @@ const PAYMONGO_LINK_REFERRAL = "https://pm.link/org-KtaTpiR8vpcqBk2K2zkWjuxr/REP
 // PayMongo only settles Philippine payment methods (GCash, Maya, PH bank
 // transfer) and is only shown to subscribers billed in PHP. Everyone else
 // (any other currency in CURRENCIES) pays via PayPal instead — see
-// isPHCustomer/PAYPAL_LINK below in UpgradeView.
+// isPHCustomer/buildPayPalLink below in UpgradeView.
 //
-// EDIT ME: your PayPal.me link (or a PayPal Payment Link from
-// paypal.com/paypalme or the Buy Now button flow) for a FULL-PRICE payment.
-const PAYPAL_LINK = "https://www.paypal.com/paypalme/REPLACE_WITH_YOUR_PAYPAL_LINK";
+// PayPal is handled differently from PayMongo above. PayMongo Payment Links
+// are a fixed price each, so PayMongo needed two separate links (full price
+// and one flat referral price) and still falls back to a manual transfer
+// for anything else. But there is no fixed discount number here — a
+// brand-new subscriber can get REFERRAL_DISCOUNT_PERCENT off (25%) on their
+// first payment, and an existing subscriber can stack up to
+// MAX_REWARD_CREDIT_PERCENT off in REFERRAL_REWARD_PERCENT (3%) increments,
+// one per person who used their code that billing cycle — so the actual
+// amount due is different for practically every subscriber. PayPal.me
+// links support the amount being typed straight into the URL
+// (paypal.me/yourname/24.79USD), so instead of maintaining fixed-price
+// links, buildPayPalLink() further below builds that URL fresh every time
+// from whatever the subscriber's real final price is. That's what makes
+// PayPal "automatic" for any discount amount: the checkout page a
+// subscriber lands on always asks for the exact number shown on screen,
+// no separate link to create per discount tier, and no manual reconciling
+// of an amount against a percentage.
+//
+// EDIT ME: your PayPal.me username — the part after paypal.me/ in your own
+// PayPal.me link. E.g. if your link is paypal.me/YourCafe, this is
+// "YourCafe". Set this up (or find it) at paypal.com/paypalme.
+const PAYPAL_ME_USERNAME = "REPLACE_WITH_YOUR_PAYPAL_ME_USERNAME";
 
-// EDIT ME: a SECOND PayPal link, created/priced at the referral-discounted
-// amount (25% off MONTHLY_PRICE_PHP's equivalent in the subscriber's
-// currency — see LOCKED_SUBSCRIPTION_PRICE_PHP below). Same reasoning as
-// PAYMONGO_LINK_REFERRAL: a fixed payment link can't apply a % discount on
-// its own, so the discounted price shown in the app has to be backed by a
-// real link at that exact amount.
-const PAYPAL_LINK_REFERRAL = "https://www.paypal.com/paypalme/REPLACE_WITH_YOUR_DISCOUNTED_PAYPAL_LINK";
+// PayPal only settles in a specific list of currencies — asking it to
+// charge in one it doesn't support (e.g. paypal.me/you/550000IDR) just
+// fails on PayPal's own checkout page, no matter how the link was built.
+// This is PayPal's publicly documented list of supported currencies as of
+// early 2026, filtered down to the ones this app offers in CURRENCIES
+// above. PayPal can add or remove currencies over time, so if a subscriber
+// ever reports their PayPal checkout rejecting the currency, double-check
+// this list against your own PayPal dashboard (Settings → Money) and
+// adjust it here.
+// Currencies from CURRENCIES that are deliberately left OUT of this set,
+// and why: INR (PayPal restricts personal PayPal.me transfers to/within
+// India), IDR and VND (PayPal doesn't settle in either at all). Subscribers
+// billed in one of those three still fall back to the manual-payment note
+// below (see needsManualPayment in UpgradeView) — not because of the
+// discount amount, only because of the currency itself.
+const PAYPAL_SUPPORTED_CURRENCIES = new Set([
+  "PHP", "USD", "EUR", "GBP", "JPY", "AUD", "SGD", "MYR", "THB",
+]);
 
 // EDIT ME: your actual monthly subscription price, shown on the Subscribe
 // popup. This is just a display number — it doesn't charge anything by
@@ -665,7 +695,7 @@ const REFERRAL_REWARD_PERCENT = 3;
 // cap — raise it if you want a more generous ceiling.
 const MAX_REWARD_CREDIT_PERCENT = 60;
 
-// EDIT ME: shown when a subscriber's exact discounted amount (e.g. a
+// EDIT ME: shown when a PH subscriber's exact discounted amount (e.g. a
 // renewal with reward credits applied) doesn't match either of the two
 // fixed PayMongo links above. PayMongo Payment Links are a fixed price
 // each, so an arbitrary, ever-changing reward-credit percentage can't be
@@ -674,8 +704,13 @@ const MAX_REWARD_CREDIT_PERCENT = 60;
 // (GCash, bank transfer, in person) for the exact discounted amount shown.
 const MANUAL_PAYMENT_NOTE_PH =
   "This discount doesn't match a fixed PayMongo link, so pay this exact amount via GCash or bank transfer, then enter your reference below.";
+// Shown to a non-PH subscriber ONLY when their billing currency is one
+// PayPal itself doesn't settle in (see PAYPAL_SUPPORTED_CURRENCIES above) —
+// every other international discount amount now goes through the dynamic
+// PayPal button automatically, so this is a currency-support fallback, not
+// a discount fallback.
 const MANUAL_PAYMENT_NOTE_INTL =
-  "This discount doesn't match a fixed PayPal link, so pay this exact amount via PayPal, then enter your reference below.";
+  "PayPal doesn't support settling in your billing currency, so pay this exact amount (converted to USD) via PayPal, then enter your reference below.";
 // Order numbers must never repeat, even after old sales are purged from
 // RETENTION_MONTHS — so this counter is tracked independently of sales.length
 // (which would otherwise shrink and start reissuing old numbers).
@@ -763,6 +798,30 @@ function formatSubscriptionAmount(amount, currencyCode) {
 // if an unrecognized code somehow shows up.
 const lockedSubscriptionPrice = (currencyCode) =>
   LOCKED_SUBSCRIPTION_PRICE_PHP[currencyCode] ?? LOCKED_SUBSCRIPTION_PRICE_PHP.PHP;
+
+// Formats an amount the way PayPal.me expects it in the URL — plain digits
+// and a ".", no thousands separators, no currency symbol, and the right
+// number of decimal places for the currency (0 for JPY-style currencies,
+// otherwise 2). This is deliberately different from
+// formatSubscriptionAmount()/money() above, which are for on-screen display
+// only and include symbols/separators PayPal.me's URL doesn't want.
+function formatPayPalAmount(amount, currencyCode) {
+  const cur = CURRENCIES.find((c) => c.code === currencyCode) || CURRENCIES[0];
+  const n = Math.max(0, Number(amount) || 0);
+  return cur.zeroDecimal ? String(Math.round(n)) : n.toFixed(2);
+}
+
+// Builds a PayPal.me checkout link priced at the EXACT amount passed in —
+// see PAYPAL_ME_USERNAME above for why this replaces maintaining a separate
+// fixed-price link per discount tier. Call this with whatever the
+// subscriber's real final price works out to (see UpgradeView), and the
+// checkout page PayPal shows them will ask for that amount, whether it's
+// full price, 25% off a first payment, or some odd number of accumulated
+// 3%-per-referral reward credits off a renewal.
+function buildPayPalLink(amount, currencyCode) {
+  const amt = formatPayPalAmount(amount, currencyCode);
+  return `https://www.paypal.com/paypalme/${PAYPAL_ME_USERNAME}/${amt}${currencyCode}`;
+}
 
 let CURRENT_SYMBOL = "₱"; // updated each render from the chosen currency, read by money()
 
@@ -6497,15 +6556,22 @@ function AutoSaveField({ label, value, onSave, type = "text", placeholder, minLe
 // a dismissable modal (owner opened it voluntarily from the trial banner or
 // Settings, onClose is a function). Sends the owner to PayMongo (GCash/
 // Maya/local cards) if they're billed in PHP, or to PayPal if they're
-// billed in any other currency — see isPHCustomer below.
-// NOTE: the old self-report "I've paid — activate my account" button/flow
-// has been removed. There's no PayMongo/PayPal webhook wired up (see
-// supabase-schema.sql notes), so `onConfirm`/markSubscriptionActive — which
-// still flips subscription_status to "active" and resets reward credits for
-// the new billing cycle — now needs to be triggered another way (e.g. an
-// admin/back-office action, or a webhook you add later) once you've
-// reconciled a payment against the PayMongo/PayPal dashboard or a manual
-// transfer.
+// billed in any other currency — see isPHCustomer below. The PayPal button
+// is fully automatic regardless of the discount: buildPayPalLink() (near
+// the top of this file) bakes the subscriber's exact final price — full
+// price, first-payment referral discount, or any accumulated reward-credit
+// % on a renewal — straight into the PayPal checkout URL, so there's no
+// fixed-price link to keep in sync with an ever-changing discount.
+// NOTE: that only covers CHARGING the right amount, not CONFIRMING the
+// payment. The old self-report "I've paid — activate my account" button/
+// flow has been removed, and there's still no PayPal/PayMongo webhook wired
+// up (see supabase-schema.sql notes) — PayPal will notify you directly
+// (dashboard + email) when a payment for your PAYPAL_ME_USERNAME comes in,
+// but `onConfirm`/markSubscriptionActive — which flips subscription_status
+// to "active" and resets reward credits for the new billing cycle — still
+// needs to be triggered another way (e.g. an admin/back-office action you
+// take after seeing that PayPal notification, or a webhook you add later)
+// once you've reconciled the payment.
 function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onApplyCode, onClose, onLogOut }) {
   const [code, setCode] = useState("");
   const [codeBusy, setCodeBusy] = useState(false);
@@ -6576,19 +6642,41 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
   // — there's no PayMongo option shown to them at all.
   const isPHCustomer = currencyCode === "PHP";
 
-  // Payment Links (both PayMongo's and PayPal's) are a fixed price each —
-  // there's no way to charge an arbitrary % off through one. We only have a
-  // real link for two exact prices per provider: full price, and the flat
-  // one-time referral-signup price. Any other amount (a renewal discounted
-  // by an ever-changing reward-credit %) has to be collected manually so
-  // the amount actually charged matches what's shown here.
+  // PayMongo Payment Links are still a fixed price each — there's no
+  // backend in this browser-only app to talk to PayMongo's API and create
+  // an arbitrary-amount charge on the fly. So PH subscribers still only
+  // have a real link for two exact prices: full price, and the flat
+  // one-time referral-signup price (usesReferralLink) — anything else (a
+  // renewal discounted by an ever-changing reward-credit %) still has to be
+  // collected manually so the amount actually charged matches what's shown
+  // here.
   const usesReferralLink = !hasSubscribedBefore && discountPercent === REFERRAL_DISCOUNT_PERCENT;
-  const needsManualPayment = discountPercent > 0 && !usesReferralLink;
+
+  // PayPal is different: buildPayPalLink() (see near the top of this file)
+  // bakes the exact final price straight into the checkout URL, so it
+  // covers every possible discount amount automatically — full price, the
+  // one-time 25% signup discount, or any accumulated reward-credit %.
+  // There is exactly one remaining reason a PayPal subscriber still needs
+  // the manual-payment fallback: their billing currency isn't one PayPal
+  // itself settles in (see PAYPAL_SUPPORTED_CURRENCIES above) — that's a
+  // currency problem, not a discount problem, and no link can work around
+  // it.
+  const needsManualPayment = isPHCustomer
+    ? (discountPercent > 0 && !usesReferralLink)
+    : !PAYPAL_SUPPORTED_CURRENCIES.has(currencyCode);
   const payLink = isPHCustomer
     ? (usesReferralLink ? PAYMONGO_LINK_REFERRAL : PAYMONGO_LINK)
-    : (usesReferralLink ? PAYPAL_LINK_REFERRAL : PAYPAL_LINK);
+    : buildPayPalLink(finalPrice, currencyCode);
   const manualPaymentNote = isPHCustomer ? MANUAL_PAYMENT_NOTE_PH : MANUAL_PAYMENT_NOTE_INTL;
-  const manualPaymentAmount = isPHCustomer ? fmtPhp(phpFinalPrice) : fmt(finalPrice);
+  // For the PH manual fallback this is the real PHP amount (what PayMongo/
+  // GCash/bank transfer actually settles in). For the international manual
+  // fallback (unsupported currency only, see above) this is a USD amount
+  // instead of the subscriber's own currency, since by definition PayPal
+  // won't take their own currency — USD is the one every PayPal account can
+  // send/receive.
+  const usdFullPrice = lockedSubscriptionPrice("USD");
+  const usdFinalPrice = usdFullPrice - usdFullPrice * (discountPercent / 100);
+  const manualPaymentAmount = isPHCustomer ? fmtPhp(phpFinalPrice) : formatSubscriptionAmount(usdFinalPrice, "USD");
 
   const headline = trialInfo?.renewalDue
     ? "Time to renew"
@@ -6722,7 +6810,7 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
           <p className="text-[11px] text-center mt-2" style={{ color: "var(--ink-soft)" }}>
             {isPHCustomer
               ? "Accepts GCash, Maya, and local or international cards — pay right here, you won't leave the app."
-              : "Pay securely via PayPal — pay right here, you won't leave the app."}
+              : `Pay securely via PayPal — the checkout is pre-filled for ${fmt(finalPrice)}, your exact discounted amount, so that's the only amount that will be deducted.`}
           </p>
         </>
       )}
