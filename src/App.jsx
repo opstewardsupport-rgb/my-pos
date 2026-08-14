@@ -209,9 +209,6 @@
      v_caller_referred_by uuid;
      v_referrer_id uuid;
      v_referrer_email text;
-     v_referrer_status text;
-     v_referrer_period_end timestamptz;
-     v_referrer_is_eligible boolean;
    begin
      if v_caller_id is null then
        raise exception 'You must be logged in to redeem a referral code.';
@@ -242,8 +239,8 @@
        raise exception 'This code has already been used for this email. Use another code.';
      end if;
 
-     select id, email, subscription_status, subscription_period_end
-       into v_referrer_id, v_referrer_email, v_referrer_status, v_referrer_period_end
+     select id, email
+       into v_referrer_id, v_referrer_email
        from public.businesses
        where upper(referral_code) = upper(trim(p_code));
 
@@ -257,14 +254,16 @@
        raise exception 'You can''t use your own referral code.';
      end if;
 
-     -- Subscriber-only eligibility: the code owner only earns the 3% reward
-     -- credit while they're an ACTIVE, PAYING subscriber — not during their
-     -- own free trial, and not once their paid period has lapsed without
-     -- renewing. This does not block the redemption itself; the new
-     -- sign-up still gets their 25% discount either way.
-     v_referrer_is_eligible := (v_referrer_status = 'active')
-       and (v_referrer_period_end is null or v_referrer_period_end > now());
-
+     -- NOTE: the 3% reward credit is intentionally NOT granted here
+     -- anymore. It used to be granted the instant a code was redeemed —
+     -- before the new sign-up had actually paid anything. That meant a
+     -- referrer could be credited for someone who applied a code and then
+     -- never subscribed at all. The reward is now granted exactly once,
+     -- later, by grant_referral_reward_on_payment() below — which only
+     -- runs when the referred person's FIRST payment is actually
+     -- confirmed (see markSubscriptionActive() in the app code). This
+     -- function still records who referred whom and the referral count
+     -- immediately, since those are just informational, not money.
      update public.businesses
        set discount_percent = 25, referred_by = v_referrer_id
        where id = v_caller_id;
@@ -277,23 +276,99 @@
      insert into public.referral_redemptions (email, code)
        values (v_caller_email, upper(trim(p_code)));
 
-     if v_referrer_is_eligible then
-       update public.businesses
-         set reward_credits = coalesce(reward_credits, 0) + 3,
-             referral_count = coalesce(referral_count, 0) + 1
-         where id = v_referrer_id;
-     else
-       -- Still counts as a referral for their history/stats, just with no
-       -- reward credit attached since they weren't an eligible subscriber
-       -- at the time it was used.
-       update public.businesses
-         set referral_count = coalesce(referral_count, 0) + 1
-         where id = v_referrer_id;
-     end if;
+     -- Referral count is a stat, not money — safe to count immediately,
+     -- regardless of whether the referrer is currently an eligible
+     -- subscriber, and regardless of whether the new sign-up ever pays.
+     update public.businesses
+       set referral_count = coalesce(referral_count, 0) + 1
+       where id = v_referrer_id;
    end;
    $$;
 
    grant execute on function redeem_referral(text) to authenticated;
+
+   -- Grants the CALLER's referrer their one-time 3% reward credit for
+   -- having referred the caller — but ONLY the first time this is called
+   -- for a given caller, and ONLY if the caller actually has a referrer
+   -- (i.e. they redeemed a code via redeem_referral() above). Call this
+   -- from the app the moment the caller's FIRST payment is confirmed
+   -- (see markSubscriptionActive() in the app code) — never at signup or
+   -- code-redemption time. This is what makes the reward reflect a real
+   -- paying referral instead of just someone typing in a code and
+   -- abandoning the upgrade screen.
+   --
+   -- Guards against ever double-crediting the same referral:
+   --   - referral_reward_granted on the CALLER's row flips to true the
+   --     first time this runs for them and is checked up front, so a
+   --     second call (e.g. a renewal, or the confirm button being pressed
+   --     twice) is a safe no-op.
+   -- Mirrors the same subscriber-only eligibility redeem_referral() used
+   -- to check inline: the referrer only actually receives the 3% if
+   -- THEY are currently an active, non-lapsed subscriber at the moment
+   -- their referral pays — if not, the referral still gets marked as
+   -- "granted" (so it's never retried later once the referrer's status
+   -- changes), it just doesn't add any credit.
+   create or replace function grant_referral_reward_on_payment()
+   returns void
+   language plpgsql
+   security definer
+   set search_path = public
+   as $$
+   declare
+     v_caller_id uuid := auth.uid();
+     v_referrer_id uuid;
+     v_already_granted boolean;
+     v_referrer_status text;
+     v_referrer_period_end timestamptz;
+     v_referrer_is_eligible boolean;
+   begin
+     if v_caller_id is null then
+       return;
+     end if;
+
+     select referred_by, coalesce(referral_reward_granted, false)
+       into v_referrer_id, v_already_granted
+       from public.businesses
+       where id = v_caller_id;
+
+     -- Nothing to do: this account was never referred, or this exact
+     -- referral has already been credited once before.
+     if v_referrer_id is null or v_already_granted then
+       return;
+     end if;
+
+     select subscription_status, subscription_period_end
+       into v_referrer_status, v_referrer_period_end
+       from public.businesses
+       where id = v_referrer_id;
+
+     v_referrer_is_eligible := (v_referrer_status = 'active')
+       and (v_referrer_period_end is null or v_referrer_period_end > now());
+
+     if v_referrer_is_eligible then
+       update public.businesses
+         set reward_credits = coalesce(reward_credits, 0) + 3
+         where id = v_referrer_id;
+     end if;
+
+     -- Marked granted regardless of the eligibility outcome above, so this
+     -- referral is never re-evaluated or re-credited again later — it's a
+     -- one-time perk tied to this one first payment, not something that
+     -- keeps checking back in on the referrer's status.
+     update public.businesses
+       set referral_reward_granted = true
+       where id = v_caller_id;
+   end;
+   $$;
+
+   grant execute on function grant_referral_reward_on_payment() to authenticated;
+
+   -- Tracks whether THIS account's referral reward (the 3% it owes its
+   -- referrer) has already been granted, so grant_referral_reward_on_payment()
+   -- above can never fire twice for the same referral. Safe to run even if
+   -- this column already exists.
+   alter table public.businesses
+     add column if not exists referral_reward_granted boolean not null default false;
 
    ---- END: paste into Supabase SQL Editor ----
 ============================================================================= */
@@ -1267,6 +1342,25 @@ export default function CafePOS() {
     };
     accountRef.current = next;
     setAccount(next);
+
+    // Credit this person's referrer (if any) with their one-time 3% reward
+    // — but only now, on an actual confirmed FIRST payment, never at
+    // code-redemption time. See grant_referral_reward_on_payment() in the
+    // SQL setup block at the top of this file, which is also the real
+    // enforcement: it's a no-op if this account was never referred, and a
+    // safe no-op if this exact referral was somehow already credited
+    // before (so this can never double-credit a referrer, even if this
+    // function ever runs twice for the same first payment). Deliberately
+    // fire-and-forget with respect to the UI: if this call fails, the
+    // subscriber's own upgrade has still fully succeeded above, so we log
+    // the failure for debugging rather than showing the subscriber an
+    // error about someone else's reward credit.
+    if (isFirstPayment) {
+      supabase.rpc("grant_referral_reward_on_payment").then(({ error: rewardErr }) => {
+        if (rewardErr) console.error("grant_referral_reward_on_payment failed:", rewardErr);
+      });
+    }
+
     notify(isFirstPayment ? "You're upgraded — thanks for subscribing!" : "Renewed — thanks for staying with us! Your reward credit has reset to 0% for the new billing cycle.");
     return true;
   }, [authUser, notify]);
