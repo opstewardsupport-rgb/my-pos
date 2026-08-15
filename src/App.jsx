@@ -1203,7 +1203,15 @@ export default function CafePOS() {
     }
     if (account.subscriptionStatus === "active") {
       const periodEndMs = account.subscriptionPeriodEnd ? new Date(account.subscriptionPeriodEnd).getTime() : null;
-      const renewalDue = Number.isFinite(periodEndMs) && Date.now() >= periodEndMs;
+      // A missing or unparseable period end (e.g. an account flipped to
+      // "active" by hand in the Supabase table editor without also setting
+      // subscription_period_end — see the SQL setup notes at the top of
+      // this file) must NOT be read as "never renews": that would leave
+      // the POS usable forever with no monthly bill ever shown. Treat an
+      // unknown period end as due-now instead, so the same hard-block
+      // renewal popup always appears rather than silently granting free
+      // access.
+      const renewalDue = !Number.isFinite(periodEndMs) || Date.now() >= periodEndMs;
       const isSubscribed = !renewalDue;
       return {
         daysLeft: null,
