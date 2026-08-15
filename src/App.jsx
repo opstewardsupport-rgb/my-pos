@@ -2638,7 +2638,6 @@ export default function CafePOS() {
     persistSales([...sales, sale]);
     persistParkedOrders(parkedOrders.filter((t) => t.id !== tab.id));
     setSettleTabTarget(null);
-    setTabDetailId(null);
     setReceipt(sale);
   };
 
@@ -5075,69 +5074,26 @@ function ParkOrderModal({ nextOrderNo, onClose, onConfirm }) {
   );
 }
 
-// Same Preparing / Completed split as the Kitchen board — a tab can be
-// checked off (crossed out) as done even though it's still unpaid; it only
-// leaves this list entirely once it's actually settled (paid) or cancelled.
-// Everything about a tab — item list, prepared checklist, adding items,
-// marking complete, cancelling, settling — happens right on its card here,
-// same as a Kitchen order card. There's no full-screen popup to open.
+// Every open (unpaid) tab lives in one list here, regardless of whether its
+// items are all checked off — "Mark order complete" below only tracks
+// kitchen prep (crossed-out items, same idea as the Kitchen board), it does
+// NOT move the tab anywhere. A tab only ever leaves this list two ways:
+// settleTab() (the bill actually gets paid — it becomes a `sale` and moves
+// over to the Kitchen board / Sales history) or cancelTab(). Everything
+// about a tab — item list, prepared checklist, adding items, marking
+// complete, cancelling, settling — happens right on its card here, same as
+// a Kitchen order card. There's no full-screen popup to open.
 function TabsView({
   tabs, products, categories, onRename, onAddItem, onIncrement, onDecrement,
   onRemoveItem, onTogglePrepared, onSetStatus, onCancelTab, onSettle,
 }) {
-  const [subview, setSubview] = useState("preparing");
-  const preparing = tabs.filter((t) => (t.status || "preparing") !== "completed");
-  const completed = tabs.filter((t) => t.status === "completed");
-  const list = (subview === "preparing" ? preparing : completed).slice().sort((a, b) => a.openedAt - b.openedAt);
+  const list = tabs.slice().sort((a, b) => a.openedAt - b.openedAt);
 
   return (
     <div>
-      <SectionTitle
-        action={
-          <div className="flex rounded-lg border p-0.5 text-xs" style={{ borderColor: "var(--line)" }}>
-            <button
-              onClick={() => setSubview("preparing")}
-              className="px-3 py-1.5 rounded-md flex items-center gap-1.5"
-              style={{ background: subview === "preparing" ? "var(--primary)" : "transparent", color: subview === "preparing" ? "#fff" : "var(--ink-soft)" }}
-            >
-              Preparing
-              {preparing.length > 0 && (
-                <span
-                  className="text-[10px] px-1.5 rounded-full"
-                  style={{ background: subview === "preparing" ? "rgba(255,255,255,0.25)" : "var(--alert)", color: "#fff" }}
-                >
-                  {preparing.length}
-                </span>
-              )}
-            </button>
-            <button
-              onClick={() => setSubview("completed")}
-              className="px-3 py-1.5 rounded-md flex items-center gap-1.5"
-              style={{ background: subview === "completed" ? "var(--primary)" : "transparent", color: subview === "completed" ? "#fff" : "var(--ink-soft)" }}
-            >
-              Completed
-              {completed.length > 0 && (
-                <span
-                  className="text-[10px] px-1.5 rounded-full"
-                  style={{ background: subview === "completed" ? "rgba(255,255,255,0.25)" : "var(--bg)", color: subview === "completed" ? "#fff" : "var(--ink-soft)" }}
-                >
-                  {completed.length}
-                </span>
-              )}
-            </button>
-          </div>
-        }
-      >
-        Tabs
-      </SectionTitle>
+      <SectionTitle>Tabs</SectionTitle>
       {list.length === 0 ? (
-        <EmptyState
-          text={
-            subview === "preparing"
-              ? `No open tabs. Use "Park as a tab" on the POS screen for a table that's eating now and paying later.`
-              : "No tabs marked complete yet — check off every item, or use \"Mark order complete\" on a tab."
-          }
-        />
+        <EmptyState text={`No open tabs. Use "Park as a tab" on the POS screen for a table that's eating now and paying later.`} />
       ) : (
         <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3 items-start">
           {list.map((t) => (
