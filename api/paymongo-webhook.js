@@ -1,147 +1,156 @@
-// =============================================================================
-// api/paymongo-webhook.js — Vercel serverless function
-// =============================================================================
-// This is the piece that makes activation AUTOMATIC. PayMongo calls this
-// URL itself, the instant a checkout session gets paid — no need for the
-// subscriber (or you) to do anything else. It:
-//   1. Confirms the request genuinely came from PayMongo (signature check).
-//   2. Reads the business_id that create-paymongo-link.js tagged the
-//      checkout with.
-//   3. Calls activate_subscription_for_business() in Supabase (see
-//      supabase-activate-subscription.sql) to flip that account back to
-//      "active" — same as clicking a "Payment confirmed" button, just
-//      done by PayMongo instead of a person.
-//
-// ONE-TIME SETUP:
-//   A) Vercel → your project → Settings → Environment Variables, add:
-//      - SUPABASE_URL = https://tdgcyffbblxxccsujtdy.supabase.co
-//      - SUPABASE_SERVICE_ROLE_KEY = your SERVICE ROLE key (Supabase
-//        dashboard → Settings → API → "service_role" — NOT the anon key
-//        already in cafe-pos.jsx; this one bypasses all the safety rules,
-//        so it must never appear in the browser code, only here).
-//      - PAYMONGO_WEBHOOK_SECRET = filled in during step B below.
-//      Redeploy after adding these (Deployments → ⋯ → Redeploy).
-//
-//   B) PayMongo Dashboard → Developer Tools → Webhooks → Add Endpoint:
-//      - URL: https://<your-deployed-domain>/api/paymongo-webhook
-//      - Events: check "checkout_session.payment.paid"
-//      - Save. PayMongo will show you an endpoint secret (starts with
-//        whsk_) — copy it into PAYMONGO_WEBHOOK_SECRET above and redeploy.
+-- =============================================================================
+-- supabase-activate-subscription.sql
+-- =============================================================================
+-- Run this ONCE in Supabase Dashboard → SQL Editor → New query → paste → Run.
+--
+-- This is what api/paymongo-webhook.js calls the instant PayMongo confirms a
+-- payment. It mirrors what markSubscriptionActive() does on the client, but
+-- runs server-side, triggered automatically by PayMongo — not by the
+-- subscriber clicking anything.
+--
+-- SECURITY: this function can flip any account straight to "active" with no
+-- payment check of its own — the webhook's signature verification is what
+-- makes sure it's only ever called after a REAL confirmed payment. Because
+-- of that, this function must NEVER be callable from the browser (with the
+-- public anon key) or by a logged-in user calling it on themselves — only
+-- the webhook, authenticating with your SERVICE ROLE key, is allowed to
+-- call it. The revokes near the bottom of this script are what enforce that.
 
-import crypto from "crypto";
-import { createClient } from "@supabase/supabase-js";
+drop function if exists public.finalize_referral_redemption_for(uuid) cascade;
+create or replace function public.finalize_referral_redemption_for(p_business_id uuid)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+-- Same logic as finalize_referral_redemption() in your main setup script,
+-- just parameterized by an explicit business id instead of auth.uid() —
+-- the webhook has no logged-in session, so it can't rely on auth.uid().
+declare
+  v_caller_email text;
+  v_pending_code text;
+  v_referred_by uuid;
+  v_already_granted boolean;
+  v_referrer_id uuid;
+  v_referrer_email text;
+  v_referrer_status text;
+  v_referrer_period_end timestamptz;
+  v_referrer_is_eligible boolean;
+begin
+  select email, pending_referral_code, referred_by, coalesce(referral_reward_granted, false)
+    into v_caller_email, v_pending_code, v_referred_by, v_already_granted
+    from public.businesses
+    where id = p_business_id;
 
-// Vercel-specific: turns off automatic body parsing so we can read the
-// EXACT raw bytes PayMongo sent. Signature verification only works against
-// the untouched raw body — even reformatting the JSON breaks it.
-export const config = { api: { bodyParser: false } };
+  if v_pending_code is not null and v_referred_by is null then
+    select id, email
+      into v_referrer_id, v_referrer_email
+      from public.businesses
+      where upper(referral_code) = v_pending_code;
 
-async function readRawBody(req) {
-  const chunks = [];
-  for await (const chunk of req) {
-    chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
-  }
-  return Buffer.concat(chunks).toString("utf8");
-}
+    if v_referrer_id is null
+       or v_referrer_id = p_business_id
+       or (v_referrer_email is not null and v_caller_email is not null
+           and lower(v_referrer_email) = lower(v_caller_email)) then
+      update public.businesses set pending_referral_code = null where id = p_business_id;
+    elsif v_caller_email is not null and exists (
+      select 1 from public.referral_redemptions
+      where lower(email) = lower(v_caller_email)
+        and upper(code) = v_pending_code
+    ) then
+      update public.businesses set pending_referral_code = null where id = p_business_id;
+    else
+      insert into public.referral_redemptions (email, code)
+        values (v_caller_email, v_pending_code);
 
-// PayMongo's Paymongo-Signature header looks like:
-//   t=1700000000,te=<hmac for test-mode events>,li=<hmac for live-mode events>
-// You compute HMAC-SHA256 of "<timestamp>.<raw body>" using your webhook's
-// secret key, then compare it to whichever of te/li matches your mode.
-// We just check against BOTH — it costs nothing extra and works whether
-// you're testing (sk_test_) or live (sk_live_).
-function isValidSignature(rawBody, signatureHeader, secret) {
-  if (!signatureHeader) return false;
-  const parts = Object.fromEntries(
-    signatureHeader.split(",").map((p) => p.split("=").map((s) => s.trim()))
-  );
-  const { t, te, li } = parts;
-  if (!t || (!te && !li)) return false;
+      update public.businesses
+        set referred_by = v_referrer_id, pending_referral_code = null
+        where id = p_business_id;
 
-  const expected = crypto
-    .createHmac("sha256", secret)
-    .update(`${t}.${rawBody}`)
-    .digest("hex");
+      update public.businesses
+        set referral_count = coalesce(referral_count, 0) + 1
+        where id = v_referrer_id;
 
-  const matches = (candidate) =>
-    !!candidate &&
-    candidate.length === expected.length &&
-    crypto.timingSafeEqual(Buffer.from(candidate), Buffer.from(expected));
+      v_referred_by := v_referrer_id;
+    end if;
+  end if;
 
-  return matches(te) || matches(li);
-}
-
-export default async function handler(req, res) {
-  if (req.method !== "POST") {
-    res.status(405).end("Method not allowed");
+  if v_referred_by is null or v_already_granted then
     return;
-  }
+  end if;
 
-  const webhookSecret = process.env.PAYMONGO_WEBHOOK_SECRET;
-  const supabaseUrl = process.env.SUPABASE_URL;
-  const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-  if (!webhookSecret || !supabaseUrl || !serviceRoleKey) {
-    console.error("paymongo-webhook: missing required environment variables.");
-    res.status(500).end("Server not configured.");
-    return;
-  }
+  select subscription_status, subscription_period_end
+    into v_referrer_status, v_referrer_period_end
+    from public.businesses
+    where id = v_referred_by;
 
-  const rawBody = await readRawBody(req);
+  v_referrer_is_eligible := (v_referrer_status = 'active')
+    and (v_referrer_period_end is null or v_referrer_period_end > now());
 
-  // Reject anything that isn't provably from PayMongo BEFORE looking at
-  // its contents at all — this is what stops anyone else on the internet
-  // from POSTing a fake "payment succeeded" straight to this URL and
-  // getting a free subscription.
-  const signatureHeader = req.headers["paymongo-signature"];
-  if (!isValidSignature(rawBody, signatureHeader, webhookSecret)) {
-    console.warn("paymongo-webhook: signature verification failed.");
-    res.status(400).end("Invalid signature.");
-    return;
-  }
+  if v_referrer_is_eligible then
+    update public.businesses
+      set reward_credits = coalesce(reward_credits, 0) + 3
+      where id = v_referred_by;
+  end if;
 
-  let event;
-  try {
-    event = JSON.parse(rawBody);
-  } catch {
-    res.status(400).end("Invalid JSON.");
-    return;
-  }
+  update public.businesses
+    set referral_reward_granted = true
+    where id = p_business_id;
+end;
+$$;
 
-  const eventType = event?.data?.attributes?.type;
-  // Only reacting to a paid Checkout Session — anything else (a failed
-  // payment, a refund, etc.) is acknowledged but ignored.
-  if (eventType !== "checkout_session.payment.paid") {
-    res.status(200).end("Ignored (not a paid checkout).");
-    return;
-  }
+drop function if exists public.activate_subscription_for_business(uuid, text) cascade;
+create or replace function public.activate_subscription_for_business(
+  p_business_id uuid,
+  p_reference text default null
+)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_is_first_payment boolean;
+  v_period_end timestamptz := now() + interval '30 days';
+  v_exists boolean;
+begin
+  select exists(select 1 from public.businesses where id = p_business_id)
+    into v_exists;
+  if not v_exists then
+    raise exception 'No business found with id %', p_business_id;
+  end if;
 
-  const checkoutSession = event?.data?.attributes?.data;
-  const businessId = checkoutSession?.attributes?.metadata?.business_id;
-  const paymentId =
-    checkoutSession?.attributes?.payments?.[0]?.id || checkoutSession?.id || null;
+  select subscription_status is distinct from 'active'
+    into v_is_first_payment
+    from public.businesses
+    where id = p_business_id;
 
-  if (!businessId) {
-    console.error("paymongo-webhook: paid event had no business_id in metadata.", event?.data?.id);
-    // Acknowledge with 200 anyway — this is a data problem on our end
-    // (or an old checkout created before metadata was added), not
-    // something PayMongo should keep retrying forever.
-    res.status(200).end("No business_id on this event.");
-    return;
-  }
+  update public.businesses
+    set subscription_status = 'active',
+        subscription_period_end = v_period_end,
+        payment_reference = coalesce(p_reference, payment_reference),
+        reward_credits = 0,
+        discount_percent = case when v_is_first_payment then 0 else discount_percent end
+    where id = p_business_id;
 
-  const supabaseAdmin = createClient(supabaseUrl, serviceRoleKey);
-  const { error } = await supabaseAdmin.rpc("activate_subscription_for_business", {
-    p_business_id: businessId,
-    p_reference: paymentId,
-  });
+  if v_is_first_payment then
+    perform public.finalize_referral_redemption_for(p_business_id);
+  end if;
+end;
+$$;
 
-  if (error) {
-    console.error("paymongo-webhook: activate_subscription_for_business failed:", error);
-    // 500 here tells PayMongo to retry this event later instead of
-    // silently losing a real payment because of a transient DB hiccup.
-    res.status(500).end("Failed to activate subscription.");
-    return;
-  }
+-- ---- Lock both functions down to server-side (webhook) use only ----
+-- By default Postgres grants EXECUTE to PUBLIC, which in Supabase means the
+-- browser's anon key AND any logged-in user could otherwise call these and
+-- activate an account with no payment at all. Revoke that, then grant
+-- execute ONLY to service_role (the role your webhook authenticates as via
+-- SUPABASE_SERVICE_ROLE_KEY — never exposed to the browser).
+revoke execute on function public.activate_subscription_for_business(uuid, text) from public;
+revoke execute on function public.activate_subscription_for_business(uuid, text) from anon;
+revoke execute on function public.activate_subscription_for_business(uuid, text) from authenticated;
+grant execute on function public.activate_subscription_for_business(uuid, text) to service_role;
 
-  res.status(200).end("OK");
-}
+revoke execute on function public.finalize_referral_redemption_for(uuid) from public;
+revoke execute on function public.finalize_referral_redemption_for(uuid) from anon;
+revoke execute on function public.finalize_referral_redemption_for(uuid) from authenticated;
+grant execute on function public.finalize_referral_redemption_for(uuid) to service_role;
