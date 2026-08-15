@@ -661,7 +661,7 @@ const PAYMONGO_CREATE_LINK_ENDPOINT = "/api/create-paymongo-link";
 // EDIT ME: your PayPal.me username — the part after paypal.me/ in your own
 // PayPal.me link. E.g. if your link is paypal.me/YourCafe, this is
 // "YourCafe". Set this up (or find it) at paypal.com/paypalme.
-const PAYPAL_ME_USERNAME = "REPLACE_WITH_YOUR_PAYPAL_ME_USERNAME";
+const PAYPAL_ME_USERNAME = "opsteward";
 
 // PayPal only settles in a specific list of currencies — asking it to
 // charge in one it doesn't support (e.g. paypal.me/you/550000IDR) just
