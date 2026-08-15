@@ -46,19 +46,36 @@
 // once PAYMONGO_SECRET_KEY is set (step 2 above) and the app redeploys.
 //
 // ---- WHAT IT DOES, STEP BY STEP ----
-// The frontend POSTs { amountPhp, description } (amountPhp is a plain peso
-// number like 1274.25 — see phpFinalPrice in UpgradeView). This function:
-//   1. Converts that to centavos (PayMongo's smallest-unit convention —
-//      PHP 100.00 is sent as 10000) and rounds it, since PayMongo won't
+// The frontend POSTs { amountPhp, description, businessId } (amountPhp is
+// a plain peso number like 1274.25 — see phpFinalPrice in UpgradeView;
+// businessId is the paying account's id — see account.id in cafe-pos.jsx).
+// This function:
+//   1. Converts amountPhp to centavos (PayMongo's smallest-unit convention
+//      — PHP 100.00 is sent as 10000) and rounds it, since PayMongo won't
 //      accept fractional centavos.
-//   2. Calls PayMongo's Links API (POST /v1/links) with your secret key to
+//   2. Tags businessId onto the END of the description as "[biz:<id>]" —
+//      see the big comment on that below. This is the ONLY place that tag
+//      gets added; api/paymongo-webhook.js reads it back out once the link
+//      is paid, to know whose subscription to activate.
+//   3. Calls PayMongo's Links API (POST /v1/links) with your secret key to
 //      create a single-use Payment Link at that exact amount.
-//   3. Returns { url: <checkout_url> } to the frontend, which opens it in
+//   4. Returns { url: <checkout_url> } to the frontend, which opens it in
 //      the in-app checkout frame.
 // If anything goes wrong (missing/invalid key, PayMongo's API is down,
 // amount too small, etc.) it returns a JSON { error } message instead —
 // the frontend falls back to the manual GCash/bank-transfer note when that
 // happens, so a subscriber is never just stuck on a blank screen.
+//
+// ---- WHY THE [biz:<id>] TAG, AND NOT SOME OTHER MECHANISM ----
+// A PayMongo Payment Link has no built-in "which of your app's users is
+// this for" field — it's just an amount, a currency, and a description.
+// The webhook that activates a subscription after payment (see
+// api/paymongo-webhook.js) needs SOME reliable way to map "this link got
+// paid" back to "this specific business row in Supabase." Embedding the
+// id directly in description is the simplest option that needs no extra
+// PayMongo API calls or lookups: it's created here, and it's echoed back
+// verbatim on the paid link's own attributes in the webhook payload, so
+// the webhook can just read it straight off the event it already got.
 
 module.exports = async function handler(req, res) {
   if (req.method !== "POST") {
@@ -87,7 +104,7 @@ module.exports = async function handler(req, res) {
       body = {};
     }
   }
-  const { amountPhp, description } = body || {};
+  const { amountPhp, description, businessId } = body || {};
 
   const amountCentavos = Math.round(Number(amountPhp) * 100);
 
@@ -98,6 +115,24 @@ module.exports = async function handler(req, res) {
     res.status(400).json({ error: "Invalid payment amount." });
     return;
   }
+
+  // Only trust businessId if it actually looks like a Supabase/Postgres
+  // uuid — a malformed or missing value just means the webhook won't be
+  // able to auto-activate this particular payment later (it'll log it for
+  // manual reconciliation instead), never a security problem, since the
+  // webhook treats the tag as "which row to activate," not as anything
+  // trusted enough to skip its own signature check.
+  const isUuid = typeof businessId === "string" && /^[0-9a-fA-F-]{8,}$/.test(businessId);
+  const bizTag = isUuid ? ` [biz:${businessId}]` : "";
+  if (businessId && !isUuid) {
+    console.warn("create-paymongo-link: businessId didn't look like a uuid, omitting tag:", businessId);
+  }
+
+  const maxDescLen = 255;
+  const baseDescription = String(description || "OpSteward QuickServe POS subscription");
+  // Reserve room for the tag so it never gets cut off by the 255-char
+  // limit — truncate the human-readable part first, then append the tag.
+  const description255 = (baseDescription.slice(0, Math.max(0, maxDescLen - bizTag.length)) + bizTag).slice(0, maxDescLen);
 
   try {
     const paymongoRes = await fetch("https://api.paymongo.com/v1/links", {
@@ -111,7 +146,7 @@ module.exports = async function handler(req, res) {
           attributes: {
             amount: amountCentavos,
             currency: "PHP",
-            description: String(description || "OpSteward QuickServe POS subscription").slice(0, 255),
+            description: description255,
           },
         },
       }),
