@@ -7611,6 +7611,10 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
           description: `OpSteward QuickServe POS — ${hasSubscribedBefore ? "renewal" : "subscription"}${
             account?.businessName ? ` for ${account.businessName}` : ""
           }`,
+          // Lets api/paymongo-webhook.js know whose account to activate
+          // once this link gets paid — see that file's setup comment for
+          // the full automatic-activation flow this enables.
+          businessId: account?.id,
         }),
       });
       let data = null;
