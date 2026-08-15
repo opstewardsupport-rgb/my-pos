@@ -28,13 +28,13 @@
 //      - Save. PayMongo will show you an endpoint secret (starts with
 //        whsk_) — copy it into PAYMONGO_WEBHOOK_SECRET above and redeploy.
 
-const crypto = require("crypto");
-const { createClient } = require("@supabase/supabase-js");
+import crypto from "crypto";
+import { createClient } from "@supabase/supabase-js";
 
 // Vercel-specific: turns off automatic body parsing so we can read the
 // EXACT raw bytes PayMongo sent. Signature verification only works against
 // the untouched raw body — even reformatting the JSON breaks it.
-module.exports.config = { api: { bodyParser: false } };
+export const config = { api: { bodyParser: false } };
 
 async function readRawBody(req) {
   const chunks = [];
@@ -71,7 +71,7 @@ function isValidSignature(rawBody, signatureHeader, secret) {
   return matches(te) || matches(li);
 }
 
-module.exports = async (req, res) => {
+export default async function handler(req, res) {
   if (req.method !== "POST") {
     res.status(405).end("Method not allowed");
     return;
@@ -144,4 +144,4 @@ module.exports = async (req, res) => {
   }
 
   res.status(200).end("OK");
-};
+}
