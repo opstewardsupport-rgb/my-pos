@@ -538,7 +538,7 @@ import {
   Trash2, AlertTriangle, RotateCcw, Pencil, Check, Receipt as ReceiptIcon,
   Tag, Banknote, CreditCard, ImagePlus, Loader2, Camera, History as HistoryIcon,
   Ban, Undo2, ChevronDown, ChevronUp, StickyNote, Coins, ChefHat, Circle, CheckCircle2,
-  Settings as SettingsIcon, LogOut, Eye, EyeOff, Store, ArrowRight,
+  Settings as SettingsIcon, LogOut, Eye, EyeOff, Store, ArrowRight, Users, ClipboardList,
 } from "lucide-react";
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell,
@@ -550,6 +550,15 @@ const LOGO_DATA_URL = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAeAAAACgCAY
 
 const CATALOG_KEY = "cafe_pos_catalog_v1";
 const SALES_KEY = "cafe_pos_sales_v1";
+// "Parked orders" (a.k.a. tabs): a cart that's been sent to the kitchen and
+// is being prepared/served, but hasn't been paid yet — for a customer who
+// eats first and pays before leaving, possibly ordering more in between.
+// Kept as a separate array from SALES_KEY (finalized, paid transactions) so
+// nothing about revenue reports, exports, or the Kitchen board's existing
+// logic has to change to account for unpaid orders sitting in the sales
+// list. See parkOrder()/settleTab() further down for how a tab is opened
+// and eventually turned into a real sale.
+const PARKED_ORDERS_KEY = "cafe_pos_parked_orders_v1";
 const CURRENCY_KEY = "cafe_pos_currency_v1";
 const EMPLOYEES_KEY = "cafe_pos_employees_v1";
 const CURRENT_EMPLOYEE_KEY = "cafe_pos_current_employee_v1";
@@ -591,43 +600,63 @@ const SUPABASE_URL = "https://tdgcyffbblxxccsujtdy.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_GUX0Y4Nyr-zeFAHB2IB0Xw_K7syHDWY";
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
-// Your PayMongo payment link, for a full-price payment. PayMongo link
-// checkouts accept both local (GCash, Maya, cards issued in PH) and
-// international cards, so one link covers both audiences.
-const PAYMONGO_LINK = "https://pm.link/org-KtaTpiR8vpcqBk2K2zkWjuxr/1VfePGD";
-
-// EDIT ME: a SECOND PayMongo Payment Link, created at the referral-discounted
-// price (see MONTHLY_PRICE_PHP and REFERRAL_DISCOUNT_PERCENT below — right
-// now that's ₱1,699 × 75% = ₱1,274.25, so create this link for ₱1,274.25 or
-// ₱1,275 if your PayMongo account only takes whole pesos). This is what
-// actually charges a new, referred subscriber the discounted amount — a
-// Payment Link is a fixed price, so the discount shown in the app has to be
-// backed by a real link at that exact price, or the discount would just be
-// cosmetic and they'd still get charged full price at checkout.
-const PAYMONGO_LINK_REFERRAL = "https://pm.link/org-KtaTpiR8vpcqBk2K2zkWjuxr/REPLACE_WITH_DISCOUNTED_LINK";
+// PayMongo checkout is now fully automatic for ANY amount — full price,
+// the one-time 25% signup referral discount, or any accumulated
+// REFERRAL_REWARD_PERCENT (3% per referral) reward credit on a renewal.
+// There is no longer a fixed-price PayMongo Payment Link to create or keep
+// in sync. Instead, the moment a PH subscriber clicks "Pay now"
+// (startPayMongoCheckout() in UpgradeView further below), the app calls a
+// tiny serverless function — api/create-paymongo-link.js, sitting in your
+// GitHub repo alongside this file — which creates a brand-new PayMongo
+// Payment Link at the EXACT peso amount shown on screen and hands back its
+// checkout URL. That's what makes PayMongo "automatic": no separate link
+// per discount tier, and the amount charged always matches the amount
+// shown, no matter how odd the number (an accumulated reward-credit %
+// makes for genuinely arbitrary amounts).
+//
+// WHY THIS NEEDS A SERVERLESS FUNCTION AT ALL: creating a PayMongo Payment
+// Link at an arbitrary amount requires PayMongo's SECRET API key (see
+// PayMongo's own docs — creating Links/Payment Intents is a server-side-only
+// operation). A secret key can NEVER be pasted into this file or any other
+// browser-side code — anyone who opened their browser's dev tools would be
+// able to read it and then create, capture, or refund charges on your
+// PayMongo account. Putting that one secret behind a small serverless
+// function (which only Vercel's servers can read, never the browser) is
+// the only safe way to get a dynamic amount without running a full backend.
+//
+// ONE-TIME SETUP (in your Vercel project dashboard — nothing to edit here):
+//   1. PayMongo Dashboard → Developers → API Keys → copy your SECRET key
+//      (starts with sk_live_… for real charges, sk_test_… while testing).
+//   2. Vercel → your project → Settings → Environment Variables → add
+//      PAYMONGO_SECRET_KEY = <the secret key from step 1> → Save.
+//   3. Redeploy (Vercel → Deployments → ⋯ → Redeploy) so the function can
+//      see the new variable.
+// That's the whole setup — api/create-paymongo-link.js reads
+// process.env.PAYMONGO_SECRET_KEY itself; nothing else in this repo needs
+// your PayMongo key.
+//
+// EDIT ME only if you rename/move the serverless function file — this is
+// just the URL path the app calls to reach it (relative, so it always
+// hits the same domain the POS is hosted on, whatever that domain is).
+const PAYMONGO_CREATE_LINK_ENDPOINT = "/api/create-paymongo-link";
 
 // PayMongo only settles Philippine payment methods (GCash, Maya, PH bank
 // transfer) and is only shown to subscribers billed in PHP. Everyone else
 // (any other currency in CURRENCIES) pays via PayPal instead — see
 // isPHCustomer/buildPayPalLink below in UpgradeView.
 //
-// PayPal is handled differently from PayMongo above. PayMongo Payment Links
-// are a fixed price each, so PayMongo needed two separate links (full price
-// and one flat referral price) and still falls back to a manual transfer
-// for anything else. But there is no fixed discount number here — a
+// PayPal is fully automatic the same way, just without needing a
+// serverless function: there is no fixed discount number here — a
 // brand-new subscriber can get REFERRAL_DISCOUNT_PERCENT off (25%) on their
 // first payment, and an existing subscriber can stack up to
 // MAX_REWARD_CREDIT_PERCENT off in REFERRAL_REWARD_PERCENT (3%) increments,
 // one per person who used their code that billing cycle — so the actual
 // amount due is different for practically every subscriber. PayPal.me
 // links support the amount being typed straight into the URL
-// (paypal.me/yourname/24.79USD), so instead of maintaining fixed-price
-// links, buildPayPalLink() further below builds that URL fresh every time
-// from whatever the subscriber's real final price is. That's what makes
-// PayPal "automatic" for any discount amount: the checkout page a
-// subscriber lands on always asks for the exact number shown on screen,
-// no separate link to create per discount tier, and no manual reconciling
-// of an amount against a percentage.
+// (paypal.me/yourname/24.79USD), so buildPayPalLink() further below builds
+// that URL fresh every time from whatever the subscriber's real final
+// price is — no separate link to create per discount tier, and no manual
+// reconciling of an amount against a percentage.
 //
 // EDIT ME: your PayPal.me username — the part after paypal.me/ in your own
 // PayPal.me link. E.g. if your link is paypal.me/YourCafe, this is
@@ -654,9 +683,11 @@ const PAYPAL_SUPPORTED_CURRENCIES = new Set([
 ]);
 
 // EDIT ME: your actual monthly subscription price, shown on the Subscribe
-// popup. This is just a display number — it doesn't charge anything by
-// itself, PayMongo's own checkout page (opened via PAYMONGO_LINK above)
-// is what actually sets the real amount charged. Keep the two in sync.
+// popup. This is what's actually sent (minus any discount) as amountPhp to
+// api/create-paymongo-link.js to create the real checkout, so it IS the
+// real amount charged for PH subscribers — change it here and every
+// PayMongo/PayPal checkout picks it up automatically, no fixed link to
+// update.
 const MONTHLY_PRICE_PHP = 1699;
 
 // Support contact shown on the sign-up/login screens, the upgrade screen,
@@ -695,15 +726,15 @@ const REFERRAL_REWARD_PERCENT = 3;
 // cap — raise it if you want a more generous ceiling.
 const MAX_REWARD_CREDIT_PERCENT = 60;
 
-// EDIT ME: shown when a PH subscriber's exact discounted amount (e.g. a
-// renewal with reward credits applied) doesn't match either of the two
-// fixed PayMongo links above. PayMongo Payment Links are a fixed price
-// each, so an arbitrary, ever-changing reward-credit percentage can't be
-// charged through a static link without a backend that talks to PayMongo's
-// API directly. Until you build that, collect these payments manually
-// (GCash, bank transfer, in person) for the exact discounted amount shown.
+// EDIT ME: shown only as a fallback for a PH subscriber, and only if the
+// live call to your api/create-paymongo-link.js serverless function fails
+// (e.g. PAYMONGO_SECRET_KEY isn't set up yet on Vercel, or PayMongo's API
+// is briefly unreachable) — see startPayMongoCheckout() in UpgradeView.
+// PayMongo checkout itself is fully automatic for any amount now, so this
+// is purely a safety net for that one failure case, not a discount-tier
+// limitation.
 const MANUAL_PAYMENT_NOTE_PH =
-  "This discount doesn't match a fixed PayMongo link, so pay this exact amount via GCash or bank transfer, then enter your reference below.";
+  "We couldn't start PayMongo checkout just now, so pay this exact amount via GCash or bank transfer instead, then enter your reference below.";
 // Shown to a non-PH subscriber ONLY when their billing currency is one
 // PayPal itself doesn't settle in (see PAYPAL_SUPPORTED_CURRENCIES above) —
 // every other international discount amount now goes through the dynamic
@@ -762,8 +793,9 @@ const CURRENCIES_ALPHABETICAL = [...CURRENCIES].sort((a, b) => a.label.localeCom
 // below — nothing else in the app needs to change, since every screen
 // (Settings, Upgrade/Subscribe) reads from this table instead of computing
 // its own conversion. Whatever you charge via PayMongo is still in PHP
-// (PAYMONGO_LINK / PAYMONGO_LINK_REFERRAL settle in PHP — that's what your
-// Philippine payment processor supports), so these other-currency amounts
+// (api/create-paymongo-link.js always creates the Payment Link in PHP —
+// that's what your Philippine payment processor supports), so these
+// other-currency amounts
 // are the "what you'll pay in your currency" reference shown to the
 // subscriber; the actual PayMongo charge is the PHP amount.
 const LOCKED_SUBSCRIPTION_PRICE_PHP = {
@@ -980,6 +1012,12 @@ export default function CafePOS() {
   const [loading, setLoading] = useState(true);
   const [catalog, setCatalog] = useState({ ingredients: [], products: [], categories: [] });
   const [sales, setSales] = useState([]);
+  // Open tabs — carts sent to the kitchen but not paid yet. See
+  // PARKED_ORDERS_KEY above and parkOrder()/settleTab() further down.
+  const [parkedOrders, setParkedOrders] = useState([]);
+  const [parkModalOpen, setParkModalOpen] = useState(false); // naming a new tab from the current cart
+  const [tabDetailId, setTabDetailId] = useState(null); // id of the tab open in TabDetailModal
+  const [settleTabTarget, setSettleTabTarget] = useState(null); // tab object being paid off in SettleTabModal
   const [nextOrderNo, setNextOrderNo] = useState(1);
   const [currencyCode, setCurrencyCode] = useState("PHP");
   const [view, setView] = useState("pos");
@@ -1213,6 +1251,7 @@ export default function CafePOS() {
       // this is just hygiene, not something the person will see.
       setCatalog({ ingredients: [], products: [], categories: [] });
       setSales([]);
+      setParkedOrders([]);
       setNextOrderNo(1);
       setCurrencyCode("PHP");
       setEmployees([]);
@@ -1227,6 +1266,7 @@ export default function CafePOS() {
       setLoading(true);
       let cat = await safeGet(scopedKey(CATALOG_KEY, userId));
       let sal = await safeGet(scopedKey(SALES_KEY, userId));
+      let parked = await safeGet(scopedKey(PARKED_ORDERS_KEY, userId));
       let cur = await safeGet(scopedKey(CURRENCY_KEY, userId));
       let emps = await safeGet(scopedKey(EMPLOYEES_KEY, userId));
       let curEmpId = await safeGet(scopedKey(CURRENT_EMPLOYEE_KEY, userId));
@@ -1242,6 +1282,7 @@ export default function CafePOS() {
         await safeSet(scopedKey(CATALOG_KEY, userId), cat);
       }
       if (!sal) { sal = []; await safeSet(scopedKey(SALES_KEY, userId), sal); }
+      if (!parked) { parked = []; await safeSet(scopedKey(PARKED_ORDERS_KEY, userId), parked); }
       // Reports/history only need to keep RETENTION_MONTHS worth of whole months.
       const purged = purgeOldSales(sal);
       if (purged.length !== sal.length) { sal = purged; await safeSet(scopedKey(SALES_KEY, userId), sal); }
@@ -1290,12 +1331,17 @@ export default function CafePOS() {
       if (!orderCounter) {
         // First run on this counter — pick up numbering after the highest
         // order number already on file so upgrades don't restart at 1.
-        const maxExisting = sal.length ? Math.max(0, ...sal.map((s) => s.orderNo || 0)) : 0;
+        const maxExisting = Math.max(
+          0,
+          ...sal.map((s) => s.orderNo || 0),
+          ...parked.map((t) => t.orderNo || 0)
+        );
         orderCounter = maxExisting + 1;
         await safeSet(scopedKey(ORDER_COUNTER_KEY, userId), orderCounter);
       }
       setCatalog(cat);
       setSales(sal);
+      setParkedOrders(parked);
       setNextOrderNo(orderCounter);
       setCurrencyCode(cur);
       setEmployees(emps);
@@ -1775,6 +1821,14 @@ export default function CafePOS() {
     setSales(trimmed);
     const ok = await safeSet(scopedKey(SALES_KEY, authUserIdRef.current), trimmed);
     if (!ok) notify("Couldn't save the sale — check connection and try again.", "err");
+  }, [notify]);
+
+  // No retention purge here — open tabs are actively managed (settled or
+  // cancelled), not a growing history log the way sales are.
+  const persistParkedOrders = useCallback(async (next) => {
+    setParkedOrders(next);
+    const ok = await safeSet(scopedKey(PARKED_ORDERS_KEY, authUserIdRef.current), next);
+    if (!ok) notify("Couldn't save the tab — check connection and try again.", "err");
   }, [notify]);
 
   const ingredientMap = useMemo(
@@ -2319,6 +2373,224 @@ export default function CafePOS() {
     setReceipt(sale);
   };
 
+  // ---------- Tabs (parked orders) ----------
+  // A tab is a cart that's already been sent to the kitchen — ingredients
+  // are deducted the moment an item is added to it, exactly like a normal
+  // checkout — but payment is deferred. Typical use: a table orders,
+  // eats, maybe orders more, then pays everything at once before leaving.
+  // Kept as its own array (parkedOrders) rather than mixed into `sales`, so
+  // nothing about Reports/History/exports has to special-case "unpaid"
+  // sales — a tab only becomes a `sale` (and only then counts toward
+  // revenue) once settleTab() below actually charges it.
+  //
+  // Shared shortage-check + stock-deduction helper used by both parking a
+  // whole cart and adding one more item to an already-open tab — same logic
+  // checkout() uses, just factored out so both call sites stay in sync.
+  const deductStockFor = (lineItems) => {
+    const needs = {};
+    lineItems.forEach(({ product, qty }) => {
+      product.recipe.forEach((r) => {
+        needs[r.ingredientId] = (needs[r.ingredientId] || 0) + r.amount * qty;
+      });
+    });
+    const shortages = Object.entries(needs)
+      .map(([ingId, needed]) => {
+        const ing = ingredientMap[ingId];
+        if (!ing) return null;
+        return needed > ing.stock ? { name: ing.name, needed, available: ing.stock, unit: ing.unit } : null;
+      })
+      .filter(Boolean);
+    if (shortages.length) return { ok: false, shortages };
+    const nextIngredients = catalog.ingredients.map((i) =>
+      needs[i.id] ? { ...i, stock: +(i.stock - needs[i.id]).toFixed(2) } : i
+    );
+    persistCatalog({ ...catalog, ingredients: nextIngredients });
+    return { ok: true };
+  };
+  // Reverses deductStockFor for a single line (e.g. removing an item from a
+  // tab, or reducing its qty) — returns those ingredients to stock.
+  const restockFor = (recipe, qty) => {
+    if (!recipe || !recipe.length) return;
+    const nextIngredients = catalog.ingredients.map((i) => {
+      const r = recipe.find((x) => x.ingredientId === i.id);
+      return r ? { ...i, stock: +(i.stock + r.amount * qty).toFixed(2) } : i;
+    });
+    persistCatalog({ ...catalog, ingredients: nextIngredients });
+  };
+
+  const parkOrder = (label) => {
+    if (cartDetailed.length === 0) return;
+    if (!activeShift) { notify("Open a shift before starting a tab.", "err"); return; }
+    const result = deductStockFor(cartDetailed);
+    if (!result.ok) {
+      setCheckoutError({ kind: "stock", shortages: result.shortages });
+      return;
+    }
+    const items = cartDetailed.map(({ product, qty }) => ({
+      productId: product.id,
+      name: product.name,
+      category: product.category,
+      qty,
+      price: product.price,
+      cost: productCost(product),
+      recipe: product.recipe.map((r) => ({ ingredientId: r.ingredientId, amount: r.amount })),
+      prepared: false,
+    }));
+    const tab = {
+      id: uid("tab"),
+      orderNo: nextOrderNo,
+      label: (label || "").trim() || `Tab #${nextOrderNo}`,
+      openedAt: Date.now(),
+      updatedAt: Date.now(),
+      employeeId: currentEmployee?.id || null,
+      employeeName: currentEmployee?.name || "Unassigned",
+      shiftId: activeShift?.id || null,
+      items,
+    };
+    persistParkedOrders([...parkedOrders, tab]);
+    setNextOrderNo((n) => n + 1);
+    safeSet(ORDER_COUNTER_KEY, nextOrderNo + 1);
+    setCart([]);
+    setCheckoutError(null);
+    setParkModalOpen(false);
+    notify(`Tab "${tab.label}" opened — order #${tab.orderNo}.`);
+  };
+
+  const addItemToTab = (tabId, productId) => {
+    const tab = parkedOrders.find((t) => t.id === tabId);
+    const product = catalog.products.find((p) => p.id === productId);
+    if (!tab || !product) return;
+    const result = deductStockFor([{ product, qty: 1 }]);
+    if (!result.ok) {
+      notify(`Not enough stock for ${product.name} (need more ${result.shortages.map((s) => s.name).join(", ")}).`, "err");
+      return;
+    }
+    const existing = tab.items.find((it) => it.productId === productId);
+    const items = existing
+      ? tab.items.map((it) => (it.productId === productId ? { ...it, qty: it.qty + 1 } : it))
+      : [
+          ...tab.items,
+          {
+            productId: product.id,
+            name: product.name,
+            category: product.category,
+            qty: 1,
+            price: product.price,
+            cost: productCost(product),
+            recipe: product.recipe.map((r) => ({ ingredientId: r.ingredientId, amount: r.amount })),
+            prepared: false,
+          },
+        ];
+    persistParkedOrders(parkedOrders.map((t) => (t.id === tabId ? { ...t, items, updatedAt: Date.now() } : t)));
+  };
+
+  // delta is always -1 here (the +1 case is addItemToTab, which also
+  // handles a brand-new line item) — reducing qty to 0 removes the line.
+  const decrementTabItem = (tabId, productId) => {
+    const tab = parkedOrders.find((t) => t.id === tabId);
+    if (!tab) return;
+    const item = tab.items.find((it) => it.productId === productId);
+    if (!item) return;
+    restockFor(item.recipe, 1);
+    const items = item.qty <= 1
+      ? tab.items.filter((it) => it.productId !== productId)
+      : tab.items.map((it) => (it.productId === productId ? { ...it, qty: it.qty - 1 } : it));
+    persistParkedOrders(parkedOrders.map((t) => (t.id === tabId ? { ...t, items, updatedAt: Date.now() } : t)));
+  };
+
+  const removeTabItem = (tabId, productId) => {
+    const tab = parkedOrders.find((t) => t.id === tabId);
+    if (!tab) return;
+    const item = tab.items.find((it) => it.productId === productId);
+    if (!item) return;
+    restockFor(item.recipe, item.qty);
+    const items = tab.items.filter((it) => it.productId !== productId);
+    persistParkedOrders(parkedOrders.map((t) => (t.id === tabId ? { ...t, items, updatedAt: Date.now() } : t)));
+  };
+
+  // The cross-out-as-prepared checklist, same idea as the Kitchen board's
+  // toggleItemPrepared — kept separate since a tab isn't a `sale` yet and
+  // has no `status`/`completedAt` of its own to keep in sync.
+  const toggleTabItemPrepared = (tabId, productId) => {
+    const tab = parkedOrders.find((t) => t.id === tabId);
+    if (!tab) return;
+    const items = tab.items.map((it) => (it.productId === productId ? { ...it, prepared: !it.prepared } : it));
+    persistParkedOrders(parkedOrders.map((t) => (t.id === tabId ? { ...t, items, updatedAt: Date.now() } : t)));
+  };
+
+  const renameTab = (tabId, label) => {
+    const trimmed = (label || "").trim();
+    if (!trimmed) return;
+    persistParkedOrders(parkedOrders.map((t) => (t.id === tabId ? { ...t, label: trimmed, updatedAt: Date.now() } : t)));
+  };
+
+  // Cancels a whole tab (customer changed their mind before paying anything)
+  // — every item's ingredients go back to stock and the tab disappears.
+  const cancelTab = (tabId) => {
+    const tab = parkedOrders.find((t) => t.id === tabId);
+    if (!tab) return;
+    tab.items.forEach((it) => restockFor(it.recipe, it.qty));
+    persistParkedOrders(parkedOrders.filter((t) => t.id !== tabId));
+    if (tabDetailId === tabId) setTabDetailId(null);
+    if (settleTabTarget?.id === tabId) setSettleTabTarget(null);
+    notify(`Tab "${tab.label}" cancelled — ingredients returned to stock.`);
+  };
+
+  // Turns a tab into a real, paid `sale` — this is the only point a tab
+  // affects revenue/reports. Ingredients are NOT deducted again here; that
+  // already happened as items were added to the tab (see deductStockFor
+  // above). Whatever's already been crossed off as prepared carries over
+  // onto the sale, so the Kitchen board / receipt reflect real progress
+  // instead of resetting to "nothing prepared" just because payment
+  // happened after the food did.
+  const settleTab = (tab, payment) => {
+    const { discountType, discountValue, discountAmount, paymentMethod, payments, amountTendered, paymentProof: proof } = payment;
+    const subtotal = tab.items.reduce((s, it) => s + it.price * it.qty, 0);
+    const total = Math.max(0, +(subtotal - discountAmount).toFixed(2));
+    const totalCost = tab.items.reduce((s, it) => s + it.cost * it.qty, 0);
+    const allPrepared = tab.items.length > 0 && tab.items.every((it) => it.prepared);
+    const sale = {
+      id: uid("sale"),
+      orderNo: tab.orderNo,
+      timestamp: tab.openedAt,
+      paidAt: Date.now(),
+      employeeId: currentEmployee?.id || tab.employeeId,
+      employeeName: currentEmployee?.name || tab.employeeName,
+      shiftId: activeShift?.id || tab.shiftId,
+      status: allPrepared ? "completed" : "preparing",
+      completedAt: allPrepared ? Date.now() : null,
+      items: tab.items.map((it) => ({ ...it, voided: false })),
+      subtotal,
+      originalSubtotal: subtotal,
+      originalDiscountAmount: discountAmount,
+      originalTotal: total,
+      originalTotalCost: totalCost,
+      discountType,
+      discountValue,
+      discountAmount,
+      total,
+      totalCost,
+      paymentMethod,
+      payments,
+      originalPayments: payments,
+      amountTendered,
+      change: paymentMethod === "cash" ? +(amountTendered - total).toFixed(2) : 0,
+      paymentProof: (paymentMethod === "online" || paymentMethod === "split") ? proof : null,
+      voided: false,
+      voidReason: null,
+      voidNote: "",
+      voidedAt: null,
+      // Kept for reference on the receipt/history detail — this was a tab,
+      // not a straight-through checkout.
+      tabLabel: tab.label,
+    };
+    persistSales([...sales, sale]);
+    persistParkedOrders(parkedOrders.filter((t) => t.id !== tab.id));
+    setSettleTabTarget(null);
+    setTabDetailId(null);
+    setReceipt(sale);
+  };
+
   // ---------- Void / restore sale items ----------
   // Voiding works at the item level: each line item on a sale carries its own
   // `voided` flag. An order's own `voided` flag is DERIVED — true only once
@@ -2808,7 +3080,7 @@ export default function CafePOS() {
         selectEmployee={requestEmployeeChange}
         openEmployeeModal={() => setEmployeeModal(true)}
       />
-      <Nav view={view} setView={setView} lowCount={lowStock.length} shiftOpen={!!activeShift} kitchenCount={kitchenPreparing.length} />
+      <Nav view={view} setView={setView} lowCount={lowStock.length} shiftOpen={!!activeShift} kitchenCount={kitchenPreparing.length} tabsCount={parkedOrders.length} />
 
       {!trialInfo.isSubscribed && !trialInfo.expired && (
         <div className="max-w-6xl mx-auto px-4 sm:px-6 no-print">
@@ -2873,10 +3145,17 @@ export default function CafePOS() {
             proofProcessing={proofProcessing}
             uploadPaymentProof={uploadPaymentProof}
             nextOrderNo={nextOrderNo}
+            openParkModal={() => setParkModalOpen(true)}
           />
           ) : (
             <NoShiftGate onGoToShift={() => setView("shift")} />
           )
+        )}
+        {view === "tabs" && (
+          <TabsView
+            tabs={parkedOrders}
+            openTab={(id) => setTabDetailId(id)}
+          />
         )}
         {view === "kitchen" && (
           <KitchenView
@@ -3056,6 +3335,36 @@ export default function CafePOS() {
       )}
       {receipt && <ReceiptModal sale={receipt} onClose={() => setReceipt(null)} />}
       {detailSale && <ReceiptModal sale={detailSale} onClose={() => setDetailSale(null)} closeLabel="Close" />}
+      {parkModalOpen && (
+        <ParkOrderModal
+          nextOrderNo={nextOrderNo}
+          onClose={() => setParkModalOpen(false)}
+          onConfirm={parkOrder}
+        />
+      )}
+      {tabDetailId && parkedOrders.some((t) => t.id === tabDetailId) && (
+        <TabDetailModal
+          tab={parkedOrders.find((t) => t.id === tabDetailId)}
+          products={catalog.products}
+          categories={catalog.categories}
+          onClose={() => setTabDetailId(null)}
+          onRename={renameTab}
+          onAddItem={addItemToTab}
+          onIncrement={addItemToTab}
+          onDecrement={decrementTabItem}
+          onRemoveItem={removeTabItem}
+          onTogglePrepared={toggleTabItemPrepared}
+          onCancelTab={cancelTab}
+          onSettle={(tab) => setSettleTabTarget(tab)}
+        />
+      )}
+      {settleTabTarget && (
+        <SettleTabModal
+          tab={settleTabTarget}
+          onClose={() => setSettleTabTarget(null)}
+          onConfirm={(payment) => settleTab(settleTabTarget, payment)}
+        />
+      )}
       {voidModal && (
         <VoidSaleModal
           sale={voidModal}
@@ -3418,9 +3727,10 @@ function NoShiftGate({ onGoToShift }) {
   );
 }
 
-function Nav({ view, setView, lowCount, shiftOpen, kitchenCount }) {
+function Nav({ view, setView, lowCount, shiftOpen, kitchenCount, tabsCount }) {
   const items = [
     { id: "pos", label: "POS", icon: ShoppingCart },
+    { id: "tabs", label: "Tabs", icon: ClipboardList, badge: tabsCount },
     { id: "kitchen", label: "Kitchen", icon: ChefHat, badge: kitchenCount },
     { id: "products", label: "Products", icon: ReceiptIcon },
     { id: "inventory", label: "Inventory", icon: Package, badge: lowCount },
@@ -3501,7 +3811,7 @@ function POSView({
   addSplitLine, removeSplitLine, updateSplitMethod, updateSplitAmount,
   checkout, checkoutError,
   paymentProof, setPaymentProof, proofProcessing, uploadPaymentProof,
-  nextOrderNo,
+  nextOrderNo, openParkModal,
 }) {
   const [cameraOpen, setCameraOpen] = useState(false);
   const cats = [{ id: "all", label: "All" }, ...categories.map((c) => ({ id: c.id, label: c.name }))];
@@ -3969,6 +4279,15 @@ function POSView({
                 Charge {cartDetailed.length > 0 ? money(cartTotal) : ""}
               </button>
             </div>
+            <button
+              onClick={openParkModal}
+              disabled={cartDetailed.length === 0}
+              className="w-full mt-2 flex items-center justify-center gap-1.5 text-sm py-2 rounded-lg border disabled:opacity-40"
+              style={{ borderColor: "var(--line)", color: "var(--ink-soft)" }}
+              title="Send this order to the kitchen and pay for it later"
+            >
+              <ClipboardList size={14} /> Park as a tab (pay later)
+            </button>
           </div>
           <div className="ticket-edge-bottom" />
         </div>
@@ -4091,6 +4410,11 @@ function ReceiptModal({ sale, onClose, closeLabel = "New order" }) {
           {sale.employeeName && (
             <div className="text-xs mt-0.5" style={{ color: "var(--ink-soft)" }}>
               Served by {sale.employeeName}
+            </div>
+          )}
+          {sale.tabLabel && (
+            <div className="text-xs mt-0.5" style={{ color: "var(--ink-soft)" }}>
+              Tab: {sale.tabLabel}
             </div>
           )}
         </div>
@@ -4658,6 +4982,571 @@ function KitchenOrderCard({ sale, toggleItemPrepared, setOrderStatus }) {
         >
           <Check size={12} /> Mark order complete
         </button>
+      )}
+    </div>
+  );
+}
+
+// ============== Tabs (parked orders) ==============
+// A tab is a cart already sent to the kitchen (ingredients deducted) that
+// hasn't been paid yet. Opened from the POS ("Park as a tab"), edited here
+// (add/remove items, cross items off as they're prepared — same idea as
+// the Kitchen board's checklist), then settled for payment once the
+// customer's ready to leave. See parkOrder()/settleTab() in App above.
+
+function ParkOrderModal({ nextOrderNo, onClose, onConfirm }) {
+  const [label, setLabel] = useState("");
+  const submit = () => onConfirm(label);
+  return (
+    <ModalWrap onClose={onClose}>
+      <div className="px-5 py-5">
+        <h3 className="display-font text-lg mb-1" style={{ fontWeight: 600 }}>Park this order as a tab</h3>
+        <p className="text-xs mb-4" style={{ color: "var(--ink-soft)" }}>
+          Sends it to the kitchen now (ingredients are deducted) but doesn't
+          charge anything yet. Settle it for payment later from the Tabs tab.
+        </p>
+        <label className="text-xs font-medium mb-1 block" style={{ color: "var(--ink-soft)" }}>
+          Table / customer name
+        </label>
+        <input
+          autoFocus
+          value={label}
+          onChange={(e) => setLabel(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && submit()}
+          placeholder={`e.g. Table 5 (or leave blank for "Tab #${nextOrderNo}")`}
+          className="w-full border rounded-lg px-3 py-2 text-sm mb-4"
+          style={{ borderColor: "var(--line)" }}
+        />
+        <div className="flex gap-2">
+          <button onClick={onClose} className="flex-1 py-2 rounded-lg text-sm border" style={{ borderColor: "var(--line)" }}>
+            Cancel
+          </button>
+          <button onClick={submit} className="flex-[2] py-2 rounded-lg text-sm font-medium" style={{ background: "var(--primary)", color: "#fff" }}>
+            Open tab
+          </button>
+        </div>
+      </div>
+    </ModalWrap>
+  );
+}
+
+function TabsView({ tabs, openTab }) {
+  const sorted = tabs.slice().sort((a, b) => a.openedAt - b.openedAt);
+  return (
+    <div>
+      <SectionTitle>Tabs</SectionTitle>
+      {sorted.length === 0 ? (
+        <EmptyState text={`No open tabs. Use "Park as a tab" on the POS screen for a table that's eating now and paying later.`} />
+      ) : (
+        <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3">
+          {sorted.map((t) => (
+            <TabCard key={t.id} tab={t} onClick={() => openTab(t.id)} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TabCard({ tab, onClick }) {
+  const total = tab.items.reduce((s, it) => s + it.price * it.qty, 0);
+  const itemCount = tab.items.reduce((s, it) => s + it.qty, 0);
+  const readyCount = tab.items.filter((it) => it.prepared).length;
+  const allReady = tab.items.length > 0 && readyCount === tab.items.length;
+  return (
+    <button
+      onClick={onClick}
+      className="text-left rounded-xl border p-3.5 flex flex-col"
+      style={{ borderColor: "var(--line)", background: "var(--surface)" }}
+    >
+      <div className="flex items-start justify-between gap-2 mb-2">
+        <div className="min-w-0">
+          <div className="font-medium text-sm truncate">{tab.label}</div>
+          <div className="text-xs truncate" style={{ color: "var(--ink-soft)" }}>
+            Order #{tab.orderNo} · opened{" "}
+            {new Date(tab.openedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+          </div>
+        </div>
+        <span
+          className="text-[10px] px-1.5 py-0.5 rounded-full shrink-0 font-medium"
+          style={{ background: allReady ? "#EAF0E2" : "#FBF0DA", color: allReady ? "var(--primary-dark)" : "var(--accent)" }}
+        >
+          {tab.items.length ? `${readyCount}/${tab.items.length} ready` : "empty"}
+        </span>
+      </div>
+      <div className="text-xs mb-2" style={{ color: "var(--ink-soft)" }}>
+        {itemCount} item{itemCount === 1 ? "" : "s"}
+      </div>
+      <div className="mono-font text-lg font-semibold mt-auto">{money(total)}</div>
+    </button>
+  );
+}
+
+function TabDetailModal({
+  tab, products, categories, onClose, onRename, onAddItem, onIncrement, onDecrement,
+  onRemoveItem, onTogglePrepared, onCancelTab, onSettle,
+}) {
+  const [labelDraft, setLabelDraft] = useState(tab.label);
+  const [editingLabel, setEditingLabel] = useState(false);
+  const [filter, setFilter] = useState("all");
+  const [confirmCancel, setConfirmCancel] = useState(false);
+
+  const cats = [{ id: "all", label: "All" }, ...categories.map((c) => ({ id: c.id, label: c.name }))];
+  const filteredProducts = filter === "all" ? products : products.filter((p) => p.category === filter);
+  const total = tab.items.reduce((s, it) => s + it.price * it.qty, 0);
+  const readyCount = tab.items.filter((it) => it.prepared).length;
+
+  const saveLabel = () => {
+    const trimmed = labelDraft.trim();
+    if (trimmed && trimmed !== tab.label) onRename(tab.id, trimmed);
+    else setLabelDraft(tab.label);
+    setEditingLabel(false);
+  };
+
+  return (
+    <div className="fixed inset-0 z-[60] flex flex-col" style={{ background: "rgba(43,36,32,0.55)" }}>
+      <div className="flex items-center justify-between px-4 py-3 gap-2" style={{ background: "var(--surface)", borderBottom: "1px solid var(--line)" }}>
+        <div className="flex items-center gap-2 min-w-0">
+          <ClipboardList size={16} color="var(--primary)" className="shrink-0" />
+          {editingLabel ? (
+            <input
+              autoFocus
+              value={labelDraft}
+              onChange={(e) => setLabelDraft(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && saveLabel()}
+              onBlur={saveLabel}
+              className="text-sm font-medium border rounded-lg px-2 py-1 min-w-0"
+              style={{ borderColor: "var(--line)" }}
+            />
+          ) : (
+            <button
+              onClick={() => { setLabelDraft(tab.label); setEditingLabel(true); }}
+              className="flex items-center gap-1 text-sm font-medium truncate"
+            >
+              <span className="truncate">{tab.label}</span> <Pencil size={11} color="var(--ink-soft)" className="shrink-0" />
+            </button>
+          )}
+          <span className="text-xs shrink-0" style={{ color: "var(--ink-soft)" }}>#{tab.orderNo}</span>
+        </div>
+        <button onClick={onClose} className="flex items-center gap-1 text-xs px-2 py-1 rounded-lg shrink-0" style={{ color: "var(--ink-soft)" }}>
+          <X size={14} /> Close
+        </button>
+      </div>
+
+      <div className="flex-1 overflow-y-auto scrollbar-thin">
+        <div className="max-w-4xl mx-auto px-4 py-4 flex flex-col lg:flex-row gap-4">
+          <div className="flex-1 min-w-0">
+            <div className="flex gap-1.5 mb-3 flex-wrap">
+              {cats.map((c) => (
+                <button
+                  key={c.id}
+                  onClick={() => setFilter(c.id)}
+                  className="text-xs px-2.5 py-1 rounded-full border whitespace-nowrap"
+                  style={{
+                    borderColor: filter === c.id ? "var(--primary)" : "var(--line)",
+                    background: filter === c.id ? "var(--primary)" : "transparent",
+                    color: filter === c.id ? "#fff" : "var(--ink-soft)",
+                  }}
+                >
+                  {c.label}
+                </button>
+              ))}
+            </div>
+            {filteredProducts.length === 0 ? (
+              <EmptyState text="No products in this category." />
+            ) : (
+              <div className="grid gap-2 grid-cols-2 sm:grid-cols-3">
+                {filteredProducts.map((p) => {
+                  const Icon = categoryIcon(p.category);
+                  return (
+                    <button
+                      key={p.id}
+                      onClick={() => onAddItem(tab.id, p.id)}
+                      className="text-left rounded-lg p-2 sm:p-2.5 border transition-transform active:scale-[0.98]"
+                      style={{ background: "var(--surface)", borderColor: "var(--line)" }}
+                    >
+                      <Icon size={13} color="var(--primary)" className="mb-1" />
+                      <div className="font-medium text-xs leading-snug truncate">{p.name}</div>
+                      <div className="mono-font text-xs mt-1" style={{ color: "var(--accent)" }}>{money(p.price)}</div>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          <div className="w-full lg:w-[360px] shrink-0">
+            <div className="rounded-xl border p-3.5" style={{ borderColor: "var(--line)", background: "var(--surface)" }}>
+              <div className="flex items-center justify-between mb-2">
+                <span className="font-medium text-sm">Items</span>
+                {tab.items.length > 0 && (
+                  <span
+                    className="text-[10px] px-1.5 py-0.5 rounded-full font-medium"
+                    style={{
+                      background: readyCount === tab.items.length ? "#EAF0E2" : "#FBF0DA",
+                      color: readyCount === tab.items.length ? "var(--primary-dark)" : "var(--accent)",
+                    }}
+                  >
+                    {readyCount}/{tab.items.length} ready
+                  </span>
+                )}
+              </div>
+              {tab.items.length === 0 ? (
+                <p className="text-sm py-4 text-center" style={{ color: "var(--ink-soft)" }}>
+                  No items yet — tap a product to add it.
+                </p>
+              ) : (
+                <div className="space-y-1 mb-3 max-h-72 overflow-y-auto scrollbar-thin pr-1">
+                  {tab.items.map((it) => (
+                    <div
+                      key={it.productId}
+                      className="flex items-center gap-2 py-1.5 border-b last:border-b-0"
+                      style={{ borderColor: "var(--line)" }}
+                    >
+                      <button onClick={() => onTogglePrepared(tab.id, it.productId)} className="shrink-0">
+                        {it.prepared ? <CheckCircle2 size={16} color="var(--primary)" /> : <Circle size={16} color="var(--line)" />}
+                      </button>
+                      <div className="flex-1 min-w-0">
+                        <div
+                          className={`text-sm truncate ${it.prepared ? "line-through" : ""}`}
+                          style={{ color: it.prepared ? "var(--ink-soft)" : "var(--ink)" }}
+                        >
+                          {it.name}
+                        </div>
+                        <div className="text-[10px]" style={{ color: "var(--ink-soft)" }}>{money(it.price)} ea</div>
+                      </div>
+                      <div className="flex items-center gap-1 shrink-0">
+                        <button
+                          onClick={() => onDecrement(tab.id, it.productId)}
+                          className="w-6 h-6 flex items-center justify-center rounded-full border"
+                          style={{ borderColor: "var(--line)" }}
+                        >
+                          <Minus size={11} />
+                        </button>
+                        <span className="w-5 text-center text-xs">{it.qty}</span>
+                        <button
+                          onClick={() => onIncrement(tab.id, it.productId)}
+                          className="w-6 h-6 flex items-center justify-center rounded-full border"
+                          style={{ borderColor: "var(--line)" }}
+                        >
+                          <Plus size={11} />
+                        </button>
+                      </div>
+                      <button onClick={() => onRemoveItem(tab.id, it.productId)} className="shrink-0">
+                        <X size={13} color="var(--ink-soft)" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div className="flex justify-between mono-font text-sm mt-1 pt-2 border-t" style={{ borderColor: "var(--line)" }}>
+                <span className="font-medium">Total so far</span>
+                <span className="text-lg font-semibold">{money(total)}</span>
+              </div>
+              <div className="flex gap-2 mt-3">
+                {confirmCancel ? (
+                  <>
+                    <button
+                      onClick={() => setConfirmCancel(false)}
+                      className="flex-1 text-xs py-2 rounded-lg border"
+                      style={{ borderColor: "var(--line)" }}
+                    >
+                      Never mind
+                    </button>
+                    <button
+                      onClick={() => onCancelTab(tab.id)}
+                      className="flex-1 text-xs py-2 rounded-lg font-medium"
+                      style={{ background: "var(--alert)", color: "#fff" }}
+                    >
+                      Confirm cancel
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <button
+                      onClick={() => setConfirmCancel(true)}
+                      className="flex-1 flex items-center justify-center gap-1 text-xs py-2 rounded-lg border"
+                      style={{ borderColor: "var(--line)", color: "var(--alert)" }}
+                    >
+                      <Ban size={12} /> Cancel tab
+                    </button>
+                    <button
+                      onClick={() => onSettle(tab)}
+                      disabled={tab.items.length === 0}
+                      className="flex-[2] text-xs py-2 rounded-lg font-medium disabled:opacity-40"
+                      style={{ background: "var(--primary)", color: "#fff" }}
+                    >
+                      Settle bill — {money(total)}
+                    </button>
+                  </>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// A condensed, self-contained payment panel for closing out a tab — mirrors
+// the POS checkout panel's cash/online/split logic, but works off the
+// tab's fixed item list instead of the live `cart` (items are edited
+// beforehand in TabDetailModal, not here) and never touches ingredient
+// stock, since that was already deducted as items were added to the tab.
+function SettleTabModal({ tab, onClose, onConfirm }) {
+  const [discountType, setDiscountType] = useState("none"); // 'none' | 'percent' | 'amount'
+  const [discountValue, setDiscountValue] = useState("");
+  const [paymentMethod, setPaymentMethod] = useState("cash");
+  const [cashReceived, setCashReceived] = useState("");
+  const [splitPayments, setSplitPayments] = useState([
+    { method: "cash", amount: "" },
+    { method: "online", amount: "" },
+  ]);
+  const [paymentProof, setPaymentProof] = useState(null);
+  const [proofProcessing, setProofProcessing] = useState(false);
+  const [cameraOpen, setCameraOpen] = useState(false);
+  const [error, setError] = useState(null);
+
+  const subtotal = tab.items.reduce((s, it) => s + it.price * it.qty, 0);
+  const discountAmount = useMemo(() => {
+    const v = parseFloat(discountValue) || 0;
+    if (v <= 0) return 0;
+    if (discountType === "percent") return Math.min(subtotal, (subtotal * v) / 100);
+    if (discountType === "amount") return Math.min(subtotal, v);
+    return 0;
+  }, [discountType, discountValue, subtotal]);
+  const total = Math.max(0, +(subtotal - discountAmount).toFixed(2));
+  const changeDue = paymentMethod === "cash" ? +((parseFloat(cashReceived) || 0) - total).toFixed(2) : 0;
+
+  // Same last-leg-takes-the-remainder trick as the POS checkout panel, just
+  // limited to typed amounts (no per-item split — the tab is already a
+  // fixed list by the time it reaches this screen).
+  const splitResolved = (() => {
+    if (paymentMethod !== "split") return [];
+    const manualTotal = splitPayments.slice(0, -1).reduce((s, p) => s + Math.max(0, parseFloat(p.amount) || 0), 0);
+    const lastAmount = Math.max(0, +(total - manualTotal).toFixed(2));
+    return splitPayments.map((p, idx) => ({
+      method: p.method,
+      amount: idx === splitPayments.length - 1 ? lastAmount : +Math.max(0, parseFloat(p.amount) || 0).toFixed(2),
+    }));
+  })();
+  const addSplitLine = () =>
+    setSplitPayments((prev) => [...prev, { method: prev[prev.length - 1].method === "cash" ? "online" : "cash", amount: "" }]);
+  const removeSplitLine = (idx) => {
+    if (splitPayments.length <= 2) return;
+    setSplitPayments((prev) => prev.filter((_, i) => i !== idx));
+  };
+  const updateSplitMethod = (idx, method) => setSplitPayments((prev) => prev.map((p, i) => (i === idx ? { ...p, method } : p)));
+  const updateSplitAmount = (idx, amount) => setSplitPayments((prev) => prev.map((p, i) => (i === idx ? { ...p, amount } : p)));
+
+  const uploadProof = async (file) => {
+    if (!file) return;
+    setProofProcessing(true);
+    try {
+      const dataUrl = await fileToResizedDataURL(file);
+      setPaymentProof(dataUrl);
+    } catch {
+      setError("Couldn't read that image — try a different file.");
+    } finally {
+      setProofProcessing(false);
+    }
+  };
+
+  const submit = () => {
+    setError(null);
+    if (tab.items.length === 0) { setError("This tab has no items."); return; }
+    if (paymentMethod === "cash" && (parseFloat(cashReceived) || 0) < total) {
+      setError("Cash received is less than the total due.");
+      return;
+    }
+    if (paymentMethod === "split") {
+      const covered = splitResolved.length >= 2 && splitResolved.every((p) => p.amount > 0);
+      if (!covered) {
+        setError("Enter payment amounts that add up to less than the total, with something left over for the last payment.");
+        return;
+      }
+    }
+    const amountTendered = paymentMethod === "cash" ? (parseFloat(cashReceived) || 0) : total;
+    onConfirm({
+      discountType,
+      discountValue: parseFloat(discountValue) || 0,
+      discountAmount,
+      paymentMethod,
+      payments: paymentMethod === "split" ? splitResolved : null,
+      amountTendered,
+      paymentProof: (paymentMethod === "online" || paymentMethod === "split") ? paymentProof : null,
+    });
+  };
+
+  return (
+    <div className="fixed inset-0 z-[70] flex items-center justify-center p-4" style={{ background: "rgba(43,36,32,0.55)" }} onClick={onClose}>
+      <div
+        className="rounded-2xl w-full max-w-md max-h-[90vh] overflow-y-auto scrollbar-thin"
+        style={{ background: "var(--surface)" }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between px-5 py-4 border-b" style={{ borderColor: "var(--line)" }}>
+          <div className="flex items-center gap-2 text-sm font-medium min-w-0">
+            <CreditCard size={15} className="shrink-0" /> <span className="truncate">Settle "{tab.label}"</span>
+          </div>
+          <button onClick={onClose} className="shrink-0" style={{ color: "var(--ink-soft)" }}><X size={16} /></button>
+        </div>
+
+        <div className="px-5 py-4">
+          <div className="mono-font text-xs mb-4 max-h-32 overflow-y-auto scrollbar-thin pr-1">
+            {tab.items.map((it) => (
+              <div key={it.productId} className="flex justify-between py-0.5">
+                <span>{it.qty}× {it.name}</span>
+                <span>{money(it.price * it.qty)}</span>
+              </div>
+            ))}
+          </div>
+
+          <div className="flex items-center gap-2 mb-3">
+            <Tag size={13} color="var(--ink-soft)" className="shrink-0" />
+            <select
+              value={discountType}
+              onChange={(e) => setDiscountType(e.target.value)}
+              className="border rounded-lg px-2 py-1.5 text-sm"
+              style={{ borderColor: "var(--line)" }}
+            >
+              <option value="none">No discount</option>
+              <option value="percent">% off</option>
+              <option value="amount">Amount off</option>
+            </select>
+            {discountType !== "none" && (
+              <input
+                type="number"
+                value={discountValue}
+                onChange={(e) => setDiscountValue(e.target.value)}
+                placeholder={discountType === "percent" ? "e.g. 10" : "e.g. 50"}
+                className="flex-1 border rounded-lg px-2 py-1.5 text-sm min-w-0"
+                style={{ borderColor: "var(--line)" }}
+              />
+            )}
+          </div>
+
+          <div className="mono-font text-sm mb-4 pt-2 border-t" style={{ borderColor: "var(--line)" }}>
+            <div className="flex justify-between" style={{ color: "var(--ink-soft)" }}>
+              <span>Subtotal</span><span>{money(subtotal)}</span>
+            </div>
+            {discountAmount > 0 && (
+              <div className="flex justify-between" style={{ color: "var(--alert)" }}>
+                <span>Discount</span><span>-{money(discountAmount)}</span>
+              </div>
+            )}
+            <div className="flex justify-between mt-1">
+              <span className="font-medium">Total due</span>
+              <span className="text-lg font-semibold">{money(total)}</span>
+            </div>
+          </div>
+
+          <div className="flex rounded-lg border p-0.5 text-xs mb-3" style={{ borderColor: "var(--line)" }}>
+            {["cash", "online", "split"].map((m) => (
+              <button
+                key={m}
+                onClick={() => setPaymentMethod(m)}
+                className="flex-1 px-2 py-1.5 rounded-md capitalize"
+                style={{ background: paymentMethod === m ? "var(--primary)" : "transparent", color: paymentMethod === m ? "#fff" : "var(--ink-soft)" }}
+              >
+                {m}
+              </button>
+            ))}
+          </div>
+
+          {paymentMethod === "cash" && (
+            <div className="mb-3">
+              <label className="text-xs font-medium mb-1 block" style={{ color: "var(--ink-soft)" }}>Cash received</label>
+              <input
+                type="number"
+                value={cashReceived}
+                onChange={(e) => setCashReceived(e.target.value)}
+                className="w-full border rounded-lg px-3 py-2 text-sm"
+                style={{ borderColor: "var(--line)" }}
+              />
+              {cashReceived !== "" && (
+                <p className="text-xs mt-1" style={{ color: "var(--ink-soft)" }}>
+                  Change due: {money(Math.max(0, changeDue))}
+                </p>
+              )}
+            </div>
+          )}
+
+          {paymentMethod === "online" && (
+            <div className="mb-3">
+              <p className="text-xs mb-2" style={{ color: "var(--ink-soft)" }}>Optional: attach a screenshot of the payment.</p>
+              <div className="flex gap-2">
+                <label
+                  className="flex-1 flex items-center justify-center gap-1.5 text-xs py-2 rounded-lg border cursor-pointer"
+                  style={{ borderColor: "var(--line)" }}
+                >
+                  <ImagePlus size={13} /> Upload
+                  <input type="file" accept="image/*" className="hidden" onChange={(e) => uploadProof(e.target.files?.[0])} />
+                </label>
+                <button
+                  onClick={() => setCameraOpen(true)}
+                  className="flex-1 flex items-center justify-center gap-1.5 text-xs py-2 rounded-lg border"
+                  style={{ borderColor: "var(--line)" }}
+                >
+                  <Camera size={13} /> Camera
+                </button>
+              </div>
+              {proofProcessing && <p className="text-xs mt-1" style={{ color: "var(--ink-soft)" }}>Processing…</p>}
+              {paymentProof && <img src={paymentProof} alt="Payment proof" className="mt-2 rounded-lg max-h-32" />}
+            </div>
+          )}
+
+          {paymentMethod === "split" && (
+            <div className="mb-3 space-y-2">
+              {splitPayments.map((p, idx) => (
+                <div key={idx} className="flex items-center gap-2">
+                  <select
+                    value={p.method}
+                    onChange={(e) => updateSplitMethod(idx, e.target.value)}
+                    className="border rounded-lg px-2 py-1.5 text-xs"
+                    style={{ borderColor: "var(--line)" }}
+                  >
+                    <option value="cash">Cash</option>
+                    <option value="online">Online</option>
+                  </select>
+                  <input
+                    type="number"
+                    value={idx === splitPayments.length - 1 ? "" : p.amount}
+                    disabled={idx === splitPayments.length - 1}
+                    onChange={(e) => updateSplitAmount(idx, e.target.value)}
+                    placeholder={idx === splitPayments.length - 1 ? `${money(splitResolved[idx]?.amount || 0)} (remainder)` : "Amount"}
+                    className="flex-1 border rounded-lg px-2 py-1.5 text-xs disabled:opacity-60 min-w-0"
+                    style={{ borderColor: "var(--line)" }}
+                  />
+                  {splitPayments.length > 2 && (
+                    <button onClick={() => removeSplitLine(idx)} className="shrink-0"><X size={13} color="var(--ink-soft)" /></button>
+                  )}
+                </div>
+              ))}
+              <button onClick={addSplitLine} className="text-xs flex items-center gap-1" style={{ color: "var(--primary)" }}>
+                <Plus size={12} /> Add another payment
+              </button>
+            </div>
+          )}
+
+          {error && (
+            <div className="flex items-start gap-1.5 text-xs mb-3 px-2.5 py-2 rounded-lg" style={{ background: "#FBEAE5", color: "var(--alert)" }}>
+              <AlertTriangle size={12} className="mt-0.5 shrink-0" /> {error}
+            </div>
+          )}
+
+          <button onClick={submit} className="w-full py-2.5 rounded-lg text-sm font-medium" style={{ background: "var(--primary)", color: "#fff" }}>
+            Confirm payment — {money(total)}
+          </button>
+        </div>
+      </div>
+
+      {cameraOpen && (
+        <CameraCaptureModal
+          onClose={() => setCameraOpen(false)}
+          onCapture={(file) => { setCameraOpen(false); uploadProof(file); }}
+        />
       )}
     </div>
   );
@@ -6556,30 +7445,47 @@ function AutoSaveField({ label, value, onSave, type = "text", placeholder, minLe
 // a dismissable modal (owner opened it voluntarily from the trial banner or
 // Settings, onClose is a function). Sends the owner to PayMongo (GCash/
 // Maya/local cards) if they're billed in PHP, or to PayPal if they're
-// billed in any other currency — see isPHCustomer below. The PayPal button
-// is fully automatic regardless of the discount: buildPayPalLink() (near
-// the top of this file) bakes the subscriber's exact final price — full
-// price, first-payment referral discount, or any accumulated reward-credit
-// % on a renewal — straight into the PayPal checkout URL, so there's no
-// fixed-price link to keep in sync with an ever-changing discount.
+// billed in any other currency — see isPHCustomer below. BOTH are fully
+// automatic for any discount amount:
+//  - PayPal: buildPayPalLink() (near the top of this file) bakes the
+//    subscriber's exact final price — full price, first-payment referral
+//    discount, or any accumulated reward-credit % on a renewal — straight
+//    into the PayPal checkout URL.
+//  - PayMongo: startPayMongoCheckout() below calls the
+//    api/create-paymongo-link.js serverless function, which creates a
+//    fresh PayMongo Payment Link at that same exact peso amount and hands
+//    back its checkout URL. See PAYMONGO_CREATE_LINK_ENDPOINT near the top
+//    of this file for the one-time Vercel setup this needs.
+// Either way, there's no fixed-price link to keep in sync with an
+// ever-changing discount, and the amount the subscriber is asked to pay is
+// always the exact number shown on screen.
 // NOTE: that only covers CHARGING the right amount, not CONFIRMING the
 // payment. The old self-report "I've paid — activate my account" button/
 // flow has been removed, and there's still no PayPal/PayMongo webhook wired
 // up (see supabase-schema.sql notes) — PayPal will notify you directly
 // (dashboard + email) when a payment for your PAYPAL_ME_USERNAME comes in,
-// but `onConfirm`/markSubscriptionActive — which flips subscription_status
-// to "active" and resets reward credits for the new billing cycle — still
+// and PayMongo will show the payment on your Dashboard in real time — but
+// `onConfirm`/markSubscriptionActive — which flips subscription_status to
+// "active" and resets reward credits for the new billing cycle — still
 // needs to be triggered another way (e.g. an admin/back-office action you
-// take after seeing that PayPal notification, or a webhook you add later)
-// once you've reconciled the payment.
+// take after seeing that payment, or a webhook you add later) once you've
+// reconciled it.
 function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onApplyCode, onClose, onLogOut }) {
   const [code, setCode] = useState("");
   const [codeBusy, setCodeBusy] = useState(false);
   const [codeError, setCodeError] = useState("");
   // Controls the in-app checkout overlay (see checkoutModal below) — payment
   // now happens inside the POS in an embedded frame instead of opening
-  // PayMongo's checkout in a new browser tab.
+  // PayMongo's/PayPal's checkout in a new browser tab.
   const [showCheckout, setShowCheckout] = useState(false);
+  // Tracks the PayMongo dynamic-link request (see startPayMongoCheckout
+  // below): "idle" before the subscriber has clicked Pay, "loading" while
+  // api/create-paymongo-link.js is being called, "ready" once it's handed
+  // back a checkout url (at which point showCheckout flips on), and "error"
+  // if that call fails for any reason — in which case the manual-payment
+  // fallback (manualPaymentNote/manualPaymentAmount below) is shown instead
+  // so a subscriber is never just stuck with a dead "Pay now" button.
+  const [paymongoState, setPaymongoState] = useState({ status: "idle", url: "", error: "" });
   // Briefly true right after a code is successfully applied, so the price
   // box can flash/highlight and make the before → after change obvious
   // instead of just silently re-rendering with new numbers.
@@ -6642,34 +7548,27 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
   // — there's no PayMongo option shown to them at all.
   const isPHCustomer = currencyCode === "PHP";
 
-  // PayMongo Payment Links are still a fixed price each — there's no
-  // backend in this browser-only app to talk to PayMongo's API and create
-  // an arbitrary-amount charge on the fly. So PH subscribers still only
-  // have a real link for two exact prices: full price, and the flat
-  // one-time referral-signup price (usesReferralLink) — anything else (a
-  // renewal discounted by an ever-changing reward-credit %) still has to be
-  // collected manually so the amount actually charged matches what's shown
-  // here.
-  const usesReferralLink = !hasSubscribedBefore && discountPercent === REFERRAL_DISCOUNT_PERCENT;
-
-  // PayPal is different: buildPayPalLink() (see near the top of this file)
-  // bakes the exact final price straight into the checkout URL, so it
-  // covers every possible discount amount automatically — full price, the
-  // one-time 25% signup discount, or any accumulated reward-credit %.
-  // There is exactly one remaining reason a PayPal subscriber still needs
-  // the manual-payment fallback: their billing currency isn't one PayPal
-  // itself settles in (see PAYPAL_SUPPORTED_CURRENCIES above) — that's a
-  // currency problem, not a discount problem, and no link can work around
-  // it.
+  // Both PayMongo and PayPal are now fully automatic for any discount
+  // amount — see the big comment above this component. The ONLY remaining
+  // reasons either falls back to manual payment:
+  //  - PayMongo (PH): the live call to api/create-paymongo-link.js failed
+  //    (see paymongoState below) — not a discount-tier limitation anymore.
+  //  - PayPal (everyone else): their billing currency isn't one PayPal
+  //    itself settles in (see PAYPAL_SUPPORTED_CURRENCIES above) — that's a
+  //    currency problem, not a discount problem, and no link can work
+  //    around it.
   const needsManualPayment = isPHCustomer
-    ? (discountPercent > 0 && !usesReferralLink)
+    ? paymongoState.status === "error"
     : !PAYPAL_SUPPORTED_CURRENCIES.has(currencyCode);
-  const payLink = isPHCustomer
-    ? (usesReferralLink ? PAYMONGO_LINK_REFERRAL : PAYMONGO_LINK)
-    : buildPayPalLink(finalPrice, currencyCode);
+  // For PH, payLink is whatever checkout URL startPayMongoCheckout() below
+  // most recently got back from the serverless function (empty until then
+  // — the "Pay now" button is what triggers fetching it). For everyone
+  // else, buildPayPalLink() bakes the exact final price straight into the
+  // URL, so it's ready immediately with no round trip needed.
+  const payLink = isPHCustomer ? paymongoState.url : buildPayPalLink(finalPrice, currencyCode);
   const manualPaymentNote = isPHCustomer ? MANUAL_PAYMENT_NOTE_PH : MANUAL_PAYMENT_NOTE_INTL;
-  // For the PH manual fallback this is the real PHP amount (what PayMongo/
-  // GCash/bank transfer actually settles in). For the international manual
+  // For the PH manual fallback this is the real PHP amount (what GCash/
+  // bank transfer actually settles in). For the international manual
   // fallback (unsupported currency only, see above) this is a USD amount
   // instead of the subscriber's own currency, since by definition PayPal
   // won't take their own currency — USD is the one every PayPal account can
@@ -6677,6 +7576,65 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
   const usdFullPrice = lockedSubscriptionPrice("USD");
   const usdFinalPrice = usdFullPrice - usdFullPrice * (discountPercent / 100);
   const manualPaymentAmount = isPHCustomer ? fmtPhp(phpFinalPrice) : formatSubscriptionAmount(usdFinalPrice, "USD");
+
+  // Whenever the amount actually due changes — a referral code just got
+  // applied, reward credits changed, whatever — throw away any PayMongo
+  // link fetched for the OLD amount. Without this, closing and reopening
+  // the checkout modal after applying a code could show a stale checkout
+  // page still priced at the old amount.
+  useEffect(() => {
+    setPaymongoState({ status: "idle", url: "", error: "" });
+  }, [phpFinalPrice]);
+
+  // Calls api/create-paymongo-link.js to create a fresh PayMongo Payment
+  // Link priced at the EXACT amount shown on screen (phpFinalPrice — full
+  // price, the one-time 25% signup discount, or any accumulated
+  // reward-credit % already baked in), then opens the in-app checkout with
+  // that link. See PAYMONGO_CREATE_LINK_ENDPOINT near the top of this file
+  // for what this calls and the one-time Vercel setup it needs.
+  const startPayMongoCheckout = useCallback(async () => {
+    setPaymongoState({ status: "loading", url: "", error: "" });
+    try {
+      const resp = await fetch(PAYMONGO_CREATE_LINK_ENDPOINT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          amountPhp: phpFinalPrice,
+          description: `OpSteward QuickServe POS — ${hasSubscribedBefore ? "renewal" : "subscription"}${
+            account?.businessName ? ` for ${account.businessName}` : ""
+          }`,
+        }),
+      });
+      let data = null;
+      try {
+        data = await resp.json();
+      } catch {
+        // Non-JSON response (e.g. the endpoint 404ed because the
+        // serverless function hasn't been added/deployed yet) — fall
+        // through to the generic error below instead of throwing here.
+      }
+      if (!resp.ok || !data?.url) {
+        throw new Error(data?.error || "Couldn't reach PayMongo just now.");
+      }
+      setPaymongoState({ status: "ready", url: data.url, error: "" });
+      setShowCheckout(true);
+    } catch (err) {
+      console.error("startPayMongoCheckout failed:", err);
+      setPaymongoState({ status: "error", url: "", error: err.message || "Something went wrong." });
+    }
+  }, [phpFinalPrice, hasSubscribedBefore, account?.businessName]);
+
+  // What the "Pay now" button actually does: PH subscribers need a fresh
+  // PayMongo link fetched first (async), everyone else already has their
+  // PayPal link ready (buildPayPalLink runs synchronously above) so the
+  // checkout modal can just open immediately.
+  const handlePayClick = () => {
+    if (isPHCustomer) {
+      startPayMongoCheckout();
+    } else {
+      setShowCheckout(true);
+    }
+  };
 
   const headline = trialInfo?.renewalDue
     ? "Time to renew"
@@ -6796,20 +7754,35 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
         <div className="rounded-lg border p-3 text-xs" style={{ borderColor: "var(--line)" }}>
           <div className="font-medium mb-1">Pay {manualPaymentAmount} to activate</div>
           <p style={{ color: "var(--ink-soft)" }}>{manualPaymentNote}</p>
+          {/* PH-only: the PayMongo call failed, not a fixed limitation — so
+              offer a one-tap retry instead of leaving the owner stuck on
+              the manual fallback for good. */}
+          {isPHCustomer && (
+            <button
+              type="button"
+              onClick={startPayMongoCheckout}
+              disabled={paymongoState.status === "loading"}
+              className="mt-2 text-xs font-medium"
+              style={{ color: "var(--primary)", opacity: paymongoState.status === "loading" ? 0.6 : 1 }}
+            >
+              {paymongoState.status === "loading" ? "Retrying…" : "Try automatic checkout again"}
+            </button>
+          )}
         </div>
       ) : (
         <>
           <button
             type="button"
-            onClick={() => setShowCheckout(true)}
+            onClick={handlePayClick}
+            disabled={paymongoState.status === "loading"}
             className="w-full flex items-center justify-center gap-2 py-2.5 rounded-lg text-sm font-medium"
-            style={{ background: "var(--primary)", color: "#fff" }}
+            style={{ background: "var(--primary)", color: "#fff", opacity: paymongoState.status === "loading" ? 0.7 : 1 }}
           >
-            <CreditCard size={15} /> Pay now
+            <CreditCard size={15} /> {paymongoState.status === "loading" ? "Preparing checkout…" : "Pay now"}
           </button>
           <p className="text-[11px] text-center mt-2" style={{ color: "var(--ink-soft)" }}>
             {isPHCustomer
-              ? "Accepts GCash, Maya, and local or international cards — pay right here, you won't leave the app."
+              ? `Accepts GCash, Maya, and local or international cards — checkout is created fresh for ${fmt(finalPrice)}, your exact discounted amount, so that's the only amount that will be deducted. Pay right here, you won't leave the app.`
               : `Pay securely via PayPal — the checkout is pre-filled for ${fmt(finalPrice)}, your exact discounted amount, so that's the only amount that will be deducted.`}
           </p>
         </>
@@ -6833,18 +7806,21 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
   );
 
   // ---- In-app payment overlay ----
-  // Renders the checkout (PayMongo for PHP subscribers, PayPal for every
-  // other currency — see isPHCustomer/payLink above) inside an embedded
-  // frame, on top of everything else, so the owner pays without ever
-  // leaving the POS or opening a new browser tab/site. Note: some hosted
-  // checkout pages block being embedded this way for their own
-  // anti-clickjacking security (an X-Frame-Options / CSP header the
-  // provider controls, not this app) — if that ever happens the frame will
-  // just show blank/refuse to load, in which case the "Open in a new tab
-  // instead" link below is the fallback. A fully native in-app card form
-  // (no iframe at all) would need a backend holding your PayMongo/PayPal
-  // secret key to create payment intents securely — that key can never
-  // live in this browser-side file.
+  // Renders the checkout (a freshly created PayMongo Payment Link for PHP
+  // subscribers, a PayPal.me link for every other currency — see
+  // isPHCustomer/payLink above) inside an embedded frame, on top of
+  // everything else, so the owner pays without ever leaving the POS or
+  // opening a new browser tab/site. Note: some hosted checkout pages block
+  // being embedded this way for their own anti-clickjacking security (an
+  // X-Frame-Options / CSP header the provider controls, not this app) — if
+  // that ever happens the frame will just show blank/refuse to load, in
+  // which case the "Open in a new tab instead" link below is the fallback.
+  // A fully native in-app card form (no iframe/redirect at all, on either
+  // provider) would need this same backend piece (see
+  // api/create-paymongo-link.js / PAYMONGO_CREATE_LINK_ENDPOINT above) to
+  // go further and handle Payment Methods/webhooks directly — the secret
+  // key itself still could never live in this browser-side file either
+  // way.
   const checkoutModal = showCheckout && (
     <div className="fixed inset-0 z-[60] flex flex-col" style={{ background: "rgba(43,36,32,0.55)" }}>
       <div className="flex items-center justify-between px-4 py-3" style={{ background: "var(--surface)", borderBottom: "1px solid var(--line)" }}>
