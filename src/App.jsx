@@ -7736,6 +7736,15 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
   // that link. See PAYMONGO_CREATE_LINK_ENDPOINT near the top of this file
   // for what this calls and the one-time Vercel setup it needs.
   const startPayMongoCheckout = useCallback(async () => {
+    // IMPORTANT: the popup window must be opened synchronously, in direct
+    // response to the click — not after an await. Browsers only allow
+    // window.open() without being treated as a blocked popup when it's a
+    // direct reaction to a user gesture; by the time an awaited fetch()
+    // resolves, that "direct gesture" window has closed and the popup
+    // gets silently blocked (falling back to a full new tab instead). So
+    // we open a blank popup right here, then point it at the real
+    // checkout URL once we have it.
+    const popup = openPaymentPopup("about:blank");
     setPaymongoState({ status: "loading", url: "", error: "" });
     try {
       const resp = await fetch(PAYMONGO_CREATE_LINK_ENDPOINT, {
@@ -7764,13 +7773,21 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
         throw new Error(data?.error || "Couldn't reach PayMongo just now.");
       }
       setPaymongoState({ status: "ready", url: data.url, error: "" });
-      // PayMongo's hosted checkout blocks being embedded in an iframe
-      // (X-Frame-Options / CSP, standard for payment pages) — open it
-      // directly instead of trying to show it inside this app.
-      window.open(data.url, "_blank", "noopener,noreferrer");
+      if (popup && !popup.closed) {
+        // Redirect the already-open popup to the real checkout link.
+        popup.location.href = data.url;
+        popup.focus();
+      } else {
+        // The pre-opened popup itself got blocked (rare, but possible) —
+        // fall back to a plain new tab so payment is still reachable.
+        window.open(data.url, "_blank", "noopener,noreferrer");
+      }
     } catch (err) {
       console.error("startPayMongoCheckout failed:", err);
       setPaymongoState({ status: "error", url: "", error: err.message || "Something went wrong." });
+      // Nothing to show in the popup we opened — close it rather than
+      // leaving a blank window sitting on screen after a failed request.
+      if (popup && !popup.closed) popup.close();
     }
   }, [phpFinalPrice, hasSubscribedBefore, account?.businessName]);
 
@@ -7778,13 +7795,35 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
   // PayMongo link fetched first (async), everyone else already has their
   // PayPal link ready (buildPayPalLink runs synchronously above) so the
   // checkout modal can just open immediately.
+  // Opens a checkout link as a small centered popup WINDOW (not an iframe
+  // embedded in this page, and not a full new tab) — e.g. roughly the size
+  // of a card-payment form, positioned in the middle of the user's screen.
+  // This works around PayMongo/PayPal blocking iframes (X-Frame-Options/
+  // CSP) because a popup is a separate browser window, not an embed — those
+  // headers only block the iframe case, not this one. If the browser or an
+  // ad-blocker blocks the popup (returns null/closed), we fall back to a
+  // normal new tab so the subscriber can still always complete payment.
+  const openPaymentPopup = (url) => {
+    const popupWidth = 480;
+    const popupHeight = 720;
+    const left = Math.round(window.screenX + (window.outerWidth - popupWidth) / 2);
+    const top = Math.round(window.screenY + (window.outerHeight - popupHeight) / 2);
+    const features = `width=${popupWidth},height=${popupHeight},left=${left},top=${top},resizable=yes,scrollbars=yes,status=no,toolbar=no,menubar=no,location=no`;
+    const popup = window.open(url, "paymentCheckout", features);
+    if (!popup || popup.closed) {
+      // Popup blocked — fall back to a plain new tab rather than leaving
+      // the subscriber with no way to pay at all.
+      window.open(url, "_blank", "noopener,noreferrer");
+    } else {
+      popup.focus();
+    }
+  };
+
   const handlePayClick = () => {
     if (isPHCustomer) {
       startPayMongoCheckout();
     } else {
-      // PayPal's checkout also blocks being embedded in an iframe — open
-      // it directly in a new tab instead.
-      window.open(payLink, "_blank", "noopener,noreferrer");
+      openPaymentPopup(payLink);
     }
   };
 
