@@ -1133,6 +1133,22 @@ export default function CafePOS() {
     };
   }, []);
 
+  // Re-reads the signed-in owner's row and, if anything actually changed,
+  // updates account state — this is what lets the app notice a payment
+  // went through (api/paymongo-webhook.js flipping subscription_status in
+  // the database) WITHOUT the owner having to manually refresh the page.
+  // See pollForActivation() in UpgradeView, which calls this repeatedly
+  // while a payment popup is open.
+  const refreshAccountStatus = useCallback(async () => {
+    if (!authUserIdRef.current) return null;
+    const biz = await fetchBusiness(authUserIdRef.current);
+    if (biz) {
+      accountRef.current = biz;
+      setAccount(biz);
+    }
+    return biz;
+  }, [fetchBusiness]);
+
   useEffect(() => {
     let mounted = true;
 
@@ -1600,13 +1616,16 @@ export default function CafePOS() {
     }
   }, [authUser, notify]);
 
-  // Called from the Upgrade screen once the owner has paid via PayMongo (or
-  // manually — see MANUAL_PAYMENT_NOTE). There's no PayMongo webhook wired
-  // up here (that needs a small server function — see supabase-schema.sql's
-  // notes), so this is a self-reported confirmation: it flips
-  // subscription_status to "active", starts a new SUBSCRIPTION_PERIOD_DAYS
-  // period, and stores whatever reference the owner typed in, for you to
-  // reconcile against PayMongo's dashboard.
+  // A normal PayMongo payment no longer reaches this function at all —
+  // api/paymongo-webhook.js activates the account server-side the instant
+  // PayMongo confirms payment (see that file's comment). This function is
+  // now only reached for the manual fallback paths: a PayPal payment
+  // (PayPal.me has no webhook — see pollForActivation's comment) or the
+  // PayMongo MANUAL_PAYMENT_NOTE case (the live create-paymongo-link.js
+  // call failed). In both cases the owner self-reports here after you've
+  // reconciled the payment by hand: it flips subscription_status to
+  // "active", starts a new SUBSCRIPTION_PERIOD_DAYS period, and stores
+  // whatever reference the owner typed in.
   const markSubscriptionActive = useCallback(async (referenceNote) => {
     if (!authUser) return false;
     // First payment ever (was still on "trial") vs. a renewal of an
@@ -3110,6 +3129,7 @@ export default function CafePOS() {
           onApplyCode={applyReferralCode}
           onClose={null}
           onLogOut={logOut}
+          onRefreshAccount={refreshAccountStatus}
         />
       </Shell>
     );
@@ -3325,6 +3345,7 @@ export default function CafePOS() {
           onConfirm={markSubscriptionActive}
           onApplyCode={applyReferralCode}
           onClose={trialInfo.expired && !trialInfo.isSubscribed ? null : () => setShowUpgrade(false)}
+          onRefreshAccount={refreshAccountStatus}
         />
       )}
 
@@ -7602,18 +7623,17 @@ function AutoSaveField({ label, value, onSave, type = "text", placeholder, minLe
 // Either way, there's no fixed-price link to keep in sync with an
 // ever-changing discount, and the amount the subscriber is asked to pay is
 // always the exact number shown on screen.
-// NOTE: that only covers CHARGING the right amount, not CONFIRMING the
-// payment. The old self-report "I've paid — activate my account" button/
-// flow has been removed, and there's still no PayPal/PayMongo webhook wired
-// up (see supabase-schema.sql notes) — PayPal will notify you directly
-// (dashboard + email) when a payment for your PAYPAL_ME_USERNAME comes in,
-// and PayMongo will show the payment on your Dashboard in real time — but
-// `onConfirm`/markSubscriptionActive — which flips subscription_status to
-// "active" and resets reward credits for the new billing cycle — still
-// needs to be triggered another way (e.g. an admin/back-office action you
-// take after seeing that payment, or a webhook you add later) once you've
-// reconciled it.
-function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onApplyCode, onClose, onLogOut }) {
+// NOTE on CONFIRMING payment (as opposed to just charging the right
+// amount): PayMongo is now fully automatic — api/paymongo-webhook.js
+// activates the account itself the instant PayMongo confirms the payment,
+// with no admin/back-office step (see that file's setup comment for the
+// one-time Vercel + PayMongo dashboard configuration this needs). PayPal
+// is NOT automatic: PayPal.me has no webhook, so a PayPal payer still
+// needs `onConfirm`/markSubscriptionActive triggered manually after you
+// see the payment land in your PayPal dashboard/email — see
+// pollForActivation()'s comment further below for why it only polls for
+// PayMongo.
+function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onApplyCode, onClose, onLogOut, onRefreshAccount }) {
   const [code, setCode] = useState("");
   const [codeBusy, setCodeBusy] = useState(false);
   const [codeError, setCodeError] = useState("");
@@ -7747,9 +7767,18 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
     const popup = openPaymentPopup("about:blank");
     setPaymongoState({ status: "loading", url: "", error: "" });
     try {
+      // create-paymongo-link.js checks this token against businessId below
+      // (via Supabase's /auth/v1/user) before creating a real charge, so a
+      // browser console can't be used to activate or overcharge a
+      // different subscriber's account.
+      const { data: sessionData } = await supabase.auth.getSession();
+      const accessToken = sessionData?.session?.access_token || "";
       const resp = await fetch(PAYMONGO_CREATE_LINK_ENDPOINT, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${accessToken}`,
+        },
         body: JSON.stringify({
           amountPhp: phpFinalPrice,
           description: `OpSteward QuickServe POS — ${hasSubscribedBefore ? "renewal" : "subscription"}${
@@ -7780,10 +7809,12 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
         popup.location.href = data.url;
         popup.focus();
         pinPopupSize(popup, 480, 720, popup.screenX, popup.screenY);
+        pollForActivation(popup);
       } else {
         // The pre-opened popup itself got blocked (rare, but possible) —
         // fall back to a plain new tab so payment is still reachable.
         window.open(data.url, "_blank", "noopener,noreferrer");
+        pollForActivation(null);
       }
     } catch (err) {
       console.error("startPayMongoCheckout failed:", err);
@@ -7854,10 +7885,62 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
     }, 300);
   };
 
+  // While the payment popup is open, the webhook (api/paymongo-webhook.js)
+  // may flip subscription_status to "active" in the database at any
+  // moment — but nothing tells THIS already-open browser tab that happened.
+  // Without this, an owner who successfully pays still sees "Time to
+  // renew"/a locked POS until they manually reload the page. This polls
+  // the business row every few seconds while the popup is open (plus a
+  // few extra checks right after it's closed, in case the webhook is a
+  // beat slower than the subscriber closing the window) and, the moment
+  // the account comes back active, updates account state — which lets
+  // trialInfo recompute and the lock screen disappear automatically —
+  // and closes the popup + the Upgrade modal itself.
+  // NOTE: this only ever fires for PayMongo, since PayPal.me has no
+  // webhook wired up yet — a PayPal payer still needs to be activated
+  // manually (see the big comment above this component).
+  const pollForActivation = (popup) => {
+    if (!onRefreshAccount) return;
+    let ticks = 0;
+    const maxTicks = 150; // ~10 minutes at 4s each — generous, but finite
+    let popupClosedAt = null;
+    const interval = setInterval(async () => {
+      ticks += 1;
+      if (popup && popup.closed && popupClosedAt === null) {
+        popupClosedAt = ticks;
+      }
+      // Keep checking for a short grace window after the popup closes
+      // (webhook delivery isn't instant), then give up.
+      const stopAfterClose = popupClosedAt !== null && ticks - popupClosedAt > 4; // ~16s grace
+      if (ticks >= maxTicks || stopAfterClose) {
+        clearInterval(interval);
+        return;
+      }
+      const fresh = await onRefreshAccount();
+      const periodEndMs = fresh?.subscriptionPeriodEnd ? new Date(fresh.subscriptionPeriodEnd).getTime() : NaN;
+      const isNowActive = fresh?.subscriptionStatus === "active" && Number.isFinite(periodEndMs) && periodEndMs > Date.now();
+      if (isNowActive) {
+        clearInterval(interval);
+        if (popup && !popup.closed) popup.close();
+        // For the voluntary modal (onClose is a function) close it too, so
+        // the owner lands straight back on their unlocked POS instead of
+        // an empty upgrade screen. The hard-block case (onClose === null)
+        // doesn't need this — trialInfo.isSubscribed flipping true is what
+        // makes the App stop rendering the block at all.
+        if (typeof onClose === "function") onClose();
+      }
+    }, 4000);
+  };
+
   const handlePayClick = () => {
     if (isPHCustomer) {
       startPayMongoCheckout();
     } else {
+      // No pollForActivation() here on purpose: PayPal.me has no webhook,
+      // so subscription_status will never flip on its own after a PayPal
+      // payment — polling would just run for 10 minutes finding nothing.
+      // International subscribers still need to be activated manually
+      // until a real PayPal integration/webhook is added.
       openPaymentPopup(payLink);
     }
   };
