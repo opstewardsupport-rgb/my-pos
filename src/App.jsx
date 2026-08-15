@@ -7969,31 +7969,41 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
   // key itself still could never live in this browser-side file either
   // way.
   const checkoutModal = showCheckout && (
-    <div className="fixed inset-0 z-[60] flex flex-col" style={{ background: "rgba(43,36,32,0.55)" }}>
-      <div className="flex items-center justify-between px-4 py-3" style={{ background: "var(--surface)", borderBottom: "1px solid var(--line)" }}>
-        <div className="flex items-center gap-2 text-sm font-medium">
-          <CreditCard size={15} /> Secure payment
+    <div
+      className="fixed inset-0 z-[60] flex items-center justify-center p-4"
+      style={{ background: "rgba(43,36,32,0.55)" }}
+      onClick={() => setShowCheckout(false)}
+    >
+      <div
+        className="rounded-2xl w-full max-w-md flex flex-col overflow-hidden shadow-xl"
+        style={{ background: "var(--surface)", height: "min(680px, 85vh)" }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between px-4 py-3 shrink-0" style={{ borderBottom: "1px solid var(--line)" }}>
+          <div className="flex items-center gap-2 text-sm font-medium">
+            <CreditCard size={15} /> Secure payment
+          </div>
+          <button onClick={() => setShowCheckout(false)} className="flex items-center gap-1 text-xs px-2 py-1 rounded-lg" style={{ color: "var(--ink-soft)" }}>
+            <X size={14} /> Close
+          </button>
         </div>
-        <button onClick={() => setShowCheckout(false)} className="flex items-center gap-1 text-xs px-2 py-1 rounded-lg" style={{ color: "var(--ink-soft)" }}>
-          <X size={14} /> Close
-        </button>
-      </div>
-      <div className="flex-1" style={{ background: "#fff" }}>
-        <iframe
-          src={payLink}
-          title="Payment checkout"
-          className="w-full h-full"
-          style={{ border: 0 }}
-          allow="payment"
-        />
-      </div>
-      <div className="px-4 py-2 text-center" style={{ background: "var(--surface)", borderTop: "1px solid var(--line)" }}>
-        <p className="text-[10px]" style={{ color: "var(--ink-soft)" }}>
-          Not loading?{" "}
-          <a href={payLink} target="_blank" rel="noopener noreferrer" style={{ color: "var(--primary)" }}>
-            Open in a new tab instead
-          </a>
-        </p>
+        <div className="flex-1 min-h-0" style={{ background: "#fff" }}>
+          <iframe
+            src={payLink}
+            title="Payment checkout"
+            className="w-full h-full"
+            style={{ border: 0 }}
+            allow="payment"
+          />
+        </div>
+        <div className="px-4 py-2 text-center shrink-0" style={{ borderTop: "1px solid var(--line)" }}>
+          <p className="text-[10px]" style={{ color: "var(--ink-soft)" }}>
+            Not loading?{" "}
+            <a href={payLink} target="_blank" rel="noopener noreferrer" style={{ color: "var(--primary)" }}>
+              Open in a new tab instead
+            </a>
+          </p>
+        </div>
       </div>
     </div>
   );
