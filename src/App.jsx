@@ -6990,6 +6990,28 @@ function PrintableReport({ periodLabel, stats, lowStock, sales }) {
           ))}
         </tbody>
       </table>
+
+      {sales.some((s) => (s.paymentMethod === "online" || s.paymentMethod === "split") && s.paymentProof) && (
+        <>
+          <h2 style={{ fontSize: 14, fontWeight: 600, marginTop: 20, marginBottom: 6 }}>
+            Payment proof photos
+          </h2>
+          {sales
+            .filter((s) => (s.paymentMethod === "online" || s.paymentMethod === "split") && s.paymentProof)
+            .map((s) => (
+              <div key={s.id} style={{ marginBottom: 14, breakInside: "avoid", pageBreakInside: "avoid" }}>
+                <p style={{ fontSize: 11, color: "#7A6D5C", marginBottom: 4 }}>
+                  Order #{s.orderNo}{s.voided ? " (voided)" : ""} · {new Date(s.timestamp).toLocaleString()} · {s.employeeName || "—"} · {money(s.total)}
+                </p>
+                <img
+                  src={s.paymentProof}
+                  alt={`Payment proof for order #${s.orderNo}`}
+                  style={{ maxWidth: 260, maxHeight: 260, borderRadius: 6, border: "1px solid #E4DCC8", display: "block" }}
+                />
+              </div>
+            ))}
+        </>
+      )}
     </div>
   );
 }
