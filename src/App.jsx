@@ -7764,7 +7764,10 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
         throw new Error(data?.error || "Couldn't reach PayMongo just now.");
       }
       setPaymongoState({ status: "ready", url: data.url, error: "" });
-      setShowCheckout(true);
+      // PayMongo's hosted checkout blocks being embedded in an iframe
+      // (X-Frame-Options / CSP, standard for payment pages) — open it
+      // directly instead of trying to show it inside this app.
+      window.open(data.url, "_blank", "noopener,noreferrer");
     } catch (err) {
       console.error("startPayMongoCheckout failed:", err);
       setPaymongoState({ status: "error", url: "", error: err.message || "Something went wrong." });
@@ -7779,7 +7782,9 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
     if (isPHCustomer) {
       startPayMongoCheckout();
     } else {
-      setShowCheckout(true);
+      // PayPal's checkout also blocks being embedded in an iframe — open
+      // it directly in a new tab instead.
+      window.open(payLink, "_blank", "noopener,noreferrer");
     }
   };
 
