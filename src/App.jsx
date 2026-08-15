@@ -534,7 +534,7 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { createClient } from "@supabase/supabase-js";
 import {
-  Coffee, Utensils, Package, BarChart3, ShoppingCart, Plus, Minus, X,
+  Coffee, Utensils, Package, BarChart3, ShoppingCart, Plus, PlusCircle, Minus, X,
   Trash2, AlertTriangle, RotateCcw, Pencil, Check, Receipt as ReceiptIcon,
   Tag, Banknote, CreditCard, ImagePlus, Loader2, Camera, History as HistoryIcon,
   Ban, Undo2, ChevronDown, ChevronUp, StickyNote, Coins, ChefHat, Circle, CheckCircle2,
@@ -1016,7 +1016,6 @@ export default function CafePOS() {
   // PARKED_ORDERS_KEY above and parkOrder()/settleTab() further down.
   const [parkedOrders, setParkedOrders] = useState([]);
   const [parkModalOpen, setParkModalOpen] = useState(false); // naming a new tab from the current cart
-  const [tabDetailId, setTabDetailId] = useState(null); // id of the tab open in TabDetailModal
   const [settleTabTarget, setSettleTabTarget] = useState(null); // tab object being paid off in SettleTabModal
   const [nextOrderNo, setNextOrderNo] = useState(1);
   const [currencyCode, setCurrencyCode] = useState("PHP");
@@ -2584,7 +2583,6 @@ export default function CafePOS() {
     if (!tab) return;
     tab.items.forEach((it) => restockFor(it.recipe, it.qty));
     persistParkedOrders(parkedOrders.filter((t) => t.id !== tabId));
-    if (tabDetailId === tabId) setTabDetailId(null);
     if (settleTabTarget?.id === tabId) setSettleTabTarget(null);
     notify(`Tab "${tab.label}" cancelled — ingredients returned to stock.`);
   };
@@ -3207,7 +3205,17 @@ export default function CafePOS() {
         {view === "tabs" && (
           <TabsView
             tabs={parkedOrders}
-            openTab={(id) => setTabDetailId(id)}
+            products={catalog.products}
+            categories={catalog.categories}
+            onRename={renameTab}
+            onAddItem={addItemToTab}
+            onIncrement={addItemToTab}
+            onDecrement={decrementTabItem}
+            onRemoveItem={removeTabItem}
+            onTogglePrepared={toggleTabItemPrepared}
+            onSetStatus={setTabStatus}
+            onCancelTab={cancelTab}
+            onSettle={(tab) => setSettleTabTarget(tab)}
           />
         )}
         {view === "kitchen" && (
@@ -3393,23 +3401,6 @@ export default function CafePOS() {
           nextOrderNo={nextOrderNo}
           onClose={() => setParkModalOpen(false)}
           onConfirm={parkOrder}
-        />
-      )}
-      {tabDetailId && parkedOrders.some((t) => t.id === tabDetailId) && (
-        <TabDetailModal
-          tab={parkedOrders.find((t) => t.id === tabDetailId)}
-          products={catalog.products}
-          categories={catalog.categories}
-          onClose={() => setTabDetailId(null)}
-          onRename={renameTab}
-          onAddItem={addItemToTab}
-          onIncrement={addItemToTab}
-          onDecrement={decrementTabItem}
-          onRemoveItem={removeTabItem}
-          onTogglePrepared={toggleTabItemPrepared}
-          onSetStatus={setTabStatus}
-          onCancelTab={cancelTab}
-          onSettle={(tab) => setSettleTabTarget(tab)}
         />
       )}
       {settleTabTarget && (
@@ -5087,7 +5078,13 @@ function ParkOrderModal({ nextOrderNo, onClose, onConfirm }) {
 // Same Preparing / Completed split as the Kitchen board — a tab can be
 // checked off (crossed out) as done even though it's still unpaid; it only
 // leaves this list entirely once it's actually settled (paid) or cancelled.
-function TabsView({ tabs, openTab }) {
+// Everything about a tab — item list, prepared checklist, adding items,
+// marking complete, cancelling, settling — happens right on its card here,
+// same as a Kitchen order card. There's no full-screen popup to open.
+function TabsView({
+  tabs, products, categories, onRename, onAddItem, onIncrement, onDecrement,
+  onRemoveItem, onTogglePrepared, onSetStatus, onCancelTab, onSettle,
+}) {
   const [subview, setSubview] = useState("preparing");
   const preparing = tabs.filter((t) => (t.status || "preparing") !== "completed");
   const completed = tabs.filter((t) => t.status === "completed");
@@ -5138,13 +5135,27 @@ function TabsView({ tabs, openTab }) {
           text={
             subview === "preparing"
               ? `No open tabs. Use "Park as a tab" on the POS screen for a table that's eating now and paying later.`
-              : "No tabs marked complete yet — check off every item, or use \"Mark order complete\" inside a tab."
+              : "No tabs marked complete yet — check off every item, or use \"Mark order complete\" on a tab."
           }
         />
       ) : (
-        <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3">
+        <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3 items-start">
           {list.map((t) => (
-            <TabCard key={t.id} tab={t} onClick={() => openTab(t.id)} />
+            <TabCard
+              key={t.id}
+              tab={t}
+              products={products}
+              categories={categories}
+              onRename={onRename}
+              onAddItem={onAddItem}
+              onIncrement={onIncrement}
+              onDecrement={onDecrement}
+              onRemoveItem={onRemoveItem}
+              onTogglePrepared={onTogglePrepared}
+              onSetStatus={onSetStatus}
+              onCancelTab={onCancelTab}
+              onSettle={onSettle}
+            />
           ))}
         </div>
       )}
@@ -5152,69 +5163,33 @@ function TabsView({ tabs, openTab }) {
   );
 }
 
-function TabCard({ tab, onClick }) {
-  const total = tab.items.reduce((s, it) => s + it.price * it.qty, 0);
-  const itemCount = tab.items.reduce((s, it) => s + it.qty, 0);
-  const readyCount = tab.items.filter((it) => it.prepared).length;
-  const allReady = tab.items.length > 0 && readyCount === tab.items.length;
-  const isCompleted = tab.status === "completed";
-  return (
-    <button
-      onClick={onClick}
-      className="text-left rounded-xl border p-3.5 flex flex-col"
-      style={{ borderColor: "var(--line)", background: "var(--surface)" }}
-    >
-      <div className="flex items-start justify-between gap-2 mb-2">
-        <div className="min-w-0">
-          <div
-            className={`font-medium text-sm truncate ${isCompleted ? "line-through" : ""}`}
-            style={{ color: isCompleted ? "var(--ink-soft)" : "var(--ink)" }}
-          >
-            {tab.label}
-          </div>
-          <div className="text-xs truncate" style={{ color: "var(--ink-soft)" }}>
-            Order #{tab.orderNo} · opened{" "}
-            {new Date(tab.openedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
-          </div>
-        </div>
-        <span
-          className="text-[10px] px-1.5 py-0.5 rounded-full shrink-0 font-medium"
-          style={{ background: isCompleted ? "#EAF0E2" : allReady ? "#EAF0E2" : "#FBF0DA", color: isCompleted || allReady ? "var(--primary-dark)" : "var(--accent)" }}
-        >
-          {isCompleted ? "Completed" : tab.items.length ? `${readyCount}/${tab.items.length} ready` : "empty"}
-        </span>
-      </div>
-      <div className="text-xs mb-2" style={{ color: "var(--ink-soft)" }}>
-        {itemCount} item{itemCount === 1 ? "" : "s"} · not paid yet
-      </div>
-      <div className={`mono-font text-lg font-semibold mt-auto ${isCompleted ? "line-through" : ""}`} style={{ color: isCompleted ? "var(--ink-soft)" : "inherit" }}>
-        {money(total)}
-      </div>
-    </button>
-  );
-}
-
-function TabDetailModal({
-  tab, products, categories, onClose, onRename, onAddItem, onIncrement, onDecrement,
+// A single tab, fully self-contained — item checklist, an expandable
+// "Add item" product picker, mark-complete, cancel, and settle — all inline
+// on the card itself. Mirrors KitchenOrderCard's "no popup, just tap on the
+// card" feel, extended with the add-item picker a tab needs that a kitchen
+// order doesn't.
+function TabCard({
+  tab, products, categories, onRename, onAddItem, onIncrement, onDecrement,
   onRemoveItem, onTogglePrepared, onSetStatus, onCancelTab, onSettle,
 }) {
   const [labelDraft, setLabelDraft] = useState(tab.label);
   const [editingLabel, setEditingLabel] = useState(false);
+  const [addOpen, setAddOpen] = useState(false);
   const [filter, setFilter] = useState("all");
   const [confirmCancel, setConfirmCancel] = useState(false);
   // Every add/remove/qty/prepared change is already saved to storage the
   // instant it happens (see persistParkedOrders in App) — there's nothing
-  // that can be lost by closing this modal. This just gives an explicit,
-  // visible confirmation after adding items, since the category buttons and
-  // item list can be easy to miss changes in on a busy counter.
+  // that can be lost. This just gives an explicit, visible confirmation
+  // after adding an item, since it's easy to miss on a busy counter.
   const [justSaved, setJustSaved] = useState(false);
   const saveTimerRef = useRef(null);
+  useEffect(() => () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); }, []);
 
-  const cats = [{ id: "all", label: "All" }, ...categories.map((c) => ({ id: c.id, label: c.name }))];
-  const filteredProducts = filter === "all" ? products : products.filter((p) => p.category === filter);
   const total = tab.items.reduce((s, it) => s + it.price * it.qty, 0);
   const readyCount = tab.items.filter((it) => it.prepared).length;
   const isCompleted = tab.status === "completed";
+  const cats = [{ id: "all", label: "All" }, ...categories.map((c) => ({ id: c.id, label: c.name }))];
+  const filteredProducts = filter === "all" ? products : products.filter((p) => p.category === filter);
 
   const saveLabel = () => {
     const trimmed = labelDraft.trim();
@@ -5223,23 +5198,17 @@ function TabDetailModal({
     setEditingLabel(false);
   };
 
-  const flashSaved = () => {
+  const addItem = (productId) => {
+    onAddItem(tab.id, productId);
     setJustSaved(true);
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     saveTimerRef.current = setTimeout(() => setJustSaved(false), 1600);
   };
-  useEffect(() => () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); }, []);
-
-  const addItem = (productId) => {
-    onAddItem(tab.id, productId);
-    flashSaved();
-  };
 
   return (
-    <div className="fixed inset-0 z-[60] flex flex-col" style={{ background: "rgba(43,36,32,0.55)" }}>
-      <div className="flex items-center justify-between px-4 py-3 gap-2" style={{ background: "var(--surface)", borderBottom: "1px solid var(--line)" }}>
-        <div className="flex items-center gap-2 min-w-0">
-          <ClipboardList size={16} color="var(--primary)" className="shrink-0" />
+    <div className="rounded-xl border p-3.5 flex flex-col" style={{ borderColor: "var(--line)", background: "var(--surface)" }}>
+      <div className="flex items-start justify-between gap-2 mb-2">
+        <div className="min-w-0">
           {editingLabel ? (
             <input
               autoFocus
@@ -5247,210 +5216,204 @@ function TabDetailModal({
               onChange={(e) => setLabelDraft(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && saveLabel()}
               onBlur={saveLabel}
-              className="text-sm font-medium border rounded-lg px-2 py-1 min-w-0"
+              className="text-sm font-medium border rounded-lg px-2 py-1 min-w-0 w-full"
               style={{ borderColor: "var(--line)" }}
             />
           ) : (
             <button
               onClick={() => { setLabelDraft(tab.label); setEditingLabel(true); }}
               className="flex items-center gap-1 text-sm font-medium truncate"
+              style={{ color: isCompleted ? "var(--ink-soft)" : "var(--ink)" }}
             >
-              <span className="truncate">{tab.label}</span> <Pencil size={11} color="var(--ink-soft)" className="shrink-0" />
+              <span className={`truncate ${isCompleted ? "line-through" : ""}`}>{tab.label}</span>
+              <Pencil size={11} color="var(--ink-soft)" className="shrink-0" />
             </button>
           )}
-          <span className="text-xs shrink-0" style={{ color: "var(--ink-soft)" }}>#{tab.orderNo}</span>
+          <div className="text-xs truncate mt-0.5" style={{ color: "var(--ink-soft)" }}>
+            Order #{tab.orderNo} · opened{" "}
+            {new Date(tab.openedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+          </div>
         </div>
-        <button onClick={onClose} className="flex items-center gap-1 text-xs px-2 py-1 rounded-lg shrink-0" style={{ color: "var(--ink-soft)" }}>
-          <X size={14} /> Close
-        </button>
+        <span
+          className="text-[10px] px-1.5 py-0.5 rounded-full shrink-0 font-medium"
+          style={{
+            background: isCompleted ? "#EAF0E2" : readyCount === tab.items.length && tab.items.length > 0 ? "#EAF0E2" : "#FBF0DA",
+            color: isCompleted || (readyCount === tab.items.length && tab.items.length > 0) ? "var(--primary-dark)" : "var(--accent)",
+          }}
+        >
+          {isCompleted ? "Completed" : tab.items.length ? `${readyCount}/${tab.items.length} ready` : "empty"}
+        </span>
       </div>
 
-      <div className="flex-1 overflow-y-auto scrollbar-thin" style={{ background: "var(--bg)" }}>
-        <div className="max-w-4xl mx-auto px-4 py-4 flex flex-col lg:flex-row gap-4">
-          <div className="flex-1 min-w-0">
-            <div className="flex gap-1.5 mb-3 flex-wrap">
-              {cats.map((c) => (
-                <button
-                  key={c.id}
-                  onClick={() => setFilter(c.id)}
-                  className="text-xs px-2.5 py-1 rounded-full border whitespace-nowrap"
-                  style={{
-                    borderColor: filter === c.id ? "var(--primary)" : "var(--line)",
-                    background: filter === c.id ? "var(--primary)" : "transparent",
-                    color: filter === c.id ? "#fff" : "var(--ink-soft)",
-                  }}
-                >
-                  {c.label}
+      {/* ---- Item checklist — same cross-out-as-prepared idea as Kitchen ---- */}
+      {tab.items.length === 0 ? (
+        <p className="text-xs py-2" style={{ color: "var(--ink-soft)" }}>
+          No items yet — tap "Add item" below.
+        </p>
+      ) : (
+        <div className="space-y-1 mb-1">
+          {tab.items.map((it) => (
+            <div key={it.productId} className="flex items-center gap-2 py-1 border-b last:border-b-0" style={{ borderColor: "var(--line)" }}>
+              <button onClick={() => onTogglePrepared(tab.id, it.productId)} className="shrink-0">
+                {it.prepared ? <CheckCircle2 size={16} color="var(--primary)" /> : <Circle size={16} color="var(--line)" />}
+              </button>
+              <div className="flex-1 min-w-0">
+                <div className={`text-sm truncate ${it.prepared ? "line-through" : ""}`} style={{ color: it.prepared ? "var(--ink-soft)" : "var(--ink)" }}>
+                  {it.qty}× {it.name}
+                </div>
+              </div>
+              <div className="flex items-center gap-1 shrink-0">
+                <button onClick={() => onDecrement(tab.id, it.productId)} className="w-5 h-5 flex items-center justify-center rounded-full border" style={{ borderColor: "var(--line)" }}>
+                  <Minus size={10} />
                 </button>
-              ))}
+                <button onClick={() => onIncrement(tab.id, it.productId)} className="w-5 h-5 flex items-center justify-center rounded-full border" style={{ borderColor: "var(--line)" }}>
+                  <Plus size={10} />
+                </button>
+              </div>
+              <button onClick={() => onRemoveItem(tab.id, it.productId)} className="shrink-0">
+                <X size={12} color="var(--ink-soft)" />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* ---- Add item — expands a category-filtered product picker right
+          on the card, no popup. ---- */}
+      <div className="mt-1">
+        <button
+          onClick={() => setAddOpen((v) => !v)}
+          className="w-full flex items-center justify-center gap-1 text-xs py-1.5 rounded-lg border"
+          style={{ borderColor: "var(--line)", color: "var(--primary-dark)" }}
+        >
+          {addOpen ? <ChevronUp size={12} /> : <PlusCircle size={12} />}
+          {addOpen ? "Hide products" : "Add item"}
+          {justSaved && !addOpen && (
+            <span className="flex items-center gap-0.5 ml-1" style={{ color: "var(--primary-dark)" }}>
+              <Check size={11} /> Saved
+            </span>
+          )}
+        </button>
+        {addOpen && (
+          <div className="mt-2 rounded-lg border p-2" style={{ borderColor: "var(--line)", background: "var(--bg)" }}>
+            <div className="flex items-center justify-between gap-2 mb-1.5">
+              <div className="flex gap-1 flex-wrap">
+                {cats.map((c) => (
+                  <button
+                    key={c.id}
+                    onClick={() => setFilter(c.id)}
+                    className="text-[10px] px-2 py-0.5 rounded-full border whitespace-nowrap"
+                    style={{
+                      borderColor: filter === c.id ? "var(--primary)" : "var(--line)",
+                      background: filter === c.id ? "var(--primary)" : "var(--surface)",
+                      color: filter === c.id ? "#fff" : "var(--ink-soft)",
+                    }}
+                  >
+                    {c.label}
+                  </button>
+                ))}
+              </div>
+              {justSaved && (
+                <span className="text-[10px] flex items-center gap-0.5 font-medium shrink-0" style={{ color: "var(--primary-dark)" }}>
+                  <Check size={11} /> Saved
+                </span>
+              )}
             </div>
             {filteredProducts.length === 0 ? (
-              <EmptyState text="No products in this category." />
+              <p className="text-[11px] py-2 text-center" style={{ color: "var(--ink-soft)" }}>No products in this category.</p>
             ) : (
-              <div className="grid gap-2 grid-cols-2 sm:grid-cols-3">
+              <div className="grid gap-1.5 grid-cols-2 max-h-56 overflow-y-auto scrollbar-thin pr-0.5">
                 {filteredProducts.map((p) => {
                   const Icon = categoryIcon(p.category);
                   return (
                     <button
                       key={p.id}
                       onClick={() => addItem(p.id)}
-                      className="text-left rounded-lg p-2 sm:p-2.5 border transition-transform active:scale-[0.98]"
+                      className="text-left rounded-lg p-2 border transition-transform active:scale-[0.98]"
                       style={{ background: "var(--surface)", borderColor: "var(--line)" }}
                     >
-                      <Icon size={13} color="var(--primary)" className="mb-1" />
-                      <div className="font-medium text-xs leading-snug truncate">{p.name}</div>
-                      <div className="mono-font text-xs mt-1" style={{ color: "var(--accent)" }}>{money(p.price)}</div>
+                      <Icon size={12} color="var(--primary)" className="mb-1" />
+                      <div className="font-medium text-[11px] leading-snug truncate">{p.name}</div>
+                      <div className="mono-font text-[11px] mt-0.5" style={{ color: "var(--accent)" }}>{money(p.price)}</div>
                     </button>
                   );
                 })}
               </div>
             )}
           </div>
+        )}
+      </div>
 
-          <div className="w-full lg:w-[360px] shrink-0">
-            <div className="rounded-xl border p-3.5" style={{ borderColor: "var(--line)", background: "var(--surface)" }}>
-              <div className="flex items-center justify-between mb-2 gap-2">
-                <span className="font-medium text-sm">Items</span>
-                <div className="flex items-center gap-1.5">
-                  {justSaved && (
-                    <span className="text-[10px] flex items-center gap-1 font-medium" style={{ color: "var(--primary-dark)" }}>
-                      <Check size={11} /> Saved
-                    </span>
-                  )}
-                  {tab.items.length > 0 && (
-                    <span
-                      className="text-[10px] px-1.5 py-0.5 rounded-full font-medium"
-                      style={{
-                        background: isCompleted ? "#EAF0E2" : readyCount === tab.items.length ? "#EAF0E2" : "#FBF0DA",
-                        color: isCompleted || readyCount === tab.items.length ? "var(--primary-dark)" : "var(--accent)",
-                      }}
-                    >
-                      {isCompleted ? "Completed" : `${readyCount}/${tab.items.length} ready`}
-                    </span>
-                  )}
-                </div>
-              </div>
-              {tab.items.length === 0 ? (
-                <p className="text-sm py-4 text-center" style={{ color: "var(--ink-soft)" }}>
-                  No items yet — tap a product to add it.
-                </p>
-              ) : (
-                <div className="space-y-1 mb-3 max-h-72 overflow-y-auto scrollbar-thin pr-1">
-                  {tab.items.map((it) => (
-                    <div
-                      key={it.productId}
-                      className="flex items-center gap-2 py-1.5 border-b last:border-b-0"
-                      style={{ borderColor: "var(--line)" }}
-                    >
-                      <button onClick={() => onTogglePrepared(tab.id, it.productId)} className="shrink-0">
-                        {it.prepared ? <CheckCircle2 size={16} color="var(--primary)" /> : <Circle size={16} color="var(--line)" />}
-                      </button>
-                      <div className="flex-1 min-w-0">
-                        <div
-                          className={`text-sm truncate ${it.prepared ? "line-through" : ""}`}
-                          style={{ color: it.prepared ? "var(--ink-soft)" : "var(--ink)" }}
-                        >
-                          {it.name}
-                        </div>
-                        <div className="text-[10px]" style={{ color: "var(--ink-soft)" }}>{money(it.price)} ea</div>
-                      </div>
-                      <div className="flex items-center gap-1 shrink-0">
-                        <button
-                          onClick={() => onDecrement(tab.id, it.productId)}
-                          className="w-6 h-6 flex items-center justify-center rounded-full border"
-                          style={{ borderColor: "var(--line)" }}
-                        >
-                          <Minus size={11} />
-                        </button>
-                        <span className="w-5 text-center text-xs">{it.qty}</span>
-                        <button
-                          onClick={() => onIncrement(tab.id, it.productId)}
-                          className="w-6 h-6 flex items-center justify-center rounded-full border"
-                          style={{ borderColor: "var(--line)" }}
-                        >
-                          <Plus size={11} />
-                        </button>
-                      </div>
-                      <button onClick={() => onRemoveItem(tab.id, it.productId)} className="shrink-0">
-                        <X size={13} color="var(--ink-soft)" />
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              )}
-              <div className="flex justify-between mono-font text-sm mt-1 pt-2 border-t" style={{ borderColor: "var(--line)" }}>
-                <span className="font-medium">Total so far</span>
-                <span className="text-lg font-semibold">{money(total)}</span>
-              </div>
-              {/* ---- Mark order complete — same idea as the Kitchen board:
-                  cross the whole tab out as done even though it hasn't been
-                  paid yet. Independent of settling the bill; a completed tab
-                  still shows up here to be paid, it just also shows as
-                  "Completed" in the Tabs list instead of "Preparing". ---- */}
-              {tab.items.length > 0 && (
-                isCompleted ? (
-                  <button
-                    onClick={() => onSetStatus(tab.id, "preparing")}
-                    className="w-full mt-3 flex items-center justify-center gap-1 text-xs py-2 rounded-lg border"
-                    style={{ borderColor: "var(--line)", color: "var(--primary-dark)" }}
-                  >
-                    <Undo2 size={12} /> Move back to preparing
-                  </button>
-                ) : (
-                  <button
-                    onClick={() => onSetStatus(tab.id, "completed")}
-                    className="w-full mt-3 flex items-center justify-center gap-1 text-xs py-2 rounded-lg font-medium"
-                    style={{
-                      background: readyCount === tab.items.length ? "var(--primary)" : "var(--bg)",
-                      color: readyCount === tab.items.length ? "#fff" : "var(--ink-soft)",
-                      border: readyCount === tab.items.length ? "none" : "1px solid var(--line)",
-                    }}
-                  >
-                    <Check size={12} /> Mark order complete
-                  </button>
-                )
-              )}
-              <div className="flex gap-2 mt-2">
-                {confirmCancel ? (
-                  <>
-                    <button
-                      onClick={() => setConfirmCancel(false)}
-                      className="flex-1 text-xs py-2 rounded-lg border"
-                      style={{ borderColor: "var(--line)" }}
-                    >
-                      Never mind
-                    </button>
-                    <button
-                      onClick={() => onCancelTab(tab.id)}
-                      className="flex-1 text-xs py-2 rounded-lg font-medium"
-                      style={{ background: "var(--alert)", color: "#fff" }}
-                    >
-                      Confirm cancel
-                    </button>
-                  </>
-                ) : (
-                  <>
-                    <button
-                      onClick={() => setConfirmCancel(true)}
-                      className="flex-1 flex items-center justify-center gap-1 text-xs py-2 rounded-lg border"
-                      style={{ borderColor: "var(--line)", color: "var(--alert)" }}
-                    >
-                      <Ban size={12} /> Cancel tab
-                    </button>
-                    <button
-                      onClick={() => onSettle(tab)}
-                      disabled={tab.items.length === 0}
-                      className="flex-[2] text-xs py-2 rounded-lg font-medium disabled:opacity-40"
-                      style={{ background: "var(--primary)", color: "#fff" }}
-                    >
-                      Settle bill — {money(total)}
-                    </button>
-                  </>
-                )}
-              </div>
-            </div>
-          </div>
-        </div>
+      <div className={`flex justify-between mono-font text-sm mt-2 pt-2 border-t ${isCompleted ? "line-through" : ""}`} style={{ borderColor: "var(--line)", color: isCompleted ? "var(--ink-soft)" : "inherit" }}>
+        <span className="font-medium">Total so far</span>
+        <span className="text-lg font-semibold">{money(total)}</span>
+      </div>
+      <div className="text-[10px] -mt-1 mb-1" style={{ color: "var(--ink-soft)" }}>not paid yet</div>
+
+      {/* ---- Mark order complete — same idea as the Kitchen board: cross
+          the whole tab out as done even though it hasn't been paid yet.
+          Independent of settling the bill. ---- */}
+      {tab.items.length > 0 && (
+        isCompleted ? (
+          <button
+            onClick={() => onSetStatus(tab.id, "preparing")}
+            className="w-full mt-1 flex items-center justify-center gap-1 text-xs py-2 rounded-lg border"
+            style={{ borderColor: "var(--line)", color: "var(--primary-dark)" }}
+          >
+            <Undo2 size={12} /> Move back to preparing
+          </button>
+        ) : (
+          <button
+            onClick={() => onSetStatus(tab.id, "completed")}
+            className="w-full mt-1 flex items-center justify-center gap-1 text-xs py-2 rounded-lg font-medium"
+            style={{
+              background: readyCount === tab.items.length ? "var(--primary)" : "var(--bg)",
+              color: readyCount === tab.items.length ? "#fff" : "var(--ink-soft)",
+              border: readyCount === tab.items.length ? "none" : "1px solid var(--line)",
+            }}
+          >
+            <Check size={12} /> Mark order complete
+          </button>
+        )
+      )}
+
+      <div className="flex gap-2 mt-2">
+        {confirmCancel ? (
+          <>
+            <button
+              onClick={() => setConfirmCancel(false)}
+              className="flex-1 text-xs py-2 rounded-lg border"
+              style={{ borderColor: "var(--line)" }}
+            >
+              Never mind
+            </button>
+            <button
+              onClick={() => onCancelTab(tab.id)}
+              className="flex-1 text-xs py-2 rounded-lg font-medium"
+              style={{ background: "var(--alert)", color: "#fff" }}
+            >
+              Confirm cancel
+            </button>
+          </>
+        ) : (
+          <>
+            <button
+              onClick={() => setConfirmCancel(true)}
+              className="flex-1 flex items-center justify-center gap-1 text-xs py-2 rounded-lg border"
+              style={{ borderColor: "var(--line)", color: "var(--alert)" }}
+            >
+              <Ban size={12} /> Cancel tab
+            </button>
+            <button
+              onClick={() => onSettle(tab)}
+              disabled={tab.items.length === 0}
+              className="flex-[2] text-xs py-2 rounded-lg font-medium disabled:opacity-40"
+              style={{ background: "var(--primary)", color: "#fff" }}
+            >
+              Settle bill — {money(total)}
+            </button>
+          </>
+        )}
       </div>
     </div>
   );
@@ -5459,8 +5422,8 @@ function TabDetailModal({
 // A condensed, self-contained payment panel for closing out a tab — mirrors
 // the POS checkout panel's cash/online/split logic, but works off the
 // tab's fixed item list instead of the live `cart` (items are edited
-// beforehand in TabDetailModal, not here) and never touches ingredient
-// stock, since that was already deducted as items were added to the tab.
+// directly on the tab's card in TabsView, not here) and never touches
+// ingredient stock, since that was already deducted as items were added.
 function SettleTabModal({ tab, onClose, onConfirm }) {
   const [discountType, setDiscountType] = useState("none"); // 'none' | 'percent' | 'amount'
   const [discountValue, setDiscountValue] = useState("");
