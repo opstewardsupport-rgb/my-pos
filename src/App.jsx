@@ -7774,9 +7774,12 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
       }
       setPaymongoState({ status: "ready", url: data.url, error: "" });
       if (popup && !popup.closed) {
-        // Redirect the already-open popup to the real checkout link.
+        // Redirect the already-open popup to the real checkout link, then
+        // pin its size again — navigating to the real page is another
+        // moment where the destination could resize/maximize itself.
         popup.location.href = data.url;
         popup.focus();
+        pinPopupSize(popup, 480, 720, popup.screenX, popup.screenY);
       } else {
         // The pre-opened popup itself got blocked (rare, but possible) —
         // fall back to a plain new tab so payment is still reachable.
@@ -7814,9 +7817,41 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
       // Popup blocked — fall back to a plain new tab rather than leaving
       // the subscriber with no way to pay at all.
       window.open(url, "_blank", "noopener,noreferrer");
-    } else {
-      popup.focus();
+      return null;
     }
+    popup.focus();
+    pinPopupSize(popup, popupWidth, popupHeight, left, top);
+    return popup;
+  };
+
+  // Some hosted checkout pages resize/maximize their own window once they
+  // finish loading (common for "make the payment form full-size" UX on
+  // their end) — that overrides the small size we opened the popup at.
+  // resizeTo/moveTo are allowed cross-origin because they act on the
+  // window itself (not its cross-origin content), so we can keep pulling
+  // it back to our fixed size. We do this repeatedly for a few seconds
+  // after opening/navigating, then stop — long enough to override the
+  // checkout page's own onload resize script, short enough that we're not
+  // fighting the subscriber if they manually resize it later themselves.
+  const pinPopupSize = (popup, w, h, left, top) => {
+    let ticks = 0;
+    const maxTicks = 10; // ~3 seconds at 300ms each
+    const interval = setInterval(() => {
+      ticks += 1;
+      if (!popup || popup.closed || ticks >= maxTicks) {
+        clearInterval(interval);
+        return;
+      }
+      try {
+        popup.resizeTo(w, h);
+        popup.moveTo(left, top);
+      } catch {
+        // Some browsers restrict resizeTo/moveTo depending on how the
+        // window was opened — if it throws, just stop trying rather than
+        // spamming errors every tick.
+        clearInterval(interval);
+      }
+    }, 300);
   };
 
   const handlePayClick = () => {
