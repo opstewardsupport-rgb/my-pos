@@ -3300,6 +3300,8 @@ export default function CafePOS() {
             sales={filteredSales}
             voidedSales={filteredVoidedSales}
             periodLabel={reportPeriodLabel}
+            detailSale={detailSale}
+            setDetailSale={setDetailSale}
           />
         )}
         {view === "settings" && (
@@ -4849,10 +4851,23 @@ function SalesHistoryView({
                         Active
                       </span>
                     )}
+                    {(s.paymentMethod === "online" || s.paymentMethod === "split") && s.paymentProof && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded-full flex items-center gap-1" style={{ background: "var(--bg)", color: "var(--ink-soft)" }}>
+                        <ImagePlus size={10} /> Proof attached
+                      </span>
+                    )}
                   </div>
                   <div className="text-xs mt-1 truncate" style={{ color: "var(--ink-soft)" }}>
                     {s.items.map((i) => `${i.qty}× ${i.name}`).join(", ")}
                   </div>
+                  {(s.paymentMethod === "online" || s.paymentMethod === "split") && s.paymentProof && (
+                    <img
+                      src={s.paymentProof}
+                      alt="Payment proof"
+                      className="mt-1.5 h-12 w-12 object-cover rounded-lg border"
+                      style={{ borderColor: "var(--line)" }}
+                    />
+                  )}
                   {s.voided && (
                     <div className="text-xs mt-1.5 flex items-start gap-1" style={{ color: "var(--alert)" }}>
                       <StickyNote size={12} className="mt-0.5 shrink-0" />
