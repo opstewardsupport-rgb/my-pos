@@ -16,7 +16,7 @@
 // key is allowed to exist, because only Vercel's servers can read
 // process.env here.
 
-module.exports = async (req, res) => {
+export default async function handler(req, res) {
   if (req.method !== "POST") {
     res.status(405).json({ error: "Method not allowed" });
     return;
@@ -111,4 +111,4 @@ module.exports = async (req, res) => {
     console.error("create-paymongo-link failed:", err);
     res.status(500).json({ error: "Couldn't reach PayMongo just now." });
   }
-};
+}
