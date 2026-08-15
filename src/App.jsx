@@ -2454,6 +2454,13 @@ export default function CafePOS() {
       employeeName: currentEmployee?.name || "Unassigned",
       shiftId: activeShift?.id || null,
       items,
+      // Mirrors a sale's status/completedAt (see Kitchen board below) so a
+      // tab can be checked off as done — crossed out, moved to a
+      // "Completed" list — the same way a normal kitchen order can, even
+      // though it's still unpaid. Kept independent of `sales`/checkout;
+      // settling the bill later doesn't require this to be "completed".
+      status: "preparing",
+      completedAt: null,
     };
     persistParkedOrders([...parkedOrders, tab]);
     setNextOrderNo((n) => n + 1);
@@ -2489,7 +2496,18 @@ export default function CafePOS() {
             prepared: false,
           },
         ];
-    persistParkedOrders(parkedOrders.map((t) => (t.id === tabId ? { ...t, items, updatedAt: Date.now() } : t)));
+    // Adding a fresh (unprepared) item to a tab that was already marked
+    // "completed" reopens it — the crossed-out/Completed state shouldn't
+    // silently hide a brand-new item that hasn't been made yet.
+    const reopening = tab.status === "completed";
+    persistParkedOrders(parkedOrders.map((t) => (t.id === tabId ? {
+      ...t,
+      items,
+      updatedAt: Date.now(),
+      status: reopening ? "preparing" : t.status,
+      completedAt: reopening ? null : t.completedAt,
+    } : t)));
+    if (reopening) notify(`Tab "${tab.label}" reopened — new item added.`);
   };
 
   // delta is always -1 here (the +1 case is addItemToTab, which also
@@ -2517,13 +2535,40 @@ export default function CafePOS() {
   };
 
   // The cross-out-as-prepared checklist, same idea as the Kitchen board's
-  // toggleItemPrepared — kept separate since a tab isn't a `sale` yet and
-  // has no `status`/`completedAt` of its own to keep in sync.
+  // toggleItemPrepared — checking off the last remaining item auto-completes
+  // the whole tab (crossed out, moved to "Completed" — see TabsView), same
+  // as a normal kitchen order, even though the tab is still unpaid.
   const toggleTabItemPrepared = (tabId, productId) => {
     const tab = parkedOrders.find((t) => t.id === tabId);
     if (!tab) return;
     const items = tab.items.map((it) => (it.productId === productId ? { ...it, prepared: !it.prepared } : it));
-    persistParkedOrders(parkedOrders.map((t) => (t.id === tabId ? { ...t, items, updatedAt: Date.now() } : t)));
+    const allPrepared = items.length > 0 && items.every((it) => it.prepared);
+    const nextStatus = allPrepared ? "completed" : "preparing";
+    const statusChanged = nextStatus !== (tab.status || "preparing");
+    persistParkedOrders(parkedOrders.map((t) => (t.id === tabId ? {
+      ...t,
+      items,
+      status: nextStatus,
+      completedAt: nextStatus === "completed" ? Date.now() : null,
+      updatedAt: Date.now(),
+    } : t)));
+    if (statusChanged && nextStatus === "completed") notify(`Tab "${tab.label}" completed.`);
+  };
+
+  // Manual override — mirrors the Kitchen board's setOrderStatus. Marking a
+  // tab complete checks off every item too, so the checklist and the status
+  // never disagree; reopening just flips the status back.
+  const setTabStatus = (tabId, status) => {
+    const tab = parkedOrders.find((t) => t.id === tabId);
+    if (!tab) return;
+    persistParkedOrders(parkedOrders.map((t) => (t.id === tabId ? {
+      ...t,
+      items: status === "completed" ? t.items.map((it) => ({ ...it, prepared: true })) : t.items,
+      status,
+      completedAt: status === "completed" ? Date.now() : null,
+      updatedAt: Date.now(),
+    } : t)));
+    notify(status === "completed" ? `Tab "${tab.label}" completed.` : `Tab "${tab.label}" moved back to preparing.`);
   };
 
   const renameTab = (tabId, label) => {
@@ -3362,6 +3407,7 @@ export default function CafePOS() {
           onDecrement={decrementTabItem}
           onRemoveItem={removeTabItem}
           onTogglePrepared={toggleTabItemPrepared}
+          onSetStatus={setTabStatus}
           onCancelTab={cancelTab}
           onSettle={(tab) => setSettleTabTarget(tab)}
         />
@@ -5038,16 +5084,66 @@ function ParkOrderModal({ nextOrderNo, onClose, onConfirm }) {
   );
 }
 
+// Same Preparing / Completed split as the Kitchen board — a tab can be
+// checked off (crossed out) as done even though it's still unpaid; it only
+// leaves this list entirely once it's actually settled (paid) or cancelled.
 function TabsView({ tabs, openTab }) {
-  const sorted = tabs.slice().sort((a, b) => a.openedAt - b.openedAt);
+  const [subview, setSubview] = useState("preparing");
+  const preparing = tabs.filter((t) => (t.status || "preparing") !== "completed");
+  const completed = tabs.filter((t) => t.status === "completed");
+  const list = (subview === "preparing" ? preparing : completed).slice().sort((a, b) => a.openedAt - b.openedAt);
+
   return (
     <div>
-      <SectionTitle>Tabs</SectionTitle>
-      {sorted.length === 0 ? (
-        <EmptyState text={`No open tabs. Use "Park as a tab" on the POS screen for a table that's eating now and paying later.`} />
+      <SectionTitle
+        action={
+          <div className="flex rounded-lg border p-0.5 text-xs" style={{ borderColor: "var(--line)" }}>
+            <button
+              onClick={() => setSubview("preparing")}
+              className="px-3 py-1.5 rounded-md flex items-center gap-1.5"
+              style={{ background: subview === "preparing" ? "var(--primary)" : "transparent", color: subview === "preparing" ? "#fff" : "var(--ink-soft)" }}
+            >
+              Preparing
+              {preparing.length > 0 && (
+                <span
+                  className="text-[10px] px-1.5 rounded-full"
+                  style={{ background: subview === "preparing" ? "rgba(255,255,255,0.25)" : "var(--alert)", color: "#fff" }}
+                >
+                  {preparing.length}
+                </span>
+              )}
+            </button>
+            <button
+              onClick={() => setSubview("completed")}
+              className="px-3 py-1.5 rounded-md flex items-center gap-1.5"
+              style={{ background: subview === "completed" ? "var(--primary)" : "transparent", color: subview === "completed" ? "#fff" : "var(--ink-soft)" }}
+            >
+              Completed
+              {completed.length > 0 && (
+                <span
+                  className="text-[10px] px-1.5 rounded-full"
+                  style={{ background: subview === "completed" ? "rgba(255,255,255,0.25)" : "var(--bg)", color: subview === "completed" ? "#fff" : "var(--ink-soft)" }}
+                >
+                  {completed.length}
+                </span>
+              )}
+            </button>
+          </div>
+        }
+      >
+        Tabs
+      </SectionTitle>
+      {list.length === 0 ? (
+        <EmptyState
+          text={
+            subview === "preparing"
+              ? `No open tabs. Use "Park as a tab" on the POS screen for a table that's eating now and paying later.`
+              : "No tabs marked complete yet — check off every item, or use \"Mark order complete\" inside a tab."
+          }
+        />
       ) : (
         <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3">
-          {sorted.map((t) => (
+          {list.map((t) => (
             <TabCard key={t.id} tab={t} onClick={() => openTab(t.id)} />
           ))}
         </div>
@@ -5061,6 +5157,7 @@ function TabCard({ tab, onClick }) {
   const itemCount = tab.items.reduce((s, it) => s + it.qty, 0);
   const readyCount = tab.items.filter((it) => it.prepared).length;
   const allReady = tab.items.length > 0 && readyCount === tab.items.length;
+  const isCompleted = tab.status === "completed";
   return (
     <button
       onClick={onClick}
@@ -5069,7 +5166,12 @@ function TabCard({ tab, onClick }) {
     >
       <div className="flex items-start justify-between gap-2 mb-2">
         <div className="min-w-0">
-          <div className="font-medium text-sm truncate">{tab.label}</div>
+          <div
+            className={`font-medium text-sm truncate ${isCompleted ? "line-through" : ""}`}
+            style={{ color: isCompleted ? "var(--ink-soft)" : "var(--ink)" }}
+          >
+            {tab.label}
+          </div>
           <div className="text-xs truncate" style={{ color: "var(--ink-soft)" }}>
             Order #{tab.orderNo} · opened{" "}
             {new Date(tab.openedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
@@ -5077,38 +5179,60 @@ function TabCard({ tab, onClick }) {
         </div>
         <span
           className="text-[10px] px-1.5 py-0.5 rounded-full shrink-0 font-medium"
-          style={{ background: allReady ? "#EAF0E2" : "#FBF0DA", color: allReady ? "var(--primary-dark)" : "var(--accent)" }}
+          style={{ background: isCompleted ? "#EAF0E2" : allReady ? "#EAF0E2" : "#FBF0DA", color: isCompleted || allReady ? "var(--primary-dark)" : "var(--accent)" }}
         >
-          {tab.items.length ? `${readyCount}/${tab.items.length} ready` : "empty"}
+          {isCompleted ? "Completed" : tab.items.length ? `${readyCount}/${tab.items.length} ready` : "empty"}
         </span>
       </div>
       <div className="text-xs mb-2" style={{ color: "var(--ink-soft)" }}>
-        {itemCount} item{itemCount === 1 ? "" : "s"}
+        {itemCount} item{itemCount === 1 ? "" : "s"} · not paid yet
       </div>
-      <div className="mono-font text-lg font-semibold mt-auto">{money(total)}</div>
+      <div className={`mono-font text-lg font-semibold mt-auto ${isCompleted ? "line-through" : ""}`} style={{ color: isCompleted ? "var(--ink-soft)" : "inherit" }}>
+        {money(total)}
+      </div>
     </button>
   );
 }
 
 function TabDetailModal({
   tab, products, categories, onClose, onRename, onAddItem, onIncrement, onDecrement,
-  onRemoveItem, onTogglePrepared, onCancelTab, onSettle,
+  onRemoveItem, onTogglePrepared, onSetStatus, onCancelTab, onSettle,
 }) {
   const [labelDraft, setLabelDraft] = useState(tab.label);
   const [editingLabel, setEditingLabel] = useState(false);
   const [filter, setFilter] = useState("all");
   const [confirmCancel, setConfirmCancel] = useState(false);
+  // Every add/remove/qty/prepared change is already saved to storage the
+  // instant it happens (see persistParkedOrders in App) — there's nothing
+  // that can be lost by closing this modal. This just gives an explicit,
+  // visible confirmation after adding items, since the category buttons and
+  // item list can be easy to miss changes in on a busy counter.
+  const [justSaved, setJustSaved] = useState(false);
+  const saveTimerRef = useRef(null);
 
   const cats = [{ id: "all", label: "All" }, ...categories.map((c) => ({ id: c.id, label: c.name }))];
   const filteredProducts = filter === "all" ? products : products.filter((p) => p.category === filter);
   const total = tab.items.reduce((s, it) => s + it.price * it.qty, 0);
   const readyCount = tab.items.filter((it) => it.prepared).length;
+  const isCompleted = tab.status === "completed";
 
   const saveLabel = () => {
     const trimmed = labelDraft.trim();
     if (trimmed && trimmed !== tab.label) onRename(tab.id, trimmed);
     else setLabelDraft(tab.label);
     setEditingLabel(false);
+  };
+
+  const flashSaved = () => {
+    setJustSaved(true);
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(() => setJustSaved(false), 1600);
+  };
+  useEffect(() => () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); }, []);
+
+  const addItem = (productId) => {
+    onAddItem(tab.id, productId);
+    flashSaved();
   };
 
   return (
@@ -5141,7 +5265,7 @@ function TabDetailModal({
         </button>
       </div>
 
-      <div className="flex-1 overflow-y-auto scrollbar-thin">
+      <div className="flex-1 overflow-y-auto scrollbar-thin" style={{ background: "var(--bg)" }}>
         <div className="max-w-4xl mx-auto px-4 py-4 flex flex-col lg:flex-row gap-4">
           <div className="flex-1 min-w-0">
             <div className="flex gap-1.5 mb-3 flex-wrap">
@@ -5169,7 +5293,7 @@ function TabDetailModal({
                   return (
                     <button
                       key={p.id}
-                      onClick={() => onAddItem(tab.id, p.id)}
+                      onClick={() => addItem(p.id)}
                       className="text-left rounded-lg p-2 sm:p-2.5 border transition-transform active:scale-[0.98]"
                       style={{ background: "var(--surface)", borderColor: "var(--line)" }}
                     >
@@ -5185,19 +5309,26 @@ function TabDetailModal({
 
           <div className="w-full lg:w-[360px] shrink-0">
             <div className="rounded-xl border p-3.5" style={{ borderColor: "var(--line)", background: "var(--surface)" }}>
-              <div className="flex items-center justify-between mb-2">
+              <div className="flex items-center justify-between mb-2 gap-2">
                 <span className="font-medium text-sm">Items</span>
-                {tab.items.length > 0 && (
-                  <span
-                    className="text-[10px] px-1.5 py-0.5 rounded-full font-medium"
-                    style={{
-                      background: readyCount === tab.items.length ? "#EAF0E2" : "#FBF0DA",
-                      color: readyCount === tab.items.length ? "var(--primary-dark)" : "var(--accent)",
-                    }}
-                  >
-                    {readyCount}/{tab.items.length} ready
-                  </span>
-                )}
+                <div className="flex items-center gap-1.5">
+                  {justSaved && (
+                    <span className="text-[10px] flex items-center gap-1 font-medium" style={{ color: "var(--primary-dark)" }}>
+                      <Check size={11} /> Saved
+                    </span>
+                  )}
+                  {tab.items.length > 0 && (
+                    <span
+                      className="text-[10px] px-1.5 py-0.5 rounded-full font-medium"
+                      style={{
+                        background: isCompleted ? "#EAF0E2" : readyCount === tab.items.length ? "#EAF0E2" : "#FBF0DA",
+                        color: isCompleted || readyCount === tab.items.length ? "var(--primary-dark)" : "var(--accent)",
+                      }}
+                    >
+                      {isCompleted ? "Completed" : `${readyCount}/${tab.items.length} ready`}
+                    </span>
+                  )}
+                </div>
               </div>
               {tab.items.length === 0 ? (
                 <p className="text-sm py-4 text-center" style={{ color: "var(--ink-soft)" }}>
@@ -5251,7 +5382,35 @@ function TabDetailModal({
                 <span className="font-medium">Total so far</span>
                 <span className="text-lg font-semibold">{money(total)}</span>
               </div>
-              <div className="flex gap-2 mt-3">
+              {/* ---- Mark order complete — same idea as the Kitchen board:
+                  cross the whole tab out as done even though it hasn't been
+                  paid yet. Independent of settling the bill; a completed tab
+                  still shows up here to be paid, it just also shows as
+                  "Completed" in the Tabs list instead of "Preparing". ---- */}
+              {tab.items.length > 0 && (
+                isCompleted ? (
+                  <button
+                    onClick={() => onSetStatus(tab.id, "preparing")}
+                    className="w-full mt-3 flex items-center justify-center gap-1 text-xs py-2 rounded-lg border"
+                    style={{ borderColor: "var(--line)", color: "var(--primary-dark)" }}
+                  >
+                    <Undo2 size={12} /> Move back to preparing
+                  </button>
+                ) : (
+                  <button
+                    onClick={() => onSetStatus(tab.id, "completed")}
+                    className="w-full mt-3 flex items-center justify-center gap-1 text-xs py-2 rounded-lg font-medium"
+                    style={{
+                      background: readyCount === tab.items.length ? "var(--primary)" : "var(--bg)",
+                      color: readyCount === tab.items.length ? "#fff" : "var(--ink-soft)",
+                      border: readyCount === tab.items.length ? "none" : "1px solid var(--line)",
+                    }}
+                  >
+                    <Check size={12} /> Mark order complete
+                  </button>
+                )
+              )}
+              <div className="flex gap-2 mt-2">
                 {confirmCancel ? (
                   <>
                     <button
@@ -7033,6 +7192,15 @@ function SignUpView({ onSignUp, onSwitchToLogin }) {
   // noticed. See the "Select a currency" placeholder option below and the
   // validation in submit().
   const [currencyCode, setCurrencyCode] = useState("");
+  // Entered here, at setup, rather than later on the Subscribe popup — this
+  // is the ONE-TIME 25% signup discount (REFERRAL_DISCOUNT_PERCENT). It's
+  // optional: leave it blank to sign up with no code. If a valid code is
+  // typed, onSignUp() below calls redeem_referral() right after the account
+  // is created, which sets discount_percent = 25 on this new account — that
+  // discount then shows up immediately in the billing section of Settings
+  // (and on the Subscribe popup) as the "from → to" first-month price. It
+  // does NOT apply to any month after the first.
+  const [referralCode, setReferralCode] = useState("");
   const [error, setError] = useState("");
   // True only when the error is specifically "this email already has an
   // account" — lets us show a one-click "Log in instead" link rather than
@@ -7050,9 +7218,7 @@ function SignUpView({ onSignUp, onSwitchToLogin }) {
     if (!currencyCode) { setError("Please select a currency."); return; }
     setError("");
     setBusy(true);
-    // No referral code here — that's entered later, on the Subscribe popup,
-    // alongside the price, once there's actually something to discount.
-    const result = await onSignUp({ businessName, email, password, currencyCode, referralCode: "" });
+    const result = await onSignUp({ businessName, email, password, currencyCode, referralCode });
     setBusy(false);
     if (result !== true) {
       setError(result || "Couldn't create the account — check your connection and try again.");
@@ -7110,6 +7276,19 @@ function SignUpView({ onSignUp, onSwitchToLogin }) {
             </select>
             <p className="text-[10px] mt-1" style={{ color: "var(--ink-soft)" }}>
               Used for both your POS totals and your subscription price. This can't be changed after setup.
+            </p>
+          </Field>
+          <Field label="Referral code (optional)">
+            <input
+              value={referralCode}
+              onChange={(e) => setReferralCode(e.target.value.toUpperCase())}
+              onKeyDown={onEnter}
+              placeholder="e.g. SUNRISE25"
+              className="w-full border rounded-lg px-3 py-2 text-sm tracking-widest"
+              style={{ borderColor: "var(--line)" }}
+            />
+            <p className="text-[10px] mt-1" style={{ color: "var(--ink-soft)" }}>
+              Have a code from another café owner? Enter it now for {REFERRAL_DISCOUNT_PERCENT}% off your first month's bill — you'll see it reflected in Settings → Subscription as soon as your account is created.
             </p>
           </Field>
         </div>
