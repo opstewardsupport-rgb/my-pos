@@ -7506,15 +7506,6 @@ function SignUpView({ onSignUp, onSwitchToLogin }) {
   // noticed. See the "Select a currency" placeholder option below and the
   // validation in submit().
   const [currencyCode, setCurrencyCode] = useState("");
-  // Entered here, at setup, rather than later on the Subscribe popup — this
-  // is the ONE-TIME 25% signup discount (REFERRAL_DISCOUNT_PERCENT). It's
-  // optional: leave it blank to sign up with no code. If a valid code is
-  // typed, onSignUp() below calls redeem_referral() right after the account
-  // is created, which sets discount_percent = 25 on this new account — that
-  // discount then shows up immediately in the billing section of Settings
-  // (and on the Subscribe popup) as the "from → to" first-month price. It
-  // does NOT apply to any month after the first.
-  const [referralCode, setReferralCode] = useState("");
   const [error, setError] = useState("");
   // True only when the error is specifically "this email already has an
   // account" — lets us show a one-click "Log in instead" link rather than
@@ -7532,7 +7523,7 @@ function SignUpView({ onSignUp, onSwitchToLogin }) {
     if (!currencyCode) { setError("Please select a currency."); return; }
     setError("");
     setBusy(true);
-    const result = await onSignUp({ businessName, email, password, currencyCode, referralCode });
+    const result = await onSignUp({ businessName, email, password, currencyCode, referralCode: "" });
     setBusy(false);
     if (result !== true) {
       setError(result || "Couldn't create the account — check your connection and try again.");
@@ -7590,19 +7581,6 @@ function SignUpView({ onSignUp, onSwitchToLogin }) {
             </select>
             <p className="text-[10px] mt-1" style={{ color: "var(--ink-soft)" }}>
               Used for both your POS totals and your subscription price. This can't be changed after setup.
-            </p>
-          </Field>
-          <Field label="Referral code (optional)">
-            <input
-              value={referralCode}
-              onChange={(e) => setReferralCode(e.target.value.toUpperCase())}
-              onKeyDown={onEnter}
-              placeholder="e.g. SUNRISE25"
-              className="w-full border rounded-lg px-3 py-2 text-sm tracking-widest"
-              style={{ borderColor: "var(--line)" }}
-            />
-            <p className="text-[10px] mt-1" style={{ color: "var(--ink-soft)" }}>
-              Have a code from another café owner? Enter it now for {REFERRAL_DISCOUNT_PERCENT}% off your first month's bill — you'll see it reflected in Settings → Subscription as soon as your account is created.
             </p>
           </Field>
         </div>
@@ -7988,6 +7966,16 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
   // box can flash/highlight and make the before → after change obvious
   // instead of just silently re-rendering with new numbers.
   const [justApplied, setJustApplied] = useState(false);
+  // Reference number/text the subscriber types in after paying manually
+  // (GCash/bank transfer for PH, or PayPal.me for international currencies
+  // PayPal itself can't settle in — see needsManualPayment below). Submitting
+  // this calls onConfirm/markSubscriptionActive, which is the ONLY thing
+  // that actually activates the account on the manual-payment path, since
+  // there's no webhook to do it automatically the way PayMongo/PayPal
+  // checkout does.
+  const [manualRef, setManualRef] = useState("");
+  const [manualBusy, setManualBusy] = useState(false);
+  const [manualError, setManualError] = useState("");
 
   const applyCode = async () => {
     if (codeBusy) return;
@@ -8362,6 +8350,39 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
     }
   };
 
+  // PayPal.me link for the international manual-payment fallback (currency
+  // PayPal doesn't settle in, e.g. INR/IDR/VND — see PAYPAL_SUPPORTED_CURRENCIES
+  // above). Priced in USD since that's the one currency every PayPal account
+  // can send/receive, matching manualPaymentAmount below.
+  const manualPayPalLink = buildPayPalLink(usdFinalPrice, "USD");
+
+  // Submits the self-reported reference for the manual-payment fallback
+  // (PH: GCash/bank transfer; international: PayPal.me) and activates the
+  // account via onConfirm/markSubscriptionActive — mirrors the ₱0/$0
+  // free-activation notify() messaging used elsewhere in this file.
+  const submitManualPayment = async () => {
+    if (manualBusy || !manualRef.trim()) return;
+    setManualError("");
+    setManualBusy(true);
+    try {
+      const ok = await onConfirm?.(manualRef.trim());
+      if (ok === false) {
+        setManualError("Couldn't confirm the upgrade. Please try again.");
+      } else {
+        setManualRef("");
+        notify?.(
+          `Thanks! We've noted your payment reference and activated your subscription for the next ${SUBSCRIPTION_PERIOD_DAYS} days.`
+        );
+        if (typeof onClose === "function") onClose();
+      }
+    } catch (err) {
+      console.error("submitManualPayment failed:", err);
+      setManualError("Something went wrong confirming that. Please try again.");
+    } finally {
+      setManualBusy(false);
+    }
+  };
+
   const headline = trialInfo?.renewalDue
     ? "Time to renew"
     : trialInfo?.expired
@@ -8483,7 +8504,7 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
           {/* PH-only: the PayMongo call failed, not a fixed limitation — so
               offer a one-tap retry instead of leaving the owner stuck on
               the manual fallback for good. */}
-          {isPHCustomer && (
+          {isPHCustomer ? (
             <button
               type="button"
               onClick={startPayMongoCheckout}
@@ -8493,7 +8514,53 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
             >
               {paymongoState.status === "loading" ? "Retrying…" : "Try automatic checkout again"}
             </button>
+          ) : (
+            // International + currency PayPal can't settle in: give an
+            // actual link to pay via, not just instructions to pay
+            // "somehow" — this was previously missing entirely.
+            <a
+              href={manualPayPalLink}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="mt-2 inline-flex items-center gap-1.5 text-xs font-medium"
+              style={{ color: "var(--primary)" }}
+            >
+              <CreditCard size={13} /> Pay {manualPaymentAmount} via PayPal.me
+            </a>
           )}
+
+          {/* Self-reported confirmation — there's no webhook on this manual
+              path, so the owner's account only activates once they submit a
+              reference here (see submitManualPayment/onConfirm above). */}
+          <div className="mt-3 pt-3" style={{ borderTop: "1px solid var(--line)" }}>
+            <label className="block mb-1 font-medium" style={{ color: "var(--ink)" }}>
+              Already paid? Enter your reference to activate
+            </label>
+            <div className="flex gap-2">
+              <input
+                value={manualRef}
+                onChange={(e) => setManualRef(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && submitManualPayment()}
+                placeholder={isPHCustomer ? "GCash/bank reference no." : "PayPal transaction ID"}
+                className="flex-1 border rounded-lg px-2.5 py-1.5 text-xs"
+                style={{ borderColor: "var(--line)" }}
+              />
+              <button
+                type="button"
+                onClick={submitManualPayment}
+                disabled={manualBusy || !manualRef.trim()}
+                className="px-3 py-1.5 rounded-lg text-xs font-medium"
+                style={{
+                  background: "var(--primary)",
+                  color: "#fff",
+                  opacity: manualBusy || !manualRef.trim() ? 0.6 : 1,
+                }}
+              >
+                {manualBusy ? "Confirming…" : "Confirm"}
+              </button>
+            </div>
+            {manualError && <p className="mt-1.5" style={{ color: "var(--alert)" }}>{manualError}</p>}
+          </div>
         </div>
       ) : (
         <>
