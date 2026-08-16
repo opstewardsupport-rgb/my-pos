@@ -529,6 +529,312 @@
    where b.id is null;
 
    ---- END: paste into Supabase SQL Editor ----
+   ============================================================================= */
+
+/* =============================================================================
+   OPTIONAL — EMAIL NOTIFICATIONS SETUP (run once, separately from the block
+   above)
+   =============================================================================
+   Sends YOU an email the moment something business-relevant happens: a new
+   sign-up, a first-time subscription, a renewal, a referral code being used,
+   or an account being deleted. This has to run on the SERVER (a database
+   trigger), not in this file's browser code — the browser's key is
+   deliberately powerless to do anything as sensitive as sending email on
+   your behalf, the same reason it can't delete accounts or grant discounts
+   (see the block above).
+
+   HOW TO SET THIS UP (about 5 minutes, no coding):
+     1. Go to https://resend.com and create a free account.
+     2. In Resend, click "API Keys" in the left sidebar -> "Create API Key".
+        Copy the key it gives you (starts with "re_").
+     3. On Resend's free plan, you can only send emails TO the address you
+        signed up to Resend with (until you verify a domain). So sign up to
+        Resend using the inbox you actually want notifications in.
+     4. Copy everything between the START/END markers below into a NEW query
+        in Supabase's SQL Editor (same place as the block above).
+     5. In that pasted text (inside the SQL Editor, NOT in this file),
+        replace REPLACE_WITH_YOUR_RESEND_API_KEY with the key from step 2,
+        and REPLACE_WITH_YOUR_EMAIL with the inbox from step 3.
+     6. Click "Run".
+
+   IMPORTANT — KEEP THIS KEY PRIVATE: unlike the SUPABASE_ANON_KEY used
+   elsewhere in this file (which is safe to be public), your Resend API key
+   can send email as you and must stay secret. Only paste it into Supabase's
+   SQL Editor — never paste the real key back into this .jsx file, and never
+   share this file (or a screenshot of the SQL Editor with the key visible)
+   publicly once you've filled it in. If you ever need to invalidate it,
+   just delete the key in Resend and create a new one, then re-run the block
+   below with the new value.
+
+   ---- START: paste into Supabase SQL Editor (as a separate query) ----
+
+   -- Lets the database make outgoing web requests (needed to call Resend).
+   create extension if not exists pg_net with schema extensions;
+
+   -- One shared helper: every notification below just calls this with a
+   -- subject and an HTML body. Keeping the Resend call in one place means
+   -- the API key only has to be pasted in once, not once per event.
+   create or replace function public.notify_owner(p_subject text, p_html text)
+   returns void
+   language plpgsql
+   security definer
+   set search_path = public
+   as $$
+   begin
+     perform net.http_post(
+       url := 'https://api.resend.com/emails',
+       headers := jsonb_build_object(
+         'Authorization', 'Bearer REPLACE_WITH_YOUR_RESEND_API_KEY',
+         'Content-Type', 'application/json'
+       ),
+       body := jsonb_build_object(
+         'from', 'OpSteward Alerts <onboarding@resend.dev>',
+         'to', jsonb_build_array('REPLACE_WITH_YOUR_EMAIL'),
+         'subject', p_subject,
+         'html', p_html
+       )
+     );
+   end;
+   $$;
+
+   -- 1) NEW SIGN-UP — fires the instant a new businesses row is created,
+   -- which covers both a normal sign-up and the handle_new_user() trigger
+   -- fallback above, so it can never be missed either way.
+   drop function if exists public.notify_on_signup() cascade;
+   create or replace function public.notify_on_signup()
+   returns trigger
+   language plpgsql
+   security definer
+   set search_path = public
+   as $$
+   begin
+     perform public.notify_owner(
+       '🎉 New sign-up: ' || coalesce(nullif(new.business_name, ''), new.email, 'someone'),
+       '<p>A new account just signed up.</p>' ||
+       '<p><b>Business:</b> ' || coalesce(nullif(new.business_name, ''), '(not set yet)') || '<br>' ||
+       '<b>Email:</b> ' || coalesce(new.email, '(unknown)') || '</p>'
+     );
+     return new;
+   end;
+   $$;
+
+   drop trigger if exists trg_notify_on_signup on public.businesses;
+   create trigger trg_notify_on_signup
+     after insert on public.businesses
+     for each row execute function public.notify_on_signup();
+
+   -- 2) FIRST SUBSCRIPTION vs RENEWAL vs REFERRAL USED — all three are just
+   -- different kinds of UPDATE on the same businesses row, so one trigger
+   -- covers them. Distinguishes a first payment (subscription_status was NOT
+   -- already 'active') from a renewal (it already was, and the paid period
+   -- just moved forward) — matches exactly how markSubscriptionActive() in
+   -- the app itself tells the two apart.
+   drop function if exists public.notify_on_subscription_change() cascade;
+   create or replace function public.notify_on_subscription_change()
+   returns trigger
+   language plpgsql
+   security definer
+   set search_path = public
+   as $$
+   begin
+     if new.subscription_status = 'active' and old.subscription_status is distinct from 'active' then
+       perform public.notify_owner(
+         '💰 New subscriber: ' || coalesce(nullif(new.business_name, ''), new.email, 'someone'),
+         '<p><b>' || coalesce(nullif(new.business_name, ''), new.email, 'A business') || '</b> just subscribed for the first time.</p>'
+       );
+     elsif new.subscription_status = 'active' and old.subscription_status = 'active'
+       and new.subscription_period_end is distinct from old.subscription_period_end then
+       perform public.notify_owner(
+         '🔁 Renewal: ' || coalesce(nullif(new.business_name, ''), new.email, 'someone'),
+         '<p><b>' || coalesce(nullif(new.business_name, ''), new.email, 'A business') || '</b> just renewed their subscription.</p>'
+       );
+     end if;
+
+     if coalesce(new.referral_count, 0) > coalesce(old.referral_count, 0) then
+       perform public.notify_owner(
+         '🤝 Referral code used: ' || coalesce(nullif(new.business_name, ''), new.email, 'someone'),
+         '<p><b>' || coalesce(nullif(new.business_name, ''), new.email, 'A business') || '</b>''s referral code was just used by a new paying subscriber.</p>'
+       );
+     end if;
+
+     return new;
+   end;
+   $$;
+
+   drop trigger if exists trg_notify_on_subscription_change on public.businesses;
+   create trigger trg_notify_on_subscription_change
+     after update on public.businesses
+     for each row execute function public.notify_on_subscription_change();
+
+   -- 3) ACCOUNT DELETED — fires from inside delete_own_account() above,
+   -- right before that row is actually removed, so you find out when
+   -- you're losing a customer.
+   drop function if exists public.notify_on_delete() cascade;
+   create or replace function public.notify_on_delete()
+   returns trigger
+   language plpgsql
+   security definer
+   set search_path = public
+   as $$
+   begin
+     perform public.notify_owner(
+       '👋 Account deleted: ' || coalesce(nullif(old.business_name, ''), old.email, 'someone'),
+       '<p><b>' || coalesce(nullif(old.business_name, ''), old.email, 'A business') || '</b> just deleted their account.</p>'
+     );
+     return old;
+   end;
+   $$;
+
+   drop trigger if exists trg_notify_on_delete on public.businesses;
+   create trigger trg_notify_on_delete
+     after delete on public.businesses
+     for each row execute function public.notify_on_delete();
+
+   ---- END: paste into Supabase SQL Editor ----
+============================================================================= */
+
+/* =============================================================================
+   OPTIONAL — PAYPAL AUTOMATIC ACTIVATION SETUP (run once, separately from
+   the blocks above)
+   =============================================================================
+   Lets api/paypal-webhook.js (a new serverless function — see the two new
+   .js files delivered alongside this one) activate a subscriber's account
+   the moment PayPal confirms their payment, the same way the PayMongo
+   webhook already does for PH customers. Needed because the webhook runs
+   as your app's SERVER, not as the logged-in customer — so it can't call
+   markSubscriptionActive()'s underlying RPCs the normal way (those rely on
+   auth.uid(), which only exists inside a real customer browser session).
+   This function takes the business's id explicitly instead, and is only
+   ever callable with your Supabase SERVICE ROLE key (never the public
+   anon key), which only your serverless functions ever hold.
+
+   Mirrors markSubscriptionActive() (first payment vs renewal, resetting
+   reward credits, one-time referral discount) and finalize_referral_redemption()
+   (crediting whoever referred this subscriber) exactly — see those in the
+   app code and in the block above for the logic this is copying server-side.
+   If you ever change SUBSCRIPTION_PERIOD_DAYS in the app code, update the
+   "30" below to match.
+
+   ---- START: paste into Supabase SQL Editor (as a separate query) ----
+
+   drop function if exists public.finalize_referral_redemption_for(uuid) cascade;
+   create or replace function public.finalize_referral_redemption_for(p_business_id uuid)
+   returns void
+   language plpgsql
+   security definer
+   set search_path = public
+   as $$
+   declare
+     v_caller_email text;
+     v_pending_code text;
+     v_referred_by uuid;
+     v_already_granted boolean;
+     v_referrer_id uuid;
+     v_referrer_email text;
+     v_referrer_status text;
+     v_referrer_period_end timestamptz;
+     v_referrer_is_eligible boolean;
+   begin
+     select email, pending_referral_code, referred_by, coalesce(referral_reward_granted, false)
+       into v_caller_email, v_pending_code, v_referred_by, v_already_granted
+       from public.businesses
+       where id = p_business_id;
+
+     if v_pending_code is not null and v_referred_by is null then
+       select id, email
+         into v_referrer_id, v_referrer_email
+         from public.businesses
+         where upper(referral_code) = v_pending_code;
+
+       if v_referrer_id is null
+          or v_referrer_id = p_business_id
+          or (v_referrer_email is not null and v_caller_email is not null
+              and lower(v_referrer_email) = lower(v_caller_email)) then
+         update public.businesses set pending_referral_code = null where id = p_business_id;
+       elsif v_caller_email is not null and exists (
+         select 1 from public.referral_redemptions
+         where lower(email) = lower(v_caller_email)
+           and upper(code) = v_pending_code
+       ) then
+         update public.businesses set pending_referral_code = null where id = p_business_id;
+       else
+         insert into public.referral_redemptions (email, code)
+           values (v_caller_email, v_pending_code);
+
+         update public.businesses
+           set referred_by = v_referrer_id, pending_referral_code = null
+           where id = p_business_id;
+
+         update public.businesses
+           set referral_count = coalesce(referral_count, 0) + 1
+           where id = v_referrer_id;
+
+         v_referred_by := v_referrer_id;
+       end if;
+     end if;
+
+     if v_referred_by is null or v_already_granted then
+       return;
+     end if;
+
+     select subscription_status, subscription_period_end
+       into v_referrer_status, v_referrer_period_end
+       from public.businesses
+       where id = v_referred_by;
+
+     v_referrer_is_eligible := (v_referrer_status = 'active')
+       and (v_referrer_period_end is null or v_referrer_period_end > now());
+
+     if v_referrer_is_eligible then
+       update public.businesses
+         set reward_credits = coalesce(reward_credits, 0) + 3
+         where id = v_referred_by;
+     end if;
+
+     update public.businesses
+       set referral_reward_granted = true
+       where id = p_business_id;
+   end;
+   $$;
+
+   -- The one function the webhook actually calls. p_reference should be the
+   -- PayPal order/capture id, so it shows up in Settings the same way a
+   -- manual payment reference does, and you can look it up in your PayPal
+   -- dashboard if a subscriber ever has a billing question.
+   drop function if exists public.activate_subscription(uuid, text) cascade;
+   create or replace function public.activate_subscription(p_business_id uuid, p_reference text)
+   returns void
+   language plpgsql
+   security definer
+   set search_path = public
+   as $$
+   declare
+     v_was_active boolean;
+   begin
+     select (subscription_status = 'active') into v_was_active
+       from public.businesses where id = p_business_id;
+
+     update public.businesses
+       set subscription_status = 'active',
+           subscription_period_end = now() + interval '30 days',
+           payment_reference = p_reference,
+           reward_credits = 0,
+           discount_percent = case when coalesce(v_was_active, false) then discount_percent else 0 end
+       where id = p_business_id;
+
+     if not coalesce(v_was_active, false) then
+       perform public.finalize_referral_redemption_for(p_business_id);
+     end if;
+   end;
+   $$;
+
+   -- Deliberately NOT granted to `authenticated` or `anon` — only your
+   -- service-role key (which only api/paypal-webhook.js ever holds) can
+   -- call this. A logged-in customer's browser key can't call it at all,
+   -- which is exactly what stops anyone from activating their own account
+   -- for free by guessing this function's name.
+
+   ---- END: paste into Supabase SQL Editor ----
 ============================================================================= */
 
 import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
@@ -643,24 +949,55 @@ const PAYMONGO_CREATE_LINK_ENDPOINT = "/api/create-paymongo-link";
 // PayMongo only settles Philippine payment methods (GCash, Maya, PH bank
 // transfer) and is only shown to subscribers billed in PHP. Everyone else
 // (any other currency in CURRENCIES) pays via PayPal instead — see
-// isPHCustomer/buildPayPalLink below in UpgradeView.
+// isPHCustomer/startPayPalCheckout below in UpgradeView.
 //
-// PayPal is fully automatic the same way, just without needing a
-// serverless function: there is no fixed discount number here — a
-// brand-new subscriber can get REFERRAL_DISCOUNT_PERCENT off (25%) on their
-// first payment, and an existing subscriber can stack up to
-// MAX_REWARD_CREDIT_PERCENT off in REFERRAL_REWARD_PERCENT (3%) increments,
-// one per person who used their code that billing cycle — so the actual
-// amount due is different for practically every subscriber. PayPal.me
-// links support the amount being typed straight into the URL
-// (paypal.me/yourname/24.79USD), so buildPayPalLink() further below builds
-// that URL fresh every time from whatever the subscriber's real final
-// price is — no separate link to create per discount tier, and no manual
-// reconciling of an amount against a percentage.
+// PayPal is now fully automatic the SAME way PayMongo is: the moment an
+// international subscriber clicks "Pay now", the app calls a tiny
+// serverless function — api/create-paypal-order.js — which creates a real
+// PayPal Order (via PayPal's Checkout API) for the EXACT amount shown on
+// screen, with this account's id attached to it (as the order's custom_id).
+// After the subscriber pays, PayPal calls api/paypal-webhook.js directly —
+// no browser tab needs to stay open — which reads that same custom_id and
+// activates the right account automatically, the same way
+// api/paymongo-webhook.js already does for PayMongo. See
+// PAYPAL_CREATE_ORDER_ENDPOINT below, and the "PAYPAL AUTOMATIC ACTIVATION
+// SETUP" SQL block near the top of this file.
 //
-// EDIT ME: your PayPal.me username — the part after paypal.me/ in your own
-// PayPal.me link. E.g. if your link is paypal.me/YourCafe, this is
-// "YourCafe". Set this up (or find it) at paypal.com/paypalme.
+// WHY THIS NEEDS A SERVERLESS FUNCTION AT ALL: same reason as PayMongo
+// above — creating a PayPal Order and verifying webhook signatures both
+// require your PayPal CLIENT SECRET, which can never be pasted into this
+// file or any other browser-side code.
+//
+// ONE-TIME SETUP (in PayPal's Developer Dashboard and your Vercel project
+// — nothing to edit here):
+//   1. developer.paypal.com/dashboard → Apps & Credentials → Create App
+//      → copy the Client ID and Secret it gives you.
+//   2. Vercel → your project → Settings → Environment Variables → add:
+//        PAYPAL_CLIENT_ID = <from step 1>
+//        PAYPAL_CLIENT_SECRET = <from step 1>
+//        PAYPAL_ENV = live   (use "sandbox" only while testing)
+//        SUPABASE_SERVICE_ROLE_KEY = <Supabase → Settings → API → service_role
+//          key — NOT the anon key. Keep this one especially secret; it can
+//          bypass every permission check in your database.>
+//   3. Back in PayPal's Dashboard, open your app → Webhooks → Add Webhook.
+//      Webhook URL: https://<your-app-domain>/api/paypal-webhook
+//      Event: check "Checkout order approved" (CHECKOUT.ORDER.APPROVED).
+//      Save, then copy the Webhook ID it gives you and add ONE more Vercel
+//      env var: PAYPAL_WEBHOOK_ID = <that id>.
+//   4. Redeploy (Vercel → Deployments → ⋯ → Redeploy) so the functions can
+//      see the new variables.
+// That's the whole setup — the two new files read these env vars
+// themselves; nothing else in this repo needs your PayPal keys.
+//
+// EDIT ME only if you rename/move the serverless function file.
+const PAYPAL_CREATE_ORDER_ENDPOINT = "/api/create-paypal-order";
+
+// Kept only as a fallback link shown in the manual-payment note (see
+// MANUAL_PAYMENT_NOTE_INTL) for the rare case where a subscriber's currency
+// isn't one PayPal settles in at all (see PAYPAL_SUPPORTED_CURRENCIES
+// below), or the automatic Order creation call itself fails. EDIT ME to
+// your own PayPal.me username if you want that fallback link to work —
+// paypal.com/paypalme.
 const PAYPAL_ME_USERNAME = "opsteward";
 
 // PayPal only settles in a specific list of currencies — asking it to
@@ -7610,30 +7947,23 @@ function AutoSaveField({ label, value, onSave, type = "text", placeholder, minLe
 // Settings, onClose is a function). Sends the owner to PayMongo (GCash/
 // Maya/local cards) if they're billed in PHP, or to PayPal if they're
 // billed in any other currency — see isPHCustomer below. BOTH are fully
-// automatic for any discount amount:
-//  - PayPal: buildPayPalLink() (near the top of this file) bakes the
-//    subscriber's exact final price — full price, first-payment referral
-//    discount, or any accumulated reward-credit % on a renewal — straight
-//    into the PayPal checkout URL.
-//  - PayMongo: startPayMongoCheckout() below calls the
-//    api/create-paymongo-link.js serverless function, which creates a
-//    fresh PayMongo Payment Link at that same exact peso amount and hands
-//    back its checkout URL. See PAYMONGO_CREATE_LINK_ENDPOINT near the top
-//    of this file for the one-time Vercel setup this needs.
+// automatic, for both the amount charged AND confirming the payment:
+//  - PayMongo: startPayMongoCheckout() below calls
+//    api/create-paymongo-link.js to create a fresh Payment Link at the
+//    exact amount shown, then api/paymongo-webhook.js activates the
+//    account the moment it's paid. See PAYMONGO_CREATE_LINK_ENDPOINT near
+//    the top of this file.
+//  - PayPal: startPayPalCheckout() below calls api/create-paypal-order.js
+//    to create a real PayPal Order at the exact amount shown, then
+//    api/paypal-webhook.js activates the account the moment it's paid. See
+//    PAYPAL_CREATE_ORDER_ENDPOINT near the top of this file.
 // Either way, there's no fixed-price link to keep in sync with an
-// ever-changing discount, and the amount the subscriber is asked to pay is
-// always the exact number shown on screen.
-// NOTE: that only covers CHARGING the right amount, not CONFIRMING the
-// payment. The old self-report "I've paid — activate my account" button/
-// flow has been removed, and there's still no PayPal/PayMongo webhook wired
-// up (see supabase-schema.sql notes) — PayPal will notify you directly
-// (dashboard + email) when a payment for your PAYPAL_ME_USERNAME comes in,
-// and PayMongo will show the payment on your Dashboard in real time — but
-// `onConfirm`/markSubscriptionActive — which flips subscription_status to
-// "active" and resets reward credits for the new billing cycle — still
-// needs to be triggered another way (e.g. an admin/back-office action you
-// take after seeing that payment, or a webhook you add later) once you've
-// reconciled it.
+// ever-changing discount, the amount charged always matches the amount
+// shown, and the account is activated automatically — no manual
+// reconciling needed. onConfirm/markSubscriptionActive is still there as a
+// fallback for the manual-payment note (needsManualPayment below), for the
+// rare case a live checkout call fails or a currency PayPal doesn't settle
+// in at all.
 function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onApplyCode, onClose, onLogOut, onRefreshAccount, notify }) {
   const [code, setCode] = useState("");
   const [codeBusy, setCodeBusy] = useState(false);
@@ -7650,6 +7980,10 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
   // fallback (manualPaymentNote/manualPaymentAmount below) is shown instead
   // so a subscriber is never just stuck with a dead "Pay now" button.
   const [paymongoState, setPaymongoState] = useState({ status: "idle", url: "", error: "" });
+  // Same idea as paymongoState, for international subscribers — see
+  // startPayPalCheckout below and PAYPAL_CREATE_ORDER_ENDPOINT near the top
+  // of this file.
+  const [paypalState, setPaypalState] = useState({ status: "idle", url: "", error: "" });
   // Briefly true right after a code is successfully applied, so the price
   // box can flash/highlight and make the before → after change obvious
   // instead of just silently re-rendering with new numbers.
@@ -7723,13 +8057,12 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
   //    around it.
   const needsManualPayment = isPHCustomer
     ? paymongoState.status === "error"
-    : !PAYPAL_SUPPORTED_CURRENCIES.has(currencyCode);
-  // For PH, payLink is whatever checkout URL startPayMongoCheckout() below
-  // most recently got back from the serverless function (empty until then
-  // — the "Pay now" button is what triggers fetching it). For everyone
-  // else, buildPayPalLink() bakes the exact final price straight into the
-  // URL, so it's ready immediately with no round trip needed.
-  const payLink = isPHCustomer ? paymongoState.url : buildPayPalLink(finalPrice, currencyCode);
+    : !PAYPAL_SUPPORTED_CURRENCIES.has(currencyCode) || paypalState.status === "error";
+  // Both PH and international checkout URLs now come from a serverless
+  // function call — empty until the subscriber clicks "Pay now" (see
+  // startPayMongoCheckout/startPayPalCheckout below), which is what
+  // triggers fetching them.
+  const payLink = isPHCustomer ? paymongoState.url : paypalState.url;
   const manualPaymentNote = isPHCustomer ? MANUAL_PAYMENT_NOTE_PH : MANUAL_PAYMENT_NOTE_INTL;
   // For the PH manual fallback this is the real PHP amount (what GCash/
   // bank transfer actually settles in). For the international manual
@@ -7749,6 +8082,13 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
   useEffect(() => {
     setPaymongoState({ status: "idle", url: "", error: "" });
   }, [phpFinalPrice]);
+
+  // Same idea, for the PayPal Order (see startPayPalCheckout below) — an
+  // Order is created for one fixed amount, so a stale one from before a
+  // referral code/discount changed the price must be thrown away too.
+  useEffect(() => {
+    setPaypalState({ status: "idle", url: "", error: "" });
+  }, [finalPrice, currencyCode]);
 
   // Calls api/create-paymongo-link.js to create a fresh PayMongo Payment
   // Link priced at the EXACT amount shown on screen (phpFinalPrice — full
@@ -7838,10 +8178,64 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
     }
   }, [phpFinalPrice, hasSubscribedBefore, account?.businessName]);
 
-  // What the "Pay now" button actually does: PH subscribers need a fresh
-  // PayMongo link fetched first (async), everyone else already has their
-  // PayPal link ready (buildPayPalLink runs synchronously above) so the
-  // checkout modal can just open immediately.
+  // Calls api/create-paypal-order.js to create a real PayPal Order priced
+  // at the EXACT amount shown on screen, with this account's id attached
+  // (so api/paypal-webhook.js knows who to activate once it's paid), then
+  // opens the in-app checkout with the approval link PayPal hands back.
+  // Mirrors startPayMongoCheckout above — see PAYPAL_CREATE_ORDER_ENDPOINT
+  // near the top of this file for the one-time setup this needs.
+  const startPayPalCheckout = useCallback(async () => {
+    // Same reasoning as startPayMongoCheckout: open the popup synchronously,
+    // in direct response to the click, then redirect it once we have the
+    // real checkout URL — otherwise the browser may block it.
+    const popup = openPaymentPopup("about:blank");
+    setPaypalState({ status: "loading", url: "", error: "" });
+    try {
+      const resp = await fetch(PAYPAL_CREATE_ORDER_ENDPOINT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          amount: finalPrice,
+          currency: currencyCode,
+          description: `OpSteward QuickServe POS — ${hasSubscribedBefore ? "renewal" : "subscription"}${
+            account?.businessName ? ` for ${account.businessName}` : ""
+          }`,
+          // Lets api/paypal-webhook.js know whose account to activate once
+          // this order is paid — see activate_subscription() in the SQL
+          // setup block near the top of this file.
+          businessId: account?.id,
+        }),
+      });
+      let data = null;
+      try {
+        data = await resp.json();
+      } catch {
+        // Non-JSON response (e.g. the endpoint 404ed because the
+        // serverless function hasn't been added/deployed yet).
+      }
+      if (!resp.ok || !data?.url) {
+        throw new Error(data?.error || "Couldn't reach PayPal just now.");
+      }
+      setPaypalState({ status: "ready", url: data.url, error: "" });
+      if (popup && !popup.closed) {
+        popup.location.href = data.url;
+        popup.focus();
+        pinPopupSize(popup, 480, 720, popup.screenX, popup.screenY);
+        pollForActivation(popup);
+      } else {
+        window.open(data.url, "_blank", "noopener,noreferrer");
+        pollForActivation(null);
+      }
+    } catch (err) {
+      console.error("startPayPalCheckout failed:", err);
+      setPaypalState({ status: "error", url: "", error: err.message || "Something went wrong." });
+      if (popup && !popup.closed) popup.close();
+    }
+  }, [finalPrice, currencyCode, hasSubscribedBefore, account?.businessName, account?.id]);
+
+  // What the "Pay now" button actually does: both PH and international
+  // subscribers now need a fresh checkout link fetched first (async) —
+  // startPayMongoCheckout / startPayPalCheckout above.
   // Opens a checkout link as a small centered popup WINDOW (not an iframe
   // embedded in this page, and not a full new tab) — e.g. roughly the size
   // of a card-payment form, positioned in the middle of the user's screen.
@@ -7898,20 +8292,18 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
     }, 300);
   };
 
-  // While the payment popup is open, the webhook (api/paymongo-webhook.js)
-  // may flip subscription_status to "active" in the database at any
-  // moment — but nothing tells THIS already-open browser tab that happened.
-  // Without this, an owner who successfully pays still sees "Time to
-  // renew"/a locked POS until they manually reload the page. This polls
-  // the business row every few seconds while the popup is open (plus a
-  // few extra checks right after it's closed, in case the webhook is a
-  // beat slower than the subscriber closing the window) and, the moment
-  // the account comes back active, updates account state — which lets
-  // trialInfo recompute and the lock screen disappear automatically —
-  // and closes the popup + the Upgrade modal itself.
-  // NOTE: this only ever fires for PayMongo, since PayPal.me has no
-  // webhook wired up yet — a PayPal payer still needs to be activated
-  // manually (see the big comment above this component).
+  // While the payment popup is open, a webhook (api/paymongo-webhook.js for
+  // PH, api/paypal-webhook.js for everyone else) may flip subscription_status
+  // to "active" in the database at any moment — but nothing tells THIS
+  // already-open browser tab that happened. Without this, an owner who
+  // successfully pays still sees "Time to renew"/a locked POS until they
+  // manually reload the page. This polls the business row every few seconds
+  // while the popup is open (plus a few extra checks right after it's
+  // closed, in case the webhook is a beat slower than the subscriber
+  // closing the window) and, the moment the account comes back active,
+  // updates account state — which lets trialInfo recompute and the lock
+  // screen disappear automatically — and closes the popup + the Upgrade
+  // modal itself.
   const pollForActivation = (popup) => {
     if (!onRefreshAccount) return;
     let ticks = 0;
@@ -7949,12 +8341,7 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
     if (isPHCustomer) {
       startPayMongoCheckout();
     } else {
-      // No pollForActivation() here on purpose: PayPal.me has no webhook,
-      // so subscription_status will never flip on its own after a PayPal
-      // payment — polling would just run for 10 minutes finding nothing.
-      // International subscribers still need to be activated manually
-      // until a real PayPal integration/webhook is added.
-      openPaymentPopup(payLink);
+      startPayPalCheckout();
     }
   };
 
