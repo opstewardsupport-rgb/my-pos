@@ -1074,13 +1074,14 @@ const MAX_REWARD_CREDIT_PERCENT = 100;
 // limitation.
 const MANUAL_PAYMENT_NOTE_PH =
   "We couldn't start PayMongo checkout just now, so pay this exact amount via GCash or bank transfer instead, then enter your reference below.";
-// Shown to a non-PH subscriber ONLY when their billing currency is one
-// PayPal itself doesn't settle in (see PAYPAL_SUPPORTED_CURRENCIES above) —
-// every other international discount amount now goes through the dynamic
-// PayPal button automatically, so this is a currency-support fallback, not
-// a discount fallback.
+// Shown to a non-PH subscriber ONLY when the live call to
+// api/create-paypal-order.js itself fails (see needsManualPayment in
+// UpgradeView) — currency is no longer the reason this shows at all, since
+// startPayPalCheckout now auto-switches unsupported-currency subscribers
+// (INR/IDR/VND) to a live USD order automatically. This is purely a
+// last-resort fallback for that live call failing.
 const MANUAL_PAYMENT_NOTE_INTL =
-  "PayPal doesn't support settling in your billing currency, so pay this exact amount (converted to USD) via PayPal, then enter your reference below.";
+  "We couldn't start PayPal checkout just now, so pay this exact amount (in USD) via PayPal, then enter your reference below.";
 // Order numbers must never repeat, even after old sales are purged from
 // RETENTION_MONTHS — so this counter is tracked independently of sales.length
 // (which would otherwise shrink and start reissuing old numbers).
@@ -8035,17 +8036,24 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
   const isPHCustomer = currencyCode === "PHP";
 
   // Both PayMongo and PayPal are now fully automatic for any discount
-  // amount — see the big comment above this component. The ONLY remaining
-  // reasons either falls back to manual payment:
+  // amount AND any currency — see the big comment above this component and
+  // startPayPalCheckout below (it auto-switches to USD for currencies
+  // PayPal itself can't settle in, e.g. INR/IDR/VND — see
+  // PAYPAL_SUPPORTED_CURRENCIES above). The ONLY remaining reason either
+  // falls back to manual payment is the live API call itself failing:
   //  - PayMongo (PH): the live call to api/create-paymongo-link.js failed
-  //    (see paymongoState below) — not a discount-tier limitation anymore.
-  //  - PayPal (everyone else): their billing currency isn't one PayPal
-  //    itself settles in (see PAYPAL_SUPPORTED_CURRENCIES above) — that's a
-  //    currency problem, not a discount problem, and no link can work
-  //    around it.
+  //    (see paymongoState below).
+  //  - PayPal (everyone else): the live call to api/create-paypal-order.js
+  //    failed (see paypalState below) — no longer gated on currency at all,
+  //    since startPayPalCheckout now always sends a currency PayPal accepts.
   const needsManualPayment = isPHCustomer
     ? paymongoState.status === "error"
-    : !PAYPAL_SUPPORTED_CURRENCIES.has(currencyCode) || paypalState.status === "error";
+    : paypalState.status === "error";
+  // True when this subscriber's billing currency isn't one PayPal itself
+  // settles in — used by startPayPalCheckout below to switch the LIVE order
+  // to USD instead (still fully automatic), and by the UI to explain why
+  // the checkout amount shown is in USD rather than their own currency.
+  const paypalNeedsUsd = !isPHCustomer && !PAYPAL_SUPPORTED_CURRENCIES.has(currencyCode);
   // Both PH and international checkout URLs now come from a serverless
   // function call — empty until the subscriber clicks "Pay now" (see
   // startPayMongoCheckout/startPayPalCheckout below), which is what
@@ -8178,13 +8186,23 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
     // real checkout URL — otherwise the browser may block it.
     const popup = openPaymentPopup("about:blank");
     setPaypalState({ status: "loading", url: "", error: "" });
+    // If this subscriber's billing currency isn't one PayPal itself settles
+    // in (INR/IDR/VND — see PAYPAL_SUPPORTED_CURRENCIES above), create the
+    // live Order in USD instead of their own currency. This is what keeps
+    // checkout fully automatic for them too, instead of falling back to a
+    // manual reference — PayPal simply cannot create an Order in a currency
+    // it doesn't support, no matter how the request is built, so USD (the
+    // one currency every PayPal account can send/receive) is the only way
+    // to still get a real, live, auto-activating checkout link.
+    const orderAmount = paypalNeedsUsd ? usdFinalPrice : finalPrice;
+    const orderCurrency = paypalNeedsUsd ? "USD" : currencyCode;
     try {
       const resp = await fetch(PAYPAL_CREATE_ORDER_ENDPOINT, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          amount: finalPrice,
-          currency: currencyCode,
+          amount: orderAmount,
+          currency: orderCurrency,
           description: `OpSteward QuickServe POS — ${hasSubscribedBefore ? "renewal" : "subscription"}${
             account?.businessName ? ` for ${account.businessName}` : ""
           }`,
@@ -8201,7 +8219,7 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
         // Non-JSON response (e.g. the endpoint 404ed because the
         // serverless function hasn't been added/deployed yet).
       }
-      // A 100% discount brings finalPrice to exactly 0 — PayPal can't
+      // A 100% discount brings the order amount to exactly 0 — PayPal can't
       // create an order for $0, so create-paypal-order.js activates the
       // subscription directly instead of returning a checkout url.
       // Mirrors the same ₱0 case in startPayMongoCheckout above.
@@ -8236,7 +8254,7 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
       setPaypalState({ status: "error", url: "", error: err.message || "Something went wrong." });
       if (popup && !popup.closed) popup.close();
     }
-  }, [finalPrice, currencyCode, hasSubscribedBefore, account?.businessName, account?.id]);
+  }, [finalPrice, currencyCode, paypalNeedsUsd, usdFinalPrice, hasSubscribedBefore, account?.businessName, account?.id]);
 
   // What the "Pay now" button actually does: both PH and international
   // subscribers now need a fresh checkout link fetched first (async) —
@@ -8501,32 +8519,37 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
         <div className="rounded-lg border p-3 text-xs" style={{ borderColor: "var(--line)" }}>
           <div className="font-medium mb-1">Pay {manualPaymentAmount} to activate</div>
           <p style={{ color: "var(--ink-soft)" }}>{manualPaymentNote}</p>
-          {/* PH-only: the PayMongo call failed, not a fixed limitation — so
-              offer a one-tap retry instead of leaving the owner stuck on
-              the manual fallback for good. */}
-          {isPHCustomer ? (
-            <button
-              type="button"
-              onClick={startPayMongoCheckout}
-              disabled={paymongoState.status === "loading"}
-              className="mt-2 text-xs font-medium"
-              style={{ color: "var(--primary)", opacity: paymongoState.status === "loading" ? 0.6 : 1 }}
-            >
-              {paymongoState.status === "loading" ? "Retrying…" : "Try automatic checkout again"}
-            </button>
-          ) : (
-            // International + currency PayPal can't settle in: give an
-            // actual link to pay via, not just instructions to pay
-            // "somehow" — this was previously missing entirely.
-            <a
-              href={manualPayPalLink}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="mt-2 inline-flex items-center gap-1.5 text-xs font-medium"
-              style={{ color: "var(--primary)" }}
-            >
-              <CreditCard size={13} /> Pay {manualPaymentAmount} via PayPal.me
-            </a>
+          {/* The live checkout call itself failed (see needsManualPayment
+              above — no longer a currency limitation, PayPal orders now
+              auto-switch to USD for currencies it can't settle in). Offer a
+              one-tap retry before falling back to the manual PayPal.me link
+              + self-reported reference below. */}
+          <button
+            type="button"
+            onClick={isPHCustomer ? startPayMongoCheckout : startPayPalCheckout}
+            disabled={isPHCustomer ? paymongoState.status === "loading" : paypalState.status === "loading"}
+            className="mt-2 text-xs font-medium"
+            style={{
+              color: "var(--primary)",
+              opacity: (isPHCustomer ? paymongoState.status === "loading" : paypalState.status === "loading") ? 0.6 : 1,
+            }}
+          >
+            {(isPHCustomer ? paymongoState.status : paypalState.status) === "loading"
+              ? "Retrying…"
+              : "Try automatic checkout again"}
+          </button>
+          {!isPHCustomer && (
+            <div className="mt-2">
+              <a
+                href={manualPayPalLink}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1.5 text-xs font-medium"
+                style={{ color: "var(--primary)" }}
+              >
+                <CreditCard size={13} /> Or pay {manualPaymentAmount} via PayPal.me directly
+              </a>
+            </div>
           )}
 
           {/* Self-reported confirmation — there's no webhook on this manual
@@ -8567,15 +8590,22 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
           <button
             type="button"
             onClick={handlePayClick}
-            disabled={paymongoState.status === "loading"}
+            disabled={isPHCustomer ? paymongoState.status === "loading" : paypalState.status === "loading"}
             className="w-full flex items-center justify-center gap-2 py-2.5 rounded-lg text-sm font-medium"
-            style={{ background: "var(--primary)", color: "#fff", opacity: paymongoState.status === "loading" ? 0.7 : 1 }}
+            style={{
+              background: "var(--primary)",
+              color: "#fff",
+              opacity: (isPHCustomer ? paymongoState.status === "loading" : paypalState.status === "loading") ? 0.7 : 1,
+            }}
           >
-            <CreditCard size={15} /> {paymongoState.status === "loading" ? "Preparing checkout…" : "Pay now"}
+            <CreditCard size={15} />{" "}
+            {(isPHCustomer ? paymongoState.status : paypalState.status) === "loading" ? "Preparing checkout…" : "Pay now"}
           </button>
           <p className="text-[11px] text-center mt-2" style={{ color: "var(--ink-soft)" }}>
             {isPHCustomer
               ? `Accepts GCash, Maya, and local or international cards — checkout is created fresh for ${fmt(finalPrice)}, your exact discounted amount, so that's the only amount that will be deducted. Pay right here, you won't leave the app.`
+              : paypalNeedsUsd
+              ? `Pay securely via PayPal — PayPal doesn't settle in ${currencyCode}, so checkout is pre-filled for ${formatSubscriptionAmount(usdFinalPrice, "USD")} (your exact discounted amount converted to USD), created fresh and charged automatically.`
               : `Pay securely via PayPal — the checkout is pre-filled for ${fmt(finalPrice)}, your exact discounted amount, so that's the only amount that will be deducted.`}
           </p>
         </>
