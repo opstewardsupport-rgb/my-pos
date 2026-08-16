@@ -13,6 +13,10 @@
 //   PAYPAL_CLIENT_SECRET
 //   PAYPAL_ENV        ("live" or "sandbox" — defaults to "live" if unset)
 
+import { createClient } from "@supabase/supabase-js";
+
+const SUPABASE_URL = "https://tdgcyffbblxxccsujtdy.supabase.co";
+
 const PAYPAL_API_BASE = (process.env.PAYPAL_ENV || "live") === "sandbox"
   ? "https://api-m.sandbox.paypal.com"
   : "https://api-m.paypal.com";
@@ -60,8 +64,27 @@ export default async function handler(req, res) {
       res.status(400).json({ error: "Missing businessId." });
       return;
     }
-    if (!currency || !Number.isFinite(amt) || amt <= 0) {
+    if (!currency || !Number.isFinite(amt) || amt < 0) {
       res.status(400).json({ error: "Missing or invalid amount/currency." });
+      return;
+    }
+
+    // A 100% discount brings the final price to exactly 0 — PayPal can't
+    // create an order for $0, so activate the subscription directly
+    // instead, the same way create-paymongo-link.js already does for a
+    // ₱0 PayMongo link. Uses the SERVICE ROLE key because this runs on
+    // your server, not as the logged-in subscriber.
+    if (amt === 0) {
+      const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+      const { error } = await supabase.rpc("activate_subscription", {
+        p_business_id: businessId,
+        p_reference: "free-100pct-discount",
+      });
+      if (error) {
+        console.error("create-paypal-order: free activation failed.", businessId, error);
+        throw new Error("Couldn't activate your free month — please try again.");
+      }
+      res.status(200).json({ activated: true });
       return;
     }
 
