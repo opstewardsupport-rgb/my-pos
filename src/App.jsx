@@ -721,10 +721,12 @@ const SUBSCRIPTION_PERIOD_DAYS = 30;
 // displays, so keep them in sync if you ever change the SQL.
 const REFERRAL_DISCOUNT_PERCENT = 25;
 const REFERRAL_REWARD_PERCENT = 3;
-// Safety cap on how much of the price reward credits can ever discount, so
-// years of referrals can't silently reach 100%+ off. Purely a display/UI
-// cap — raise it if you want a more generous ceiling.
-const MAX_REWARD_CREDIT_PERCENT = 60;
+// Safety cap on how much of the price reward credits can ever discount.
+// Set to 100 so accumulated reward credits can fully cover the price
+// (a subscriber with enough referrals in one billing cycle can renew for
+// free). Purely a display/UI cap — lower it again if you ever want a
+// ceiling below 100%.
+const MAX_REWARD_CREDIT_PERCENT = 100;
 
 // EDIT ME: shown only as a fallback for a PH subscriber, and only if the
 // live call to your api/create-paymongo-link.js serverless function fails
@@ -1616,16 +1618,13 @@ export default function CafePOS() {
     }
   }, [authUser, notify]);
 
-  // A normal PayMongo payment no longer reaches this function at all —
-  // api/paymongo-webhook.js activates the account server-side the instant
-  // PayMongo confirms payment (see that file's comment). This function is
-  // now only reached for the manual fallback paths: a PayPal payment
-  // (PayPal.me has no webhook — see pollForActivation's comment) or the
-  // PayMongo MANUAL_PAYMENT_NOTE case (the live create-paymongo-link.js
-  // call failed). In both cases the owner self-reports here after you've
-  // reconciled the payment by hand: it flips subscription_status to
-  // "active", starts a new SUBSCRIPTION_PERIOD_DAYS period, and stores
-  // whatever reference the owner typed in.
+  // Called from the Upgrade screen once the owner has paid via PayMongo (or
+  // manually — see MANUAL_PAYMENT_NOTE). There's no PayMongo webhook wired
+  // up here (that needs a small server function — see supabase-schema.sql's
+  // notes), so this is a self-reported confirmation: it flips
+  // subscription_status to "active", starts a new SUBSCRIPTION_PERIOD_DAYS
+  // period, and stores whatever reference the owner typed in, for you to
+  // reconcile against PayMongo's dashboard.
   const markSubscriptionActive = useCallback(async (referenceNote) => {
     if (!authUser) return false;
     // First payment ever (was still on "trial") vs. a renewal of an
@@ -7623,16 +7622,17 @@ function AutoSaveField({ label, value, onSave, type = "text", placeholder, minLe
 // Either way, there's no fixed-price link to keep in sync with an
 // ever-changing discount, and the amount the subscriber is asked to pay is
 // always the exact number shown on screen.
-// NOTE on CONFIRMING payment (as opposed to just charging the right
-// amount): PayMongo is now fully automatic — api/paymongo-webhook.js
-// activates the account itself the instant PayMongo confirms the payment,
-// with no admin/back-office step (see that file's setup comment for the
-// one-time Vercel + PayMongo dashboard configuration this needs). PayPal
-// is NOT automatic: PayPal.me has no webhook, so a PayPal payer still
-// needs `onConfirm`/markSubscriptionActive triggered manually after you
-// see the payment land in your PayPal dashboard/email — see
-// pollForActivation()'s comment further below for why it only polls for
-// PayMongo.
+// NOTE: that only covers CHARGING the right amount, not CONFIRMING the
+// payment. The old self-report "I've paid — activate my account" button/
+// flow has been removed, and there's still no PayPal/PayMongo webhook wired
+// up (see supabase-schema.sql notes) — PayPal will notify you directly
+// (dashboard + email) when a payment for your PAYPAL_ME_USERNAME comes in,
+// and PayMongo will show the payment on your Dashboard in real time — but
+// `onConfirm`/markSubscriptionActive — which flips subscription_status to
+// "active" and resets reward credits for the new billing cycle — still
+// needs to be triggered another way (e.g. an admin/back-office action you
+// take after seeing that payment, or a webhook you add later) once you've
+// reconciled it.
 function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onApplyCode, onClose, onLogOut, onRefreshAccount }) {
   const [code, setCode] = useState("");
   const [codeBusy, setCodeBusy] = useState(false);
@@ -7767,18 +7767,9 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
     const popup = openPaymentPopup("about:blank");
     setPaymongoState({ status: "loading", url: "", error: "" });
     try {
-      // create-paymongo-link.js checks this token against businessId below
-      // (via Supabase's /auth/v1/user) before creating a real charge, so a
-      // browser console can't be used to activate or overcharge a
-      // different subscriber's account.
-      const { data: sessionData } = await supabase.auth.getSession();
-      const accessToken = sessionData?.session?.access_token || "";
       const resp = await fetch(PAYMONGO_CREATE_LINK_ENDPOINT, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${accessToken}`,
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           amountPhp: phpFinalPrice,
           description: `OpSteward QuickServe POS — ${hasSubscribedBefore ? "renewal" : "subscription"}${
