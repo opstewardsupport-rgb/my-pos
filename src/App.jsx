@@ -3345,6 +3345,7 @@ export default function CafePOS() {
           onApplyCode={applyReferralCode}
           onClose={trialInfo.expired && !trialInfo.isSubscribed ? null : () => setShowUpgrade(false)}
           onRefreshAccount={refreshAccountStatus}
+          notify={notify}
         />
       )}
 
@@ -7633,7 +7634,7 @@ function AutoSaveField({ label, value, onSave, type = "text", placeholder, minLe
 // needs to be triggered another way (e.g. an admin/back-office action you
 // take after seeing that payment, or a webhook you add later) once you've
 // reconciled it.
-function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onApplyCode, onClose, onLogOut, onRefreshAccount }) {
+function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onApplyCode, onClose, onLogOut, onRefreshAccount, notify }) {
   const [code, setCode] = useState("");
   const [codeBusy, setCodeBusy] = useState(false);
   const [codeError, setCodeError] = useState("");
@@ -7788,6 +7789,27 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
         // Non-JSON response (e.g. the endpoint 404ed because the
         // serverless function hasn't been added/deployed yet) — fall
         // through to the generic error below instead of throwing here.
+      }
+      // A 100% discount brings phpFinalPrice to exactly ₱0 — PayMongo can't
+      // create a checkout session for ₱0, so create-paymongo-link.js
+      // activates the subscription directly instead of returning a
+      // checkout url. Nothing to redirect the popup to; just close it,
+      // refresh the account, and clearly tell the subscriber what happened
+      // to this month's bill — since no payment screen ever appeared, they
+      // have no other way of knowing it was actually covered rather than
+      // silently skipped.
+      if (data?.activated) {
+        if (popup && !popup.closed) popup.close();
+        setPaymongoState({ status: "idle", url: "", error: "" });
+        await onRefreshAccount?.();
+        notify?.(
+          `This month's bill (${fmtPhp(phpFullPrice)}) was fully covered by your ${discountPercent}% ` +
+            `${hasSubscribedBefore ? "reward credit" : "referral discount"} — nothing to pay, and your ` +
+            `subscription is active for the next ${SUBSCRIPTION_PERIOD_DAYS} days. Reward credit resets to ` +
+            `0% next cycle, so next month's bill will be ${fmtPhp(phpFullPrice)} unless new referrals come in.`
+        );
+        if (typeof onClose === "function") onClose();
+        return;
       }
       if (!resp.ok || !data?.url) {
         throw new Error(data?.error || "Couldn't reach PayMongo just now.");
