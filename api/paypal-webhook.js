@@ -20,7 +20,7 @@
 //   https://<your-app-domain>/api/paypal-webhook
 // with the "Checkout order approved" event checked.
 
-const { createClient } = require("@supabase/supabase-js");
+import { createClient } from "@supabase/supabase-js";
 
 const PAYPAL_API_BASE = (process.env.PAYPAL_ENV || "live") === "sandbox"
   ? "https://api-m.sandbox.paypal.com"
@@ -71,7 +71,7 @@ async function verifySignature(accessToken, headers, body) {
   return data.verification_status === "SUCCESS";
 }
 
-module.exports = async (req, res) => {
+export default async function handler(req, res) {
   if (req.method !== "POST") {
     res.status(405).send("Method not allowed");
     return;
@@ -138,4 +138,4 @@ module.exports = async (req, res) => {
     console.error("paypal-webhook failed:", err);
     res.status(500).send("Internal error");
   }
-};
+}
