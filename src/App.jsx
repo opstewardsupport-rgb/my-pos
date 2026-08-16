@@ -8213,6 +8213,23 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
         // Non-JSON response (e.g. the endpoint 404ed because the
         // serverless function hasn't been added/deployed yet).
       }
+      // A 100% discount brings finalPrice to exactly 0 — PayPal can't
+      // create an order for $0, so create-paypal-order.js activates the
+      // subscription directly instead of returning a checkout url.
+      // Mirrors the same ₱0 case in startPayMongoCheckout above.
+      if (data?.activated) {
+        if (popup && !popup.closed) popup.close();
+        setPaypalState({ status: "idle", url: "", error: "" });
+        await onRefreshAccount?.();
+        notify?.(
+          `This month's bill (${fmt(fullPrice)}) was fully covered by your ` +
+            `${discountPercent}% ${hasSubscribedBefore ? "reward credit" : "referral discount"} — nothing to ` +
+            `pay, and your subscription is active for the next ${SUBSCRIPTION_PERIOD_DAYS} days. Reward credit ` +
+            `resets to 0% next cycle, so next month's bill will be ${fmt(fullPrice)} unless new referrals come in.`
+        );
+        if (typeof onClose === "function") onClose();
+        return;
+      }
       if (!resp.ok || !data?.url) {
         throw new Error(data?.error || "Couldn't reach PayPal just now.");
       }
