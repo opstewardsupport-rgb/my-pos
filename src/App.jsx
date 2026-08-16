@@ -454,8 +454,13 @@
        and (v_referrer_period_end is null or v_referrer_period_end > now());
 
      if v_referrer_is_eligible then
+       -- Capped at 50 so accumulation genuinely stops once a referrer hits
+       -- the maximum discount for the month — matches MAX_REWARD_CREDIT_PERCENT
+       -- in the app code (cafe-pos.jsx). If you ever change that constant,
+       -- change the 50 here (and in the other identical UPDATE below) to
+       -- match, or the two will drift out of sync.
        update public.businesses
-         set reward_credits = coalesce(reward_credits, 0) + 3
+         set reward_credits = least(coalesce(reward_credits, 0) + 3, 50)
          where id = v_referred_by;
      end if;
 
@@ -787,7 +792,7 @@
 
      if v_referrer_is_eligible then
        update public.businesses
-         set reward_credits = coalesce(reward_credits, 0) + 3
+         set reward_credits = least(coalesce(reward_credits, 0) + 3, 50)
          where id = v_referred_by;
      end if;
 
@@ -1059,11 +1064,14 @@ const SUBSCRIPTION_PERIOD_DAYS = 30;
 const REFERRAL_DISCOUNT_PERCENT = 25;
 const REFERRAL_REWARD_PERCENT = 3;
 // Safety cap on how much of the price reward credits can ever discount.
-// Set to 100 so accumulated reward credits can fully cover the price
-// (a subscriber with enough referrals in one billing cycle can renew for
-// free). Purely a display/UI cap — lower it again if you ever want a
-// ceiling below 100%.
-const MAX_REWARD_CREDIT_PERCENT = 100;
+// Set to 50 so a subscriber's renewal is never more than half off, no
+// matter how many referrals they rack up in one billing cycle. This is a
+// display/UI cap — the underlying reward_credits column in Supabase keeps
+// accumulating past 50 with no ceiling (see redeem_referral() in the SQL
+// setup block), but every screen that reads it (UpgradeView, SettingsView)
+// clamps to this constant before showing or charging anything, so the
+// subscriber is never actually charged below 50% of the full price.
+const MAX_REWARD_CREDIT_PERCENT = 50;
 
 // EDIT ME: shown only as a fallback for a PH subscriber, and only if the
 // live call to your api/create-paymongo-link.js serverless function fails
@@ -8940,14 +8948,14 @@ function SettingsView({ account, onUpdateField, onLogOut, onDeleteAccount, trial
             </button>
           </div>
           <p className="text-[11px]" style={{ color: "var(--ink-soft)" }}>
-            Share this code — new sign-ups who use it get {REFERRAL_DISCOUNT_PERCENT}% off their first month, and you earn a {REFERRAL_REWARD_PERCENT}% reward credit every time it's used.
+            Share this code — new sign-ups who use it get {REFERRAL_DISCOUNT_PERCENT}% off their first month, and you earn a {REFERRAL_REWARD_PERCENT}% reward credit every time it's used (up to {MAX_REWARD_CREDIT_PERCENT}% off in one billing month).
           </p>
 
           {/* ---- Current-month referral explainer ---- */}
           <div className="rounded-lg p-3" style={{ background: "var(--bg)" }}>
             <div className="text-[11px] font-medium mb-1">Current month</div>
             <p className="text-[11px]" style={{ color: "var(--ink-soft)" }}>
-              Every time a new user signs up with your referral code, you earn {REFERRAL_REWARD_PERCENT}% off your immediate current billing cycle. When the month ends and the next billing cycle begins, that {REFERRAL_REWARD_PERCENT}% discount resets to 0% for the new month until fresh referrals are made during that cycle.
+              Every time a new user signs up with your referral code, you earn {REFERRAL_REWARD_PERCENT}% off your immediate current billing cycle, up to a maximum of {MAX_REWARD_CREDIT_PERCENT}% off — so even with a lot of referrals in one month, your bill is never discounted by more than that. When the month ends and the next billing cycle begins, that discount resets to 0% for the new month until fresh referrals are made during that cycle.
             </p>
           </div>
           <div className="flex gap-3 pt-1">
@@ -8987,7 +8995,7 @@ function SettingsView({ account, onUpdateField, onLogOut, onDeleteAccount, trial
           </div>
 
           <p className="text-[10px]" style={{ color: "var(--ink-soft)" }}>
-            <b>Note on referral credits:</b> The {REFERRAL_REWARD_PERCENT}% reward credit applies only to the current billing month and does not accumulate or roll over to future months. It resets to 0% at the start of each new billing cycle.
+            <b>Note on referral credits:</b> The {REFERRAL_REWARD_PERCENT}% reward credit applies only to the current billing month and does not accumulate or roll over to future months. It resets to 0% at the start of each new billing cycle. Reward credit is capped at a maximum of {MAX_REWARD_CREDIT_PERCENT}% off any single bill, no matter how many referrals you bring in during that month.
           </p>
         </div>
       ) : (
@@ -8996,7 +9004,7 @@ function SettingsView({ account, onUpdateField, onLogOut, onDeleteAccount, trial
             <Store size={13} /> Referral code
           </div>
           <p className="text-[11px] mt-2" style={{ color: "var(--ink-soft)" }}>
-            Your referral code unlocks once you're a paying subscriber — subscribe to get your own code to share, and start earning a {REFERRAL_REWARD_PERCENT}% reward credit every time it's used. New users who sign up with your code get {REFERRAL_DISCOUNT_PERCENT}% off their first month.
+            Your referral code unlocks once you're a paying subscriber — subscribe to get your own code to share, and start earning a {REFERRAL_REWARD_PERCENT}% reward credit every time it's used, up to a maximum of {MAX_REWARD_CREDIT_PERCENT}% off any single bill. New users who sign up with your code get {REFERRAL_DISCOUNT_PERCENT}% off their first month.
           </p>
         </div>
       )}
