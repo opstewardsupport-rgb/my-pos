@@ -47,7 +47,7 @@ async function getAccessToken() {
   return data.access_token;
 }
 
-module.exports = async (req, res) => {
+export default async function handler(req, res) {
   if (req.method !== "POST") {
     res.status(405).json({ error: "Method not allowed" });
     return;
@@ -117,4 +117,4 @@ module.exports = async (req, res) => {
     console.error("create-paypal-order failed:", err);
     res.status(500).json({ error: err.message || "Something went wrong." });
   }
-};
+}
