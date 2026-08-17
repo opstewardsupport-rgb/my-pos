@@ -10,6 +10,16 @@
     <meta name="theme-color" content="#4F5E33" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-title" content="OpSteward" />
+    <!-- PWA: catch the browser's install signal as early as possible, before
+         the app itself has loaded, so a fast page load can't cause the
+         in-app "Install app" button to miss it (see App.jsx for where this
+         gets picked up). -->
+    <script>
+      window.addEventListener("beforeinstallprompt", (e) => {
+        e.preventDefault();
+        window.__deferredInstallPrompt = e;
+      });
+    </script>
   </head>
   <body class="bg-gray-100">
     <div id="root"></div>
