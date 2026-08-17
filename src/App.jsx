@@ -4948,7 +4948,7 @@ function POSView({
                         color: paymentMethod === "cash" ? "#fff" : "var(--ink-soft)",
                       }}
                     >
-                      <Banknote size={13} /> <span className="hidden sm:inline">Cash</span>
+                      <Banknote size={13} /> <span>Cash</span>
                     </button>
                     <button
                       onClick={() => setPaymentMethod("online")}
@@ -4960,7 +4960,7 @@ function POSView({
                         color: paymentMethod === "online" ? "#fff" : "var(--ink-soft)",
                       }}
                     >
-                      <CreditCard size={13} /> <span className="hidden sm:inline">Online</span>
+                      <CreditCard size={13} /> <span>Online</span>
                     </button>
                     <button
                       onClick={() => setPaymentMethod("split")}
@@ -4972,7 +4972,7 @@ function POSView({
                         color: paymentMethod === "split" ? "#fff" : "var(--ink-soft)",
                       }}
                     >
-                      <Banknote size={13} /> <span className="hidden sm:inline">Split</span>
+                      <Banknote size={13} /> <span>Split</span>
                     </button>
                   </div>
                 </div>
