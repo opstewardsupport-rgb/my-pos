@@ -4018,6 +4018,14 @@ function useInstallPrompt() {
   const [isIOSNonSafari, setIsIOSNonSafari] = useState(false);
   const [isAndroid, setIsAndroid] = useState(false);
   const [inAppBrowser, setInAppBrowser] = useState(null);
+  // iPad (real UA token, or the "Mac in disguise" case below) shows its
+  // Share icon up in the toolbar next to the address bar, not at the bottom
+  // like iPhone — so install instructions need to point somewhere different.
+  const [isIPad, setIsIPad] = useState(false);
+  // Genuine desktop Safari on a Mac (no touchscreen, so not an iPad wearing
+  // a Mac costume, and not Chrome/Edge/Firefox on Mac either) — its Share
+  // icon lives at the top right of the window, right by the address bar.
+  const [isDesktopSafari, setIsDesktopSafari] = useState(false);
 
   useEffect(() => {
     const standalone =
@@ -4035,6 +4043,15 @@ function useInstallPrompt() {
       navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1;
     const iosDevice = (/iphone|ipad|ipod/i.test(ua) && !window.MSStream) || iPadDesktopMode;
     setIsIOS(iosDevice);
+    // Either a real iPad UA, or the "Mac in disguise" iPad detected above —
+    // either way its Share icon sits in the top toolbar, not the bottom.
+    setIsIPad(/ipad/i.test(ua) || iPadDesktopMode);
+    // A real Mac desktop, running actual Safari (not Chrome/Firefox/Edge on
+    // Mac, and not an iPad reporting itself as "Macintosh" — that case is
+    // excluded via the touch-point check, same as iPadDesktopMode above).
+    const macDesktop = navigator.platform === "MacIntel" && !(navigator.maxTouchPoints > 1);
+    const macSafari = macDesktop && /Safari/i.test(ua) && !/Chrome|CriOS|Chromium|Edg|OPR|Firefox/i.test(ua);
+    setIsDesktopSafari(macSafari);
     // On iOS, Apple requires every browser to use Safari's underlying engine,
     // but only Safari itself is allowed to expose "Add to Home Screen" / PWA
     // install. Chrome, Firefox, Edge, etc. on iOS are all Safari in a
@@ -4077,11 +4094,17 @@ function useInstallPrompt() {
     return choice.outcome; // "accepted" | "dismissed"
   }, [deferredPrompt]);
 
-  return { canPrompt: !!deferredPrompt, promptInstall, isStandalone, isIOS, isIOSNonSafari, isAndroid, inAppBrowser };
+  return {
+    canPrompt: !!deferredPrompt, promptInstall, isStandalone, isIOS, isIOSNonSafari, isAndroid,
+    inAppBrowser, isIPad, isDesktopSafari,
+  };
 }
 
 function InstallAppButton({ size = "normal" }) {
-  const { canPrompt, promptInstall, isStandalone, isIOS, isIOSNonSafari, isAndroid, inAppBrowser } = useInstallPrompt();
+  const {
+    canPrompt, promptInstall, isStandalone, isIOS, isIOSNonSafari, isAndroid, inAppBrowser,
+    isIPad, isDesktopSafari,
+  } = useInstallPrompt();
   const [showHelp, setShowHelp] = useState(false);
   const [copied, setCopied] = useState(false);
 
@@ -4199,16 +4222,30 @@ function InstallAppButton({ size = "normal" }) {
                 </button>
                 <p className="text-[11px] leading-relaxed" style={{ color: "var(--ink-soft)" }}>
                   In Safari: paste the link (or find this page in your Safari
-                  history/bookmarks), then tap the <b>Share</b> icon and choose{" "}
-                  <b>Add to Home Screen</b>.
+                  history/bookmarks), then tap the <b>Share</b> icon (the square
+                  with an arrow —{" "}
+                  {isIPad
+                    ? "top right of the screen, near the address bar"
+                    : "usually at the bottom of the screen"}
+                  ) and choose <b>Add to Home Screen</b>.
                 </p>
               </>
+            ) : isDesktopSafari ? (
+              <p className="text-xs leading-relaxed" style={{ color: "var(--ink-soft)" }}>
+                In Safari, click the <b>Share</b> icon (the square with an arrow,
+                at the top right near the address bar), then choose{" "}
+                <b>Add to Dock</b> (or <b>Add to Home Screen</b> on older versions
+                of Safari). The app icon will then open like any other app on
+                your Mac.
+              </p>
             ) : isIOS ? (
               <p className="text-xs leading-relaxed" style={{ color: "var(--ink-soft)" }}>
-                In Safari, tap the <b>Share</b> icon (the square with an arrow, usually
-                at the bottom of the screen), then scroll down and tap{" "}
-                <b>Add to Home Screen</b>. The app icon will appear on your home
-                screen like any other app.
+                In Safari, tap the <b>Share</b> icon (the square with an arrow —{" "}
+                {isIPad
+                  ? "top right of the screen, near the address bar"
+                  : "usually at the bottom of the screen"}
+                ), then scroll down and tap <b>Add to Home Screen</b>. The app icon
+                will appear on your home screen like any other app.
               </p>
             ) : (
               <p className="text-xs leading-relaxed" style={{ color: "var(--ink-soft)" }}>
@@ -5009,20 +5046,26 @@ function POSView({
                 )}
 
                 {paymentMethod === "cash" && (
-                  <div className="mt-2.5 flex items-center gap-2">
-                    <input
-                      type="number"
-                      min="0"
-                      step="0.01"
-                      value={cashReceived}
-                      onChange={(e) => setCashReceived(e.target.value)}
-                      placeholder="Cash received"
-                      className="flex-1 border rounded-lg px-2.5 py-1.5 text-xs mono-font"
-                      style={{ borderColor: "var(--line)" }}
-                    />
-                    <span className="text-xs mono-font whitespace-nowrap" style={{ color: changeDue < 0 ? "var(--alert)" : "var(--primary-dark)" }}>
-                      {cashReceived === "" ? "Change —" : changeDue < 0 ? `Short ${money(Math.abs(changeDue))}` : `Change ${money(changeDue)}`}
-                    </span>
+                  <div className="mt-2.5">
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="number"
+                        min="0"
+                        step="0.01"
+                        value={cashReceived}
+                        onChange={(e) => setCashReceived(e.target.value)}
+                        placeholder="Amount received"
+                        className="flex-1 border rounded-lg px-2.5 py-1.5 text-xs mono-font"
+                        style={{ borderColor: "var(--line)" }}
+                      />
+                      <span className="text-xs mono-font whitespace-nowrap" style={{ color: changeDue < 0 ? "var(--alert)" : "var(--primary-dark)" }}>
+                        {cashReceived === "" ? "Change —" : changeDue < 0 ? `Short ${money(Math.abs(changeDue))}` : `Change ${money(changeDue)}`}
+                      </span>
+                    </div>
+                    {/* Built into the checkout layout itself (not a popup) so
+                        the total/change readout above stays visible while
+                        keying in the amount on a touchscreen register. */}
+                    <NumericKeypad value={cashReceived} onChange={setCashReceived} />
                   </div>
                 )}
 
@@ -6499,7 +6542,7 @@ function SettleTabModal({ tab, onClose, onConfirm }) {
 
           {paymentMethod === "cash" && (
             <div className="mb-3">
-              <label className="text-xs font-medium mb-1 block" style={{ color: "var(--ink-soft)" }}>Cash received</label>
+              <label className="text-xs font-medium mb-1 block" style={{ color: "var(--ink-soft)" }}>Amount received</label>
               <input
                 type="number"
                 value={cashReceived}
@@ -6512,6 +6555,9 @@ function SettleTabModal({ tab, onClose, onConfirm }) {
                   Change due: {money(Math.max(0, changeDue))}
                 </p>
               )}
+              {/* Embedded directly in the settle-tab layout, not a popup, so
+                  the running total stays visible while entering the amount. */}
+              <NumericKeypad value={cashReceived} onChange={setCashReceived} />
             </div>
           )}
 
@@ -9688,6 +9734,69 @@ function SettingsView({ account, onUpdateField, onLogOut, onDeleteAccount, trial
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+// =============================================================================
+// EMBEDDED NUMERIC KEYPAD (built into the checkout layout, not a popup)
+// =============================================================================
+// Used wherever a cashier keys in "Amount Received" — the POS checkout
+// panel and the Settle Tab screen. It's a plain in-line grid of buttons
+// sitting right under the amount field, not a modal, so it works well on
+// touchscreen registers that have no physical numpad and don't want a
+// popup covering the total/change readout while typing.
+//
+// `value` is the current amount as a string (same shape the linked text
+// input uses); `onChange` receives the next string. Digit entry mirrors
+// how a calculator/POS numpad behaves: leading zero is replaced by the
+// first digit typed, and only one decimal point is allowed.
+function NumericKeypad({ value, onChange }) {
+  const press = (key) => {
+    if (key === "back") {
+      onChange((value || "").slice(0, -1));
+      return;
+    }
+    if (key === "clear") {
+      onChange("");
+      return;
+    }
+    if (key === ".") {
+      if ((value || "").includes(".")) return; // only one decimal point
+      onChange(value === "" ? "0." : value + ".");
+      return;
+    }
+    // Digit key
+    if (value === "" || value === "0") {
+      onChange(key);
+    } else {
+      onChange(value + key);
+    }
+  };
+
+  const keys = ["1", "2", "3", "4", "5", "6", "7", "8", "9", ".", "0", "back"];
+
+  return (
+    <div className="grid grid-cols-3 gap-1.5 mt-1.5" role="group" aria-label="Numeric keypad">
+      {keys.map((k) => (
+        <button
+          key={k}
+          type="button"
+          onClick={() => press(k)}
+          className="py-2 rounded-lg text-sm font-medium border active:scale-95"
+          style={{ borderColor: "var(--line)", background: "var(--bg)", color: "var(--ink)" }}
+        >
+          {k === "back" ? <X size={14} className="mx-auto" /> : k}
+        </button>
+      ))}
+      <button
+        type="button"
+        onClick={() => press("clear")}
+        className="col-span-3 py-1.5 rounded-lg text-[11px] font-medium border"
+        style={{ borderColor: "var(--line)", color: "var(--ink-soft)" }}
+      >
+        Clear
+      </button>
     </div>
   );
 }
