@@ -4825,11 +4825,11 @@ function POSView({
         )}
       </div>
 
-      <div className="w-full h-screen overflow-hidden flex flex-col min-w-0">
-        <div className="flex flex-col flex-1 min-h-0 overflow-hidden rounded-xl border" style={{ borderColor: "var(--line)", background: "var(--surface)" }}>
+      <div className="w-full flex flex-col min-w-0">
+        <div className="flex flex-col rounded-xl border" style={{ borderColor: "var(--line)", background: "var(--surface)" }}>
           <div className="ticket-edge-top shrink-0" />
 
-          {/* ---- Fixed header — order title + order number, never scrolls ---- */}
+          {/* ---- Header — order title + order number ---- */}
           <div className="px-3 sm:px-5 pt-2 shrink-0">
             <div className="flex items-center gap-1.5 mb-3 justify-between flex-wrap">
               <div className="flex items-center gap-1.5">
@@ -4842,11 +4842,12 @@ function POSView({
             </div>
           </div>
 
-          {/* ---- Scrollable middle — only the order items list grows/scrolls
-              here; everything else (discount, payment method, keypad,
-              totals, Charge/Park buttons) lives in the fixed footer below
-              so it's always reachable without scrolling past a long order. ---- */}
-          <div className="flex-1 min-h-0 overflow-y-auto scrollbar-thin px-3 sm:px-5">
+          {/* ---- Order items — plain in-flow list, not its own scroll box.
+              The whole card just grows with however many items are on the
+              order; Discount, Payment method, keypad, totals, and the
+              Charge/Clear/Park buttons below are always visible, whether
+              the order is empty or full. ---- */}
+          <div className="px-3 sm:px-5">
             {cartDetailed.length === 0 ? (
               <p className="text-sm py-6 text-center" style={{ color: "var(--ink-soft)" }}>Tap a product to add it.</p>
             ) : (
@@ -4893,8 +4894,7 @@ function POSView({
               </div>
             )}
 
-            {cartDetailed.length > 0 && (
-              <>
+            <>
                 {/* Discount */}
                 <div className="mt-3 pt-3 border-t" style={{ borderColor: "var(--line)" }}>
                   <div className="flex items-center justify-between mb-1.5">
@@ -5198,7 +5198,6 @@ function POSView({
                   </div>
                 )}
               </>
-            )}
 
             {checkoutError && checkoutError.kind === "stock" && (
               <div className="mt-3 text-xs rounded-lg p-2.5" style={{ background: "#F3E3DC", color: "var(--alert)" }}>
@@ -5214,48 +5213,47 @@ function POSView({
               </div>
             )}
 
-            {cartDetailed.length > 0 && (
-              <>
-                <div className="mt-3 pt-3 border-t mono-font text-sm sm:text-base" style={{ borderColor: "var(--line)" }}>
-                  <div className="flex justify-between" style={{ color: "var(--ink-soft)" }}>
-                    <span>Subtotal</span><span>{money(subtotal)}</span>
-                  </div>
-                  {discountAmount > 0 && (
-                    <div className="flex justify-between" style={{ color: "var(--alert)" }}>
-                      <span>Discount</span><span>-{money(discountAmount)}</span>
-                    </div>
-                  )}
-                  <div className="flex justify-between mt-1">
-                    <span className="font-medium">Total</span>
-                    <span className="text-lg sm:text-xl font-semibold">{money(cartTotal)}</span>
-                  </div>
+            <div className="mt-3 pt-3 border-t mono-font text-sm sm:text-base" style={{ borderColor: "var(--line)" }}>
+              <div className="flex justify-between" style={{ color: "var(--ink-soft)" }}>
+                <span>Subtotal</span><span>{money(subtotal)}</span>
+              </div>
+              {discountAmount > 0 && (
+                <div className="flex justify-between" style={{ color: "var(--alert)" }}>
+                  <span>Discount</span><span>-{money(discountAmount)}</span>
                 </div>
-                <div className="flex gap-2 mt-3">
-                  <button
-                    onClick={clearCart}
-                    className="flex-1 text-sm sm:text-base py-2 sm:py-2.5 rounded-lg border disabled:opacity-40"
-                    style={{ borderColor: "var(--line)", color: "var(--ink-soft)" }}
-                  >
-                    Clear
-                  </button>
-                  <button
-                    onClick={checkout}
-                    className="flex-[2] text-sm sm:text-base py-2 sm:py-2.5 rounded-lg font-medium disabled:opacity-40"
-                    style={{ background: "var(--primary)", color: "#fff" }}
-                  >
-                    Charge {money(cartTotal)}
-                  </button>
-                </div>
-                <button
-                  onClick={openParkModal}
-                  className="w-full mt-2 flex items-center justify-center gap-1.5 text-sm py-2 rounded-lg border disabled:opacity-40"
-                  style={{ borderColor: "var(--line)", color: "var(--ink-soft)" }}
-                  title="Send this order to the kitchen and pay for it later"
-                >
-                  <ClipboardList size={14} /> Park as a tab (pay later)
-                </button>
-              </>
-            )}
+              )}
+              <div className="flex justify-between mt-1">
+                <span className="font-medium">Total</span>
+                <span className="text-lg sm:text-xl font-semibold">{money(cartTotal)}</span>
+              </div>
+            </div>
+            <div className="flex gap-2 mt-3">
+              <button
+                onClick={clearCart}
+                disabled={cartDetailed.length === 0}
+                className="flex-1 text-sm sm:text-base py-2 sm:py-2.5 rounded-lg border disabled:opacity-40"
+                style={{ borderColor: "var(--line)", color: "var(--ink-soft)" }}
+              >
+                Clear
+              </button>
+              <button
+                onClick={checkout}
+                disabled={cartDetailed.length === 0}
+                className="flex-[2] text-sm sm:text-base py-2 sm:py-2.5 rounded-lg font-medium disabled:opacity-40"
+                style={{ background: "var(--primary)", color: "#fff" }}
+              >
+                Charge {cartDetailed.length > 0 ? money(cartTotal) : ""}
+              </button>
+            </div>
+            <button
+              onClick={openParkModal}
+              disabled={cartDetailed.length === 0}
+              className="w-full mt-2 flex items-center justify-center gap-1.5 text-sm py-2 rounded-lg border disabled:opacity-40"
+              style={{ borderColor: "var(--line)", color: "var(--ink-soft)" }}
+              title="Send this order to the kitchen and pay for it later"
+            >
+              <ClipboardList size={14} /> Park as a tab (pay later)
+            </button>
           </div>
           <div className="ticket-edge-bottom shrink-0" />
         </div>
