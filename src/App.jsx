@@ -850,7 +850,7 @@ import {
   Tag, Banknote, CreditCard, ImagePlus, Loader2, Camera, History as HistoryIcon,
   Ban, Undo2, ChevronDown, ChevronUp, StickyNote, Coins, ChefHat, Circle, CheckCircle2,
   Settings as SettingsIcon, LogOut, Eye, EyeOff, Store, ArrowRight, Users, ClipboardList,
-  Printer,
+  Printer, Download, Smartphone, RefreshCw,
 } from "lucide-react";
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell,
@@ -1358,6 +1358,7 @@ function fileToResizedDataURL(file, maxWidth = 480, quality = 0.72) {
 }
 
 export default function CafePOS() {
+  const updateWaitingToApply = useAppUpdate();
   const [loading, setLoading] = useState(true);
   const [catalog, setCatalog] = useState({ ingredients: [], products: [], categories: [] });
   const [sales, setSales] = useState([]);
@@ -1736,6 +1737,36 @@ export default function CafePOS() {
     setToast({ msg, type });
     setTimeout(() => setToast(null), 2600);
   }, []);
+
+  // Once a new version has taken over in the background (see useAppUpdate
+  // above), don't reload immediately — wait until the register is actually
+  // quiet: an empty cart and nothing open (no modal, no in-progress void/
+  // restore/checkout, etc.). Checked every couple of seconds; the moment
+  // it's quiet, we reload once to pick up the new version. A manual
+  // "Refresh now" button in the banner lets someone override this and
+  // apply it immediately if they'd rather not wait.
+  const isQuietMoment = () =>
+    cart.length === 0 &&
+    !ingModal && !prodModal && !receipt && !voidModal && !restoreModal &&
+    !catModal && !parkModalOpen && !settleTabTarget && !employeeModal &&
+    !detailSale && !restockId && !checkoutError;
+
+  useEffect(() => {
+    if (!updateWaitingToApply) return;
+    if (isQuietMoment()) {
+      window.location.reload();
+      return;
+    }
+    const interval = setInterval(() => {
+      if (isQuietMoment()) window.location.reload();
+    }, 3000);
+    return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    updateWaitingToApply, cart, ingModal, prodModal, receipt, voidModal,
+    restoreModal, catModal, parkModalOpen, settleTabTarget, employeeModal,
+    detailSale, restockId, checkoutError,
+  ]);
 
   // Creates a new owner account via Supabase Auth, then a matching row in
   // `businesses` (business name, email, and trial_start_date = now). If the
@@ -3477,6 +3508,7 @@ export default function CafePOS() {
           onLogOut={logOut}
           onRefreshAccount={refreshAccountStatus}
         />
+        {updateWaitingToApply && <UpdateBanner onRefreshNow={() => window.location.reload()} />}
       </Shell>
     );
   }
@@ -3802,6 +3834,7 @@ export default function CafePOS() {
         />
       )}
       {toast && <Toast toast={toast} />}
+      {updateWaitingToApply && <UpdateBanner onRefreshNow={() => window.location.reload()} />}
     </Shell>
   );
 }
@@ -3862,6 +3895,192 @@ function Shell({ children }) {
   );
 }
 
+// =============================================================================
+// INSTALL APP (cross-device "add to home screen" / PWA install)
+// =============================================================================
+// Works three different ways depending on the device, because there's no
+// single API every browser supports:
+//   - Chrome / Edge / most Android browsers fire a `beforeinstallprompt`
+//     event we can hook into and trigger programmatically — the button just
+//     calls deferredPrompt.prompt().
+//   - iOS Safari never fires that event (Apple doesn't support it), so on
+//     iOS we detect that and show a small "tap Share, then Add to Home
+//     Screen" instruction modal instead.
+//   - Everywhere else (older/unsupported browsers, or once already
+//     installed) the button either shows generic instructions or hides
+//     itself entirely (see isStandalone below).
+// This only works at all once the app is served over https with a
+// manifest.json linked from index.html — see the deployment notes at the
+// end of this file / the separate manifest.json and sw.js this comes with.
+function useInstallPrompt() {
+  const [deferredPrompt, setDeferredPrompt] = useState(null);
+  const [isStandalone, setIsStandalone] = useState(false);
+  const [isIOS, setIsIOS] = useState(false);
+
+  useEffect(() => {
+    const standalone =
+      (window.matchMedia && window.matchMedia("(display-mode: standalone)").matches) ||
+      window.navigator.standalone === true; // iOS Safari's own flag
+    setIsStandalone(!!standalone);
+
+    const ua = window.navigator.userAgent || "";
+    setIsIOS(/iphone|ipad|ipod/i.test(ua) && !window.MSStream);
+
+    const onBeforeInstall = (e) => {
+      e.preventDefault(); // stop the browser's default mini-infobar
+      setDeferredPrompt(e); // save it so our own button can trigger it later
+    };
+    const onInstalled = () => {
+      setDeferredPrompt(null);
+      setIsStandalone(true);
+    };
+    window.addEventListener("beforeinstallprompt", onBeforeInstall);
+    window.addEventListener("appinstalled", onInstalled);
+    return () => {
+      window.removeEventListener("beforeinstallprompt", onBeforeInstall);
+      window.removeEventListener("appinstalled", onInstalled);
+    };
+  }, []);
+
+  const promptInstall = useCallback(async () => {
+    if (!deferredPrompt) return null;
+    deferredPrompt.prompt();
+    const choice = await deferredPrompt.userChoice;
+    setDeferredPrompt(null);
+    return choice.outcome; // "accepted" | "dismissed"
+  }, [deferredPrompt]);
+
+  return { canPrompt: !!deferredPrompt, promptInstall, isStandalone, isIOS };
+}
+
+function InstallAppButton() {
+  const { canPrompt, promptInstall, isStandalone, isIOS } = useInstallPrompt();
+  const [showHelp, setShowHelp] = useState(false);
+
+  // Already installed and running as an app — nothing to offer.
+  if (isStandalone) return null;
+
+  const handleClick = async () => {
+    if (canPrompt) {
+      await promptInstall();
+    } else {
+      // iOS (and any other browser without native install support) doesn't
+      // let us trigger installation from code — show manual steps instead.
+      setShowHelp(true);
+    }
+  };
+
+  return (
+    <>
+      <button
+        onClick={handleClick}
+        className="flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-full font-medium no-print"
+        style={{ background: "var(--primary)", color: "#fff" }}
+        title="Install this app on your device"
+      >
+        <Download size={12} /> Install app
+      </button>
+      {showHelp && (
+        <ModalWrap onClose={() => setShowHelp(false)}>
+          <div className="p-5 space-y-3">
+            <div className="flex items-center gap-2 text-sm font-semibold">
+              <Smartphone size={16} /> Install this app
+            </div>
+            {isIOS ? (
+              <p className="text-xs leading-relaxed" style={{ color: "var(--ink-soft)" }}>
+                In Safari, tap the <b>Share</b> icon (the square with an arrow, usually
+                at the bottom of the screen), then scroll down and tap{" "}
+                <b>Add to Home Screen</b>. The app icon will appear on your home
+                screen like any other app.
+              </p>
+            ) : (
+              <p className="text-xs leading-relaxed" style={{ color: "var(--ink-soft)" }}>
+                Open this page's browser menu (usually the ⋮ or ••• icon) and look
+                for <b>Install app</b> or <b>Add to Home Screen</b>. Once installed,
+                it opens like any other app and updates automatically — no App
+                Store needed.
+              </p>
+            )}
+            <button
+              onClick={() => setShowHelp(false)}
+              className="text-xs px-3 py-2 rounded-lg border"
+              style={{ borderColor: "var(--line)", color: "var(--ink-soft)" }}
+            >
+              Got it
+            </button>
+          </div>
+        </ModalWrap>
+      )}
+    </>
+  );
+}
+
+// =============================================================================
+// AUTO-UPDATE (existing installs pick up new pushes automatically)
+// =============================================================================
+// This app's index.html already registers /sw.js on page load — we don't
+// register it again here, just watch the existing registration for a new
+// version becoming available. That sw.js calls self.skipWaiting() and
+// self.clients.claim() on its own, so a newly-deployed version takes over
+// automatically within a few seconds of a client noticing it. We can't stop
+// that handover — but we CAN control when the page actually reloads to pick
+// it up, which is what the "quiet moment" logic further down (inside
+// CafePOS, near the other effects) does: it waits until the cart is empty
+// and no modal is open before reloading, instead of yanking the screen out
+// from under a mid-sale cashier.
+function useAppUpdate() {
+  const [controllerChanged, setControllerChanged] = useState(false);
+
+  useEffect(() => {
+    if (!("serviceWorker" in navigator)) return;
+
+    let cleanupUpdateFound = () => {};
+    navigator.serviceWorker.getRegistration().then((reg) => {
+      if (!reg) return;
+      const onUpdateFound = () => {
+        const installing = reg.installing;
+        if (!installing) return;
+        // Nothing to do here ourselves — sw.js handles skipWaiting/claim on
+        // its own; we just wait for "controllerchange" below, which is the
+        // actual signal that the new version has taken over.
+      };
+      reg.addEventListener("updatefound", onUpdateFound);
+      cleanupUpdateFound = () => reg.removeEventListener("updatefound", onUpdateFound);
+      reg.update();
+      const interval = setInterval(() => reg.update(), 60 * 60 * 1000);
+      cleanupUpdateFound = ((prev) => () => { prev(); clearInterval(interval); })(cleanupUpdateFound);
+    });
+
+    const onControllerChange = () => setControllerChanged(true);
+    navigator.serviceWorker.addEventListener("controllerchange", onControllerChange);
+
+    return () => {
+      cleanupUpdateFound();
+      navigator.serviceWorker.removeEventListener("controllerchange", onControllerChange);
+    };
+  }, []);
+
+  return controllerChanged;
+}
+
+function UpdateBanner({ onRefreshNow }) {
+  return (
+    <div
+      className="fixed bottom-4 left-1/2 -translate-x-1/2 z-[60] flex items-center gap-3 px-4 py-2.5 rounded-full shadow-lg no-print"
+      style={{ background: "var(--ink)", color: "#fff" }}
+    >
+      <span className="text-xs font-medium">Update ready — will apply once it's quiet.</span>
+      <button
+        onClick={onRefreshNow}
+        className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-full font-semibold"
+        style={{ background: "var(--primary)", color: "#fff" }}
+      >
+        <RefreshCw size={12} /> Refresh now
+      </button>
+    </div>
+  );
+}
+
 function Header({ businessName, low, confirmReset, setConfirmReset, resetAll, currencyCode, changeCurrency, employees, currentEmployee, selectEmployee, openEmployeeModal }) {
   return (
     <header className="max-w-6xl mx-auto px-4 sm:px-6 pt-6 pb-3 flex items-start justify-between no-print">
@@ -3914,6 +4133,7 @@ function Header({ businessName, low, confirmReset, setConfirmReset, resetAll, cu
         >
           <RotateCcw size={12} /> {confirmReset ? "Confirm reset?" : "Reset data"}
         </button>
+        <InstallAppButton />
       </div>
     </header>
   );
