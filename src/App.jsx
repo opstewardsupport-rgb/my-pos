@@ -850,7 +850,7 @@ import {
   Tag, Banknote, CreditCard, ImagePlus, Loader2, Camera, History as HistoryIcon,
   Ban, Undo2, ChevronDown, ChevronUp, StickyNote, Coins, ChefHat, Circle, CheckCircle2,
   Settings as SettingsIcon, LogOut, Eye, EyeOff, Store, ArrowRight, Users, ClipboardList,
-  Printer, Download, Smartphone, RefreshCw,
+  Printer, Download, Smartphone, RefreshCw, FileText,
 } from "lucide-react";
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell,
@@ -7949,6 +7949,9 @@ function AuthCard({ children }) {
           <InstallAppButton size="small" />
         </div>
         {children}
+        <div className="flex justify-center mt-4">
+          <TermsGuidelinesButton />
+        </div>
       </div>
     </div>
   );
@@ -9526,8 +9529,11 @@ function SettingsView({ account, onUpdateField, onLogOut, onDeleteAccount, trial
             <LogOut size={13} /> Log out
           </button>
         )}
-        <p className="text-[11px]" style={{ color: "var(--ink-soft)" }}>
-          Need help? <a href={`mailto:${SUPPORT_EMAIL}`} style={{ color: "var(--primary)" }}>{SUPPORT_EMAIL}</a>
+        <p className="text-[11px] flex items-center gap-3" style={{ color: "var(--ink-soft)" }}>
+          <span>
+            Need help? <a href={`mailto:${SUPPORT_EMAIL}`} style={{ color: "var(--primary)" }}>{SUPPORT_EMAIL}</a>
+          </span>
+          <TermsGuidelinesButton />
         </p>
       </div>
 
@@ -9597,5 +9603,105 @@ function ModalWrap({ onClose, children }) {
         {children}
       </div>
     </div>
+  );
+}
+
+// =============================================================================
+// TERMS & GUIDELINES (short, in-app version)
+// =============================================================================
+// A condensed, plain-language summary meant to be read on a phone screen in
+// under a minute — NOT a replacement for a full legal Terms of Service. Keep
+// this in sync with the full document if the underlying rules ever change
+// (trial length, referral percentages, retention window, etc.).
+function TermsGuidelinesModal({ onClose }) {
+  const Section = ({ title, children }) => (
+    <div className="mb-4">
+      <div className="text-xs font-semibold mb-1.5">{title}</div>
+      <ul className="space-y-1.5">{children}</ul>
+    </div>
+  );
+  const Point = ({ children }) => (
+    <li className="text-[12px] leading-relaxed flex gap-1.5" style={{ color: "var(--ink-soft)" }}>
+      <span style={{ color: "var(--primary)" }}>•</span>
+      <span>{children}</span>
+    </li>
+  );
+
+  return (
+    <ModalWrap onClose={onClose}>
+      <div className="p-5">
+        <div className="flex items-center justify-between mb-1">
+          <div className="flex items-center gap-2 text-sm font-semibold">
+            <FileText size={16} /> Terms & Guidelines
+          </div>
+          <button onClick={onClose} className="p-1 rounded-full" style={{ color: "var(--ink-soft)" }} title="Close">
+            <X size={16} />
+          </button>
+        </div>
+        <p className="text-[11px] mb-4" style={{ color: "var(--ink-soft)" }}>
+          The short version. Full terms available on request.
+        </p>
+
+        <Section title="Trial & subscription">
+          <Point>New accounts get a {TRIAL_DAYS}-day free trial.</Point>
+          <Point>Subscription price is fixed in the currency you pick at sign-up — it can't be changed later.</Point>
+          <Point>Subscriptions run in {SUBSCRIPTION_PERIOD_DAYS}-day periods; renew from Settings before yours lapses.</Point>
+          <Point>Fees aren't refundable except where required by law.</Point>
+        </Section>
+
+        <Section title="Your data">
+          <Point>Your catalog, sales, staff, shifts, and waste logs are stored on this device's browser only — not synced to the cloud or other devices.</Point>
+          <Point>Clearing browser data, losing the device, or switching devices can permanently lose that data. Back it up if you need to keep it.</Point>
+          <Point>Sales history older than {RETENTION_MONTHS} months is purged automatically.</Point>
+          <Point>Deleting your account removes your login, not this device's local data.</Point>
+        </Section>
+
+        <Section title="Staying logged in">
+          <Point>Removing the app icon does NOT log you out — use Log out in Settings, or clear browser data, to actually sign out.</Point>
+          <Point>You're responsible for any staff PINs you issue and what happens under them.</Point>
+        </Section>
+
+        <Section title="Referrals">
+          <Point>Your code gives new sign-ups {REFERRAL_DISCOUNT_PERCENT}% off their first month.</Point>
+          <Point>You earn {REFERRAL_REWARD_PERCENT}% credit per referral, capped at {MAX_REWARD_CREDIT_PERCENT}% off, resetting each billing cycle.</Point>
+          <Point>Fake or self-referrals aren't allowed and may get an account suspended.</Point>
+        </Section>
+
+        <Section title="Fair use">
+          <Point>Use the app for legitimate business purposes only — no unauthorized access, tampering, or fraud.</Point>
+          <Point>We can suspend accounts that violate these terms or abuse the referral program.</Point>
+        </Section>
+
+        <p className="text-[11px] mt-1" style={{ color: "var(--ink-soft)" }}>
+          Questions? Email{" "}
+          <a href={`mailto:${SUPPORT_EMAIL}`} style={{ color: "var(--primary)" }}>{SUPPORT_EMAIL}</a>
+        </p>
+
+        <button
+          onClick={onClose}
+          className="w-full mt-4 text-xs px-3 py-2.5 rounded-lg font-medium"
+          style={{ background: "var(--primary)", color: "#fff" }}
+        >
+          Got it
+        </button>
+      </div>
+    </ModalWrap>
+  );
+}
+
+function TermsGuidelinesButton({ className }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      <button
+        type="button"
+        onClick={() => setOpen(true)}
+        className={className || "flex items-center gap-1 text-[11px] underline"}
+        style={{ color: "var(--ink-soft)" }}
+      >
+        <FileText size={11} /> Terms & Guidelines
+      </button>
+      {open && <TermsGuidelinesModal onClose={() => setOpen(false)} />}
+    </>
   );
 }
