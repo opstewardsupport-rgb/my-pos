@@ -850,6 +850,7 @@ import {
   Tag, Banknote, CreditCard, ImagePlus, Loader2, Camera, History as HistoryIcon,
   Ban, Undo2, ChevronDown, ChevronUp, StickyNote, Coins, ChefHat, Circle, CheckCircle2,
   Settings as SettingsIcon, LogOut, Eye, EyeOff, Store, ArrowRight, Users, ClipboardList,
+  Printer,
 } from "lucide-react";
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell,
@@ -4810,6 +4811,132 @@ function CameraCaptureModal({ onClose, onCapture }) {
   );
 }
 
+// Builds a small, self-contained HTML page for a single sale receipt and
+// sends it to the browser's print dialog. Runs in its own popup window
+// rather than calling window.print() on the main app — the app's print CSS
+// (see the .no-print / .print-only rules in the global <style> block) is
+// built around printing the Reports page, not a receipt sitting inside a
+// modal overlay, so reusing it here would risk printing the dashboard
+// underneath along with the receipt. A dedicated popup keeps this simple
+// and prints ONLY the receipt, every time, regardless of which screen it
+// was opened from (checkout, Sales History, etc).
+function printReceipt(sale) {
+  const esc = (s) =>
+    String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+  const itemsHTML = sale.items
+    .map(
+      (i) => `
+        <div class="row">
+          <span>${esc(i.qty)} × ${esc(i.name)}</span>
+          <span>${esc(money(i.price * i.qty))}</span>
+        </div>`
+    )
+    .join("");
+
+  const discountHTML =
+    sale.discountAmount > 0
+      ? `
+        <div class="row alert">
+          <span>Discount${sale.discountType === "percent" ? ` (${esc(sale.discountValue)}%)` : ""}</span>
+          <span>-${esc(money(sale.discountAmount))}</span>
+        </div>`
+      : "";
+
+  let paymentHTML = `
+    <div class="row soft"><span>Payment</span><span style="text-transform:capitalize">${esc(sale.paymentMethod || "cash")}</span></div>`;
+  if (sale.paymentMethod === "cash") {
+    paymentHTML += `
+      <div class="row soft"><span>Cash received</span><span>${esc(money(sale.amountTendered))}</span></div>
+      <div class="row soft"><span>Change</span><span>${esc(money(sale.change))}</span></div>`;
+  } else if (sale.paymentMethod === "split" && sale.payments) {
+    paymentHTML += sale.payments
+      .map((p) => `<div class="row soft" style="text-transform:capitalize"><span>${esc(p.method)}</span><span>${esc(money(p.amount))}</span></div>`)
+      .join("");
+  }
+
+  const voidedHTML = sale.voided
+    ? `
+      <div class="notice alert">
+        <div class="bold">VOIDED — not counted in reports</div>
+        <div>Reason: ${esc(sale.voidReason)}${sale.voidedAt ? ` · ${esc(new Date(sale.voidedAt).toLocaleString())}` : ""}${sale.voidedByName ? ` · by ${esc(sale.voidedByName)}` : ""}</div>
+        ${sale.approvedByName ? `<div>Approved by ${esc(sale.approvedByName)}</div>` : ""}
+        ${sale.voidNote ? `<div>Note: ${esc(sale.voidNote)}</div>` : ""}
+      </div>`
+    : "";
+
+  const restoredHTML =
+    !sale.voided && sale.restoredAt
+      ? `
+      <div class="notice">
+        <div class="bold">Restored</div>
+        <div>${esc(new Date(sale.restoredAt).toLocaleString())}${sale.restoredByName ? ` · by ${esc(sale.restoredByName)}` : ""}${sale.voidReason ? ` · originally voided (${esc(sale.voidReason)})` : ""}</div>
+        ${sale.restoreApprovedByName ? `<div>Approved by ${esc(sale.restoreApprovedByName)}</div>` : ""}
+      </div>`
+      : "";
+
+  const html = `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>Receipt — Order #${esc(sale.orderNo)}</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 16px; font-family: 'Courier New', monospace; color: #2B2420; width: 300px; }
+  .center { text-align: center; }
+  .store { font-size: 16px; font-weight: 700; margin-bottom: 2px; }
+  .meta { font-size: 11px; color: #6b6058; margin-top: 2px; }
+  .row { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; margin: 3px 0; }
+  .row.soft { color: #6b6058; }
+  .row.alert { color: #B23B2E; }
+  .divider { border-top: 1px dashed #999; margin: 10px 0; }
+  .totals .row:last-child { font-weight: 700; font-size: 14px; padding-top: 4px; }
+  .notice { font-size: 11px; margin: 10px 0; padding: 6px 8px; background: #f2f2f2; }
+  .notice.alert { background: #F3E3DC; color: #B23B2E; }
+  .bold { font-weight: 700; }
+  .thanks { text-align: center; font-size: 12px; margin-top: 14px; }
+  @media print { body { width: auto; } }
+</style>
+</head>
+<body>
+  <div class="center">
+    <div class="store">The Counter</div>
+    <div class="meta">Order #${esc(sale.orderNo)} · ${esc(new Date(sale.timestamp).toLocaleString())}</div>
+    ${sale.employeeName ? `<div class="meta">Served by ${esc(sale.employeeName)}</div>` : ""}
+    ${sale.tabLabel ? `<div class="meta">Tab: ${esc(sale.tabLabel)}</div>` : ""}
+  </div>
+  ${voidedHTML}
+  ${restoredHTML}
+  <div class="divider"></div>
+  ${itemsHTML}
+  <div class="divider"></div>
+  <div class="totals">
+    <div class="row soft"><span>Subtotal</span><span>${esc(money(sale.subtotal ?? sale.total))}</span></div>
+    ${discountHTML}
+    <div class="row"><span>Total</span><span>${esc(money(sale.total))}</span></div>
+  </div>
+  <div class="divider"></div>
+  ${paymentHTML}
+  <div class="thanks">Thanks for stopping by ☕</div>
+</body>
+</html>`;
+
+  // A popup keeps this print job fully independent of the current page —
+  // no CSS conflicts with whatever view (POS, Sales History, Reports) the
+  // receipt happened to be opened from.
+  const win = window.open("", "_blank", "width=380,height=640");
+  if (!win) return; // popup blocked — nothing we can silently recover from here
+  win.document.write(html);
+  win.document.close();
+  win.focus();
+  // Give the popup a tick to finish rendering before invoking print, then
+  // close it once the person is done with the print dialog.
+  win.onload = () => {
+    win.print();
+  };
+  win.onafterprint = () => win.close();
+}
+
 function ReceiptModal({ sale, onClose, closeLabel = "New order" }) {
   return (
     <ModalWrap onClose={onClose}>
@@ -4913,9 +5040,19 @@ function ReceiptModal({ sale, onClose, closeLabel = "New order" }) {
           </div>
         )}
         <p className="text-center text-xs mt-4" style={{ color: "var(--ink-soft)" }}>Thanks for stopping by ☕</p>
-        <button onClick={onClose} className="w-full mt-4 py-2 rounded-lg text-sm font-medium" style={{ background: "var(--primary)", color: "#fff" }}>
-          {closeLabel}
-        </button>
+        <div className="flex gap-2 mt-4">
+          <button
+            onClick={() => printReceipt(sale)}
+            className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-lg text-sm font-medium border"
+            style={{ borderColor: "var(--line)", color: "var(--ink-soft)" }}
+            title="Opens this receipt in a print-ready window"
+          >
+            <Printer size={15} /> Print receipt
+          </button>
+          <button onClick={onClose} className="flex-1 py-2 rounded-lg text-sm font-medium" style={{ background: "var(--primary)", color: "#fff" }}>
+            {closeLabel}
+          </button>
+        </div>
       </div>
       <div className="ticket-edge-bottom" />
     </ModalWrap>
