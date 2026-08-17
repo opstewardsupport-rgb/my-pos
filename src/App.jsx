@@ -850,7 +850,7 @@ import {
   Tag, Banknote, CreditCard, ImagePlus, Loader2, Camera, History as HistoryIcon,
   Ban, Undo2, ChevronDown, ChevronUp, StickyNote, Coins, ChefHat, Circle, CheckCircle2,
   Settings as SettingsIcon, LogOut, Eye, EyeOff, Store, ArrowRight, Users, ClipboardList,
-  Printer, Download, Smartphone, RefreshCw, FileText,
+  Printer, Download, Smartphone, RefreshCw, FileText, UserX,
 } from "lucide-react";
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell,
@@ -2009,6 +2009,62 @@ export default function CafePOS() {
       return true;
     } catch (e) {
       notify("Couldn't delete your account — " + (e?.message || "check your connection and try again."), "err");
+      return false;
+    }
+  }, [authUser, notify]);
+
+  // Cancels the signed-in owner's PAID subscription WITHOUT deleting their
+  // account — unlike deleteAccount() above, the login, the businesses row,
+  // and every permanent record on it (referral_code, referred_by,
+  // referral_count, and — critically — the referral_redemptions table keyed
+  // by their email, see the SQL setup block at the top of this file) all
+  // stay exactly as they are. Only subscription_status/subscription_period_end/
+  // payment_reference are cleared, which immediately locks the POS behind
+  // the paywall again (trialInfo falls back to the original, long-expired
+  // trial window — see the trialInfo useMemo above — since account.trialStartDate
+  // is untouched).
+  //
+  // Deliberately NOT touched here: referred_by, discount_percent,
+  // reward_credits, referral_count. Leaving referred_by set is what makes
+  // redeem_referral() on the server keep refusing "You've already redeemed
+  // a referral code" if this owner ever tries to apply ANY code again after
+  // resubscribing — and referral_redemptions (permanent, keyed by email —
+  // survives even a full account deletion) independently blocks reusing the
+  // exact same code even in the hypothetical case referred_by was ever
+  // cleared. So "no re-using a promo code across an unsubscribe" falls out
+  // of infrastructure that already exists; this function doesn't need to
+  // duplicate it.
+  //
+  // Because subscription_status is no longer "active", two things fall out
+  // for free the next time this owner subscribes again:
+  //   1. hasSubscribedBefore (see UpgradeView) recomputes to false, so the
+  //      Upgrade screen shows "Upgrade your account" / a first-time
+  //      subscribe price breakdown instead of "Manage your subscription".
+  //   2. markSubscriptionActive()'s isFirstPayment recomputes to true, so
+  //      the confirmation toast is the "You're upgraded — thanks for
+  //      subscribing!" NEW SUBSCRIBER message, not the "Renewed —..." one.
+  const unsubscribeAccount = useCallback(async () => {
+    if (!authUser) return false;
+    try {
+      const updates = {
+        subscription_status: "cancelled",
+        subscription_period_end: null,
+        payment_reference: null,
+      };
+      const { error } = await supabase.from("businesses").update(updates).eq("id", authUser.id);
+      if (error) throw error;
+      const next = {
+        ...(accountRef.current || {}),
+        subscriptionStatus: "cancelled",
+        subscriptionPeriodEnd: null,
+        paymentReference: "",
+      };
+      accountRef.current = next;
+      setAccount(next);
+      notify("You've unsubscribed. You can resubscribe any time from Settings.");
+      return true;
+    } catch (e) {
+      notify("Couldn't unsubscribe — " + (e?.message || "check your connection and try again."), "err");
       return false;
     }
   }, [authUser, notify]);
@@ -3763,6 +3819,7 @@ export default function CafePOS() {
             onUpdateField={updateAccountField}
             onLogOut={logOut}
             onDeleteAccount={deleteAccount}
+            onUnsubscribe={unsubscribeAccount}
             trialInfo={trialInfo}
             currencyCode={currencyCode}
             openUpgrade={() => setShowUpgrade(true)}
@@ -4727,8 +4784,8 @@ function POSView({
   }, [cartDetailed, ingredients]);
 
   return (
-    <div className="flex flex-col lg:flex-row gap-2.5 sm:gap-4 mt-2 items-start">
-      <div className="flex-1 min-w-0 w-full">
+    <div className="flex flex-col lg:grid lg:grid-cols-2 gap-2.5 sm:gap-4 mt-2 items-start">
+      <div className="min-w-0 w-full">
         <div className="flex gap-1.5 sm:gap-2 mb-3 sm:mb-4 flex-wrap">
           {cats.map((c) => (
             <button
@@ -4768,7 +4825,7 @@ function POSView({
         )}
       </div>
 
-      <div className="lg:sticky top-2 sm:top-4 h-fit lg:max-h-[calc(100dvh-1rem)] overflow-y-auto scrollbar-thin shrink-0 w-full lg:w-[380px] xl:w-[420px]">
+      <div className="lg:sticky top-2 sm:top-4 h-fit lg:max-h-[calc(100dvh-1rem)] overflow-y-auto scrollbar-thin w-full min-w-0">
         <div className="rounded-xl overflow-hidden border" style={{ borderColor: "var(--line)", background: "var(--surface)" }}>
           <div className="ticket-edge-top" />
           <div className="px-3 sm:px-5 pt-2 pb-4">
@@ -9038,8 +9095,21 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
     }
   };
 
+  // A previously-unsubscribed owner (see unsubscribeAccount() in the main
+  // App component) lands here with subscription_status === "cancelled" —
+  // trialInfo treats that the same as never having subscribed (expired,
+  // not renewalDue, hasSubscribedBefore false), so without this check
+  // they'd see the generic "free trial has ended" copy. This gives them
+  // copy that actually matches what happened, while everything below (the
+  // price breakdown, the "subscription" vs "renewal" wording, the
+  // referral-code eligibility) already correctly treats them as a NEW
+  // subscriber for free, since it all keys off hasSubscribedBefore/
+  // account.subscriptionStatus rather than this headline.
+  const wasUnsubscribed = account?.subscriptionStatus === "cancelled";
   const headline = trialInfo?.renewalDue
     ? "Time to renew"
+    : wasUnsubscribed
+    ? "You've unsubscribed"
     : trialInfo?.expired
     ? "Your free trial has ended"
     : hasSubscribedBefore
@@ -9047,6 +9117,8 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
     : "Upgrade your account";
   const subhead = trialInfo?.renewalDue
     ? "Your paid period has ended — renew to keep the counter running. Your data is safe and right where you left it."
+    : wasUnsubscribed
+    ? "Resubscribe any time to keep using your POS — your data is safe and right where you left it."
     : trialInfo?.expired
     ? "Subscribe to keep using your POS — your data is safe and will be right where you left it."
     : hasSubscribedBefore
@@ -9423,12 +9495,18 @@ function CompleteProfileView({ account, onSave, onLogOut }) {
   );
 }
 
-function SettingsView({ account, onUpdateField, onLogOut, onDeleteAccount, trialInfo, currencyCode = "PHP", openUpgrade }) {
+function SettingsView({ account, onUpdateField, onLogOut, onDeleteAccount, onUnsubscribe, trialInfo, currencyCode = "PHP", openUpgrade }) {
   const [confirmLogout, setConfirmLogout] = useState(false);
   const [copied, setCopied] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [deleteTyped, setDeleteTyped] = useState("");
   const [deleting, setDeleting] = useState(false);
+  // Unsubscribe (cancel a PAID subscription without deleting the account —
+  // see unsubscribeAccount() for what this does and doesn't touch) has its
+  // own little confirm step, mirroring the Log out pattern above, since a
+  // stray tap shouldn't immediately cut off access.
+  const [confirmUnsubscribe, setConfirmUnsubscribe] = useState(false);
+  const [unsubscribing, setUnsubscribing] = useState(false);
 
   const copyCode = async () => {
     if (!account?.referralCode) return;
@@ -9511,10 +9589,58 @@ function SettingsView({ account, onUpdateField, onLogOut, onDeleteAccount, trial
             </span>
           ) : (
             <span className="text-[11px] px-2 py-0.5 rounded-full font-medium" style={{ background: "#F3E3DC", color: "var(--alert)" }}>
-              {trialInfo?.expired ? "Trial ended" : `${trialInfo?.daysLeft ?? ""} day${trialInfo?.daysLeft === 1 ? "" : "s"} left`}
+              {account?.subscriptionStatus === "cancelled" ? "Unsubscribed" : trialInfo?.expired ? "Trial ended" : `${trialInfo?.daysLeft ?? ""} day${trialInfo?.daysLeft === 1 ? "" : "s"} left`}
             </span>
           )}
         </div>
+
+        {/* ---- Unsubscribe — only offered to a currently-active, PAYING
+            subscriber. Cancels the subscription but keeps the login (see
+            unsubscribeAccount() for exactly what is and isn't touched). If
+            this owner ever signs back up, they'll see the New Subscriber
+            welcome flow (not a renewal), and any referral code they already
+            redeemed stays permanently blocked from being redeemed again. ---- */}
+        {trialInfo?.isSubscribed && (
+          <div className="mt-3 pt-3" style={{ borderTop: "1px dashed var(--line)" }}>
+            {!confirmUnsubscribe ? (
+              <button
+                onClick={() => setConfirmUnsubscribe(true)}
+                className="flex items-center gap-1.5 text-[11px] px-3 py-2 rounded-lg border font-medium"
+                style={{ borderColor: "var(--line)", color: "var(--ink-soft)" }}
+              >
+                <UserX size={12} /> Unsubscribe
+              </button>
+            ) : (
+              <div className="space-y-2">
+                <p className="text-[11px]" style={{ color: "var(--ink-soft)" }}>
+                  This cancels your paid subscription right away — your POS locks behind the paywall again. Your login and data stay put, and you can resubscribe any time.
+                </p>
+                <div className="flex items-center gap-2">
+                  <button
+                    disabled={unsubscribing}
+                    onClick={async () => {
+                      setUnsubscribing(true);
+                      const ok = await onUnsubscribe();
+                      setUnsubscribing(false);
+                      if (ok) setConfirmUnsubscribe(false);
+                    }}
+                    className="flex items-center gap-1.5 text-[11px] px-3 py-2 rounded-lg font-medium disabled:opacity-40"
+                    style={{ background: "var(--alert)", color: "#fff" }}
+                  >
+                    <UserX size={12} /> {unsubscribing ? "Unsubscribing…" : "Confirm unsubscribe"}
+                  </button>
+                  <button
+                    onClick={() => setConfirmUnsubscribe(false)}
+                    className="text-[11px] px-3 py-2 rounded-lg border"
+                    style={{ borderColor: "var(--line)", color: "var(--ink-soft)" }}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
         {!trialInfo?.isSubscribed && (
           <>
             {/* ---- Monthly fee preview — shown right here as soon as the
