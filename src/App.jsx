@@ -3922,10 +3922,46 @@ function Shell({ children }) {
 // immediately (before any app code loads) and stashes the event on
 // `window.__deferredInstallPrompt`. We just check for that here in
 // addition to listening for the live event ourselves.
+// Detects when the page is running inside another app's built-in ("in-app")
+// browser rather than a real, full browser — e.g. someone tapped the link
+// inside Messenger, Instagram, Facebook, TikTok, Line, or WeChat. This
+// matters a lot here: inside these webviews `beforeinstallprompt` never
+// fires AND there is no browser menu with "Add to Home Screen" to find —
+// the feature is not hidden, it's genuinely absent. No amount of on-page
+// code can install a PWA from inside one of these; the only fix is for the
+// person to leave the host app and open the link in their real browser
+// (Chrome, Safari, Edge, Firefox...). Returns a human-readable app name for
+// the message, or null if this looks like a normal browser.
+function detectInAppBrowser(ua) {
+  const knownHosts = [
+    { name: "Facebook", re: /FBAN|FBAV|FB_IAB/i },
+    { name: "Instagram", re: /Instagram/i },
+    { name: "TikTok", re: /musical_ly|BytedanceWebview|TikTok/i },
+    { name: "Line", re: /\bLine\//i },
+    { name: "WeChat", re: /MicroMessenger/i },
+    { name: "Twitter/X", re: /Twitter/i },
+    { name: "LinkedIn", re: /LinkedInApp/i },
+    { name: "Snapchat", re: /Snapchat/i },
+    { name: "Pinterest", re: /Pinterest/i },
+    { name: "WhatsApp", re: /\bWhatsApp\//i },
+  ];
+  for (const host of knownHosts) if (host.re.test(ua)) return host.name;
+  // Generic Android WebView fingerprint (a bare "; wv)" token in the UA) —
+  // catches other apps' in-app browsers that don't self-identify above.
+  if (/Android/i.test(ua) && /\bwv\)/i.test(ua)) return "this app's";
+  // Generic iOS in-app browser fingerprint: standalone WebKit content
+  // views typically drop "Safari" from the UA string even though they're
+  // still WebKit-based, unlike real Mobile Safari.
+  if (/iphone|ipad|ipod/i.test(ua) && /AppleWebKit/i.test(ua) && !/Safari/i.test(ua)) return "this app's";
+  return null;
+}
+
 function useInstallPrompt() {
   const [deferredPrompt, setDeferredPrompt] = useState(null);
   const [isStandalone, setIsStandalone] = useState(false);
   const [isIOS, setIsIOS] = useState(false);
+  const [isAndroid, setIsAndroid] = useState(false);
+  const [inAppBrowser, setInAppBrowser] = useState(null);
 
   useEffect(() => {
     const standalone =
@@ -3935,6 +3971,8 @@ function useInstallPrompt() {
 
     const ua = window.navigator.userAgent || "";
     setIsIOS(/iphone|ipad|ipod/i.test(ua) && !window.MSStream);
+    setIsAndroid(/Android/i.test(ua));
+    setInAppBrowser(detectInAppBrowser(ua));
 
     // Was it already captured before this component mounted?
     if (window.__deferredInstallPrompt) {
@@ -3968,35 +4006,65 @@ function useInstallPrompt() {
     return choice.outcome; // "accepted" | "dismissed"
   }, [deferredPrompt]);
 
-  return { canPrompt: !!deferredPrompt, promptInstall, isStandalone, isIOS };
+  return { canPrompt: !!deferredPrompt, promptInstall, isStandalone, isIOS, isAndroid, inAppBrowser };
 }
 
-function InstallAppButton() {
-  const { canPrompt, promptInstall, isStandalone, isIOS } = useInstallPrompt();
+function InstallAppButton({ size = "normal" }) {
+  const { canPrompt, promptInstall, isStandalone, isIOS, isAndroid, inAppBrowser } = useInstallPrompt();
   const [showHelp, setShowHelp] = useState(false);
+  const [copied, setCopied] = useState(false);
 
   // Already installed and running as an app — nothing to offer.
   if (isStandalone) return null;
 
   const handleClick = async () => {
-    if (canPrompt) {
+    // Inside an in-app browser, `beforeinstallprompt` never fires (canPrompt
+    // is always false there), so this branch is really just for real
+    // browsers with native one-tap install support.
+    if (canPrompt && !inAppBrowser) {
       await promptInstall();
     } else {
-      // iOS (and any other browser without native install support) doesn't
-      // let us trigger installation from code — show manual steps instead.
       setShowHelp(true);
     }
   };
+
+  const pageUrl = typeof window !== "undefined" ? window.location.href : "";
+
+  const copyLink = async () => {
+    try {
+      await navigator.clipboard.writeText(pageUrl);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2500);
+    } catch {
+      // Clipboard API can itself be blocked inside some in-app webviews —
+      // the link is still visible/selectable in the modal as a fallback.
+    }
+  };
+
+  // Android-only escape hatch: this special "intent://" link asks the OS
+  // to open the page in Chrome specifically, which is usually enough to
+  // jump straight out of an in-app webview (Messenger, Instagram, etc.)
+  // without the person having to hunt for a hidden menu first. It's simply
+  // ignored on non-Android devices, so it's safe to always build.
+  let androidChromeIntentUrl = null;
+  try {
+    const u = new URL(pageUrl);
+    androidChromeIntentUrl = `intent://${u.host}${u.pathname}${u.search}#Intent;scheme=https;package=com.android.chrome;end;`;
+  } catch {
+    androidChromeIntentUrl = null;
+  }
+
+  const small = size === "small";
 
   return (
     <>
       <button
         onClick={handleClick}
-        className="flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-full font-medium no-print"
+        className={`flex items-center gap-1.5 rounded-full font-medium no-print ${small ? "text-[11px] px-2 py-1" : "text-xs px-2.5 py-1.5"}`}
         style={{ background: "var(--primary)", color: "#fff" }}
         title="Install this app on your device"
       >
-        <Download size={12} /> Install app
+        <Download size={small ? 11 : 12} /> Install app
       </button>
       {showHelp && (
         <ModalWrap onClose={() => setShowHelp(false)}>
@@ -4004,7 +4072,42 @@ function InstallAppButton() {
             <div className="flex items-center gap-2 text-sm font-semibold">
               <Smartphone size={16} /> Install this app
             </div>
-            {isIOS ? (
+
+            {inAppBrowser ? (
+              <>
+                {/* There is no "Add to Home Screen" menu item to find here —
+                    in-app webviews genuinely don't have one. The only real
+                    fix is leaving the host app for a real browser. */}
+                <p className="text-xs leading-relaxed" style={{ color: "var(--ink-soft)" }}>
+                  You're viewing this inside {inAppBrowser} browser, which can't
+                  install apps. Open this page in your regular browser (Chrome,
+                  Safari, Edge…) instead — the <b>Install app</b> button will work
+                  from there.
+                </p>
+                {isAndroid && androidChromeIntentUrl && (
+                  <a
+                    href={androidChromeIntentUrl}
+                    className="block text-center text-xs px-3 py-2 rounded-lg font-medium"
+                    style={{ background: "var(--primary)", color: "#fff" }}
+                  >
+                    Open in Chrome
+                  </a>
+                )}
+                <button
+                  onClick={copyLink}
+                  className="w-full text-xs px-3 py-2 rounded-lg border font-medium"
+                  style={{ borderColor: "var(--line)", color: "var(--ink-soft)" }}
+                >
+                  {copied ? "Link copied!" : "Copy this page's link"}
+                </button>
+                <p className="text-[11px] leading-relaxed" style={{ color: "var(--ink-soft)" }}>
+                  <b>iPhone:</b> tap the <b>•••</b> or <b>Share</b> icon (usually at the
+                  bottom of the screen) and choose <b>Open in Safari</b>.{" "}
+                  <b>Android:</b> tap the same icon and choose <b>Open in Chrome</b>,
+                  or paste the copied link into Chrome.
+                </p>
+              </>
+            ) : isIOS ? (
               <p className="text-xs leading-relaxed" style={{ color: "var(--ink-soft)" }}>
                 In Safari, tap the <b>Share</b> icon (the square with an arrow, usually
                 at the bottom of the screen), then scroll down and tap{" "}
@@ -7839,6 +7942,12 @@ function AuthCard({ children }) {
   return (
     <div className="min-h-[75vh] flex items-center justify-center px-4 py-10 no-print">
       <div className="w-full max-w-sm rounded-2xl border p-6 sm:p-7" style={{ borderColor: "var(--line)", background: "var(--surface)" }}>
+        {/* Install is offered here too, not just after logging in — most
+            owners install the app once, on the device they use every shift,
+            long before they'd think to look for it in Settings. */}
+        <div className="flex justify-end mb-3">
+          <InstallAppButton size="small" />
+        </div>
         {children}
       </div>
     </div>
