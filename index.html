@@ -4,9 +4,6 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>POS System</title>
-    <!-- Tailwind CSS CDN -->
-    <script src="https://cdn.tailwindcss.com"></script>
-
     <!-- PWA: makes the app installable on iPad/tablet/phone -->
     <link rel="manifest" href="/manifest.json" />
     <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
@@ -17,7 +14,6 @@
   <body class="bg-gray-100">
     <div id="root"></div>
     <script type="module" src="/src/main.jsx"></script>
-
     <!-- PWA: registers the service worker -->
     <script>
       if ("serviceWorker" in navigator) {
