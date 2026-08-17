@@ -3912,6 +3912,16 @@ function Shell({ children }) {
 // This only works at all once the app is served over https with a
 // manifest.json linked from index.html — see the deployment notes at the
 // end of this file / the separate manifest.json and sw.js this comes with.
+//
+// TIMING NOTE: the browser can fire `beforeinstallprompt` within the first
+// instant the page loads — sometimes before this component has even
+// mounted. If we only listened for it here, that first event could be
+// missed on a fast load, and the button would fall back to manual
+// instructions even on a browser that fully supports one-tap install. To
+// avoid that, index.html has a tiny inline script that starts listening
+// immediately (before any app code loads) and stashes the event on
+// `window.__deferredInstallPrompt`. We just check for that here in
+// addition to listening for the live event ourselves.
 function useInstallPrompt() {
   const [deferredPrompt, setDeferredPrompt] = useState(null);
   const [isStandalone, setIsStandalone] = useState(false);
@@ -3926,11 +3936,18 @@ function useInstallPrompt() {
     const ua = window.navigator.userAgent || "";
     setIsIOS(/iphone|ipad|ipod/i.test(ua) && !window.MSStream);
 
+    // Was it already captured before this component mounted?
+    if (window.__deferredInstallPrompt) {
+      setDeferredPrompt(window.__deferredInstallPrompt);
+    }
+
     const onBeforeInstall = (e) => {
       e.preventDefault(); // stop the browser's default mini-infobar
+      window.__deferredInstallPrompt = e;
       setDeferredPrompt(e); // save it so our own button can trigger it later
     };
     const onInstalled = () => {
+      window.__deferredInstallPrompt = null;
       setDeferredPrompt(null);
       setIsStandalone(true);
     };
@@ -3946,6 +3963,7 @@ function useInstallPrompt() {
     if (!deferredPrompt) return null;
     deferredPrompt.prompt();
     const choice = await deferredPrompt.userChoice;
+    window.__deferredInstallPrompt = null;
     setDeferredPrompt(null);
     return choice.outcome; // "accepted" | "dismissed"
   }, [deferredPrompt]);
