@@ -5122,9 +5122,9 @@ function POSView({
                   <div className="mt-2.5">
                     <div className="flex items-center gap-2">
                       <input
-                        type="number"
-                        min="0"
-                        step="0.01"
+                        type="text"
+                        inputMode="none"
+                        readOnly
                         value={cashReceived}
                         onChange={(e) => setCashReceived(e.target.value)}
                         placeholder="Amount received"
@@ -5137,7 +5137,11 @@ function POSView({
                     </div>
                     {/* Built into the checkout layout itself (not a popup) so
                         the total/change readout above stays visible while
-                        keying in the amount on a touchscreen register. */}
+                        keying in the amount on a touchscreen register. The
+                        input above is read-only and blocks the device's own
+                        number keyboard (inputMode="none") — this on-screen
+                        keypad is the only way to enter the amount, so the
+                        two keyboards never fight for screen space. ---- */}
                     <NumericKeypad value={cashReceived} onChange={setCashReceived} />
                   </div>
                 )}
