@@ -4825,7 +4825,7 @@ function POSView({
         )}
       </div>
 
-      <div className="w-full h-screen flex flex-col min-w-0">
+      <div className="w-full h-screen overflow-hidden flex flex-col min-w-0">
         <div className="flex flex-col flex-1 min-h-0 overflow-hidden rounded-xl border" style={{ borderColor: "var(--line)", background: "var(--surface)" }}>
           <div className="ticket-edge-top shrink-0" />
 
@@ -4846,7 +4846,7 @@ function POSView({
               here; everything else (discount, payment method, keypad,
               totals, Charge/Park buttons) lives in the fixed footer below
               so it's always reachable without scrolling past a long order. ---- */}
-          <div className="flex-1 overflow-y-auto scrollbar-thin px-3 sm:px-5">
+          <div className="flex-1 min-h-0 overflow-y-auto scrollbar-thin px-3 sm:px-5">
             {cartDetailed.length === 0 ? (
               <p className="text-sm py-6 text-center" style={{ color: "var(--ink-soft)" }}>Tap a product to add it.</p>
             ) : (
