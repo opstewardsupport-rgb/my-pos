@@ -4825,10 +4825,12 @@ function POSView({
         )}
       </div>
 
-      <div className="lg:sticky top-2 sm:top-4 h-fit lg:max-h-[calc(100dvh-1rem)] overflow-y-auto scrollbar-thin w-full min-w-0">
-        <div className="rounded-xl overflow-hidden border" style={{ borderColor: "var(--line)", background: "var(--surface)" }}>
-          <div className="ticket-edge-top" />
-          <div className="px-3 sm:px-5 pt-2 pb-4">
+      <div className="w-full h-screen flex flex-col min-w-0">
+        <div className="flex flex-col flex-1 min-h-0 overflow-hidden rounded-xl border" style={{ borderColor: "var(--line)", background: "var(--surface)" }}>
+          <div className="ticket-edge-top shrink-0" />
+
+          {/* ---- Fixed header — order title + order number, never scrolls ---- */}
+          <div className="px-3 sm:px-5 pt-2 shrink-0">
             <div className="flex items-center gap-1.5 mb-3 justify-between flex-wrap">
               <div className="flex items-center gap-1.5">
                 <ShoppingCart size={17} color="var(--primary)" />
@@ -4838,10 +4840,17 @@ function POSView({
                 #{nextOrderNo}
               </span>
             </div>
+          </div>
+
+          {/* ---- Scrollable middle — only the order items list grows/scrolls
+              here; everything else (discount, payment method, keypad,
+              totals, Charge/Park buttons) lives in the fixed footer below
+              so it's always reachable without scrolling past a long order. ---- */}
+          <div className="flex-1 overflow-y-auto scrollbar-thin px-3 sm:px-5">
             {cartDetailed.length === 0 ? (
               <p className="text-sm py-6 text-center" style={{ color: "var(--ink-soft)" }}>Tap a product to add it.</p>
             ) : (
-              <div className="mono-font text-xs sm:text-sm max-h-64 sm:max-h-80 overflow-y-auto scrollbar-thin pr-1">
+              <div className="mono-font text-xs sm:text-sm pr-1">
                 {cartDetailed.map(({ product, qty }) => (
                   <div
                     key={product.id}
@@ -4863,7 +4872,14 @@ function POSView({
                 ))}
               </div>
             )}
+          </div>
 
+          {/* ---- Fixed footer — discount, payment method (incl. the
+              numeric keypad), totals, and the Charge/Clear/Park buttons.
+              Pinned below the scrollable items list so the keypad and
+              Charge button are always visible, never require scrolling
+              down to reach. ---- */}
+          <div className="px-3 sm:px-5 pb-4 pt-2 shrink-0" style={{ borderTop: "1px solid var(--line)" }}>
             {stockWarnings.length > 0 && (
               <div className="rounded-lg px-3 py-2 mt-2.5 text-xs space-y-1" style={{ background: "#FBF1EC" }}>
                 {stockWarnings.map((w) => (
@@ -5240,7 +5256,7 @@ function POSView({
               <ClipboardList size={14} /> Park as a tab (pay later)
             </button>
           </div>
-          <div className="ticket-edge-bottom" />
+          <div className="ticket-edge-bottom shrink-0" />
         </div>
       </div>
 
