@@ -9441,7 +9441,7 @@ function SettingsView({ account, onUpdateField, onLogOut, onDeleteAccount, trial
           <div className="rounded-lg p-3" style={{ background: "var(--bg)" }}>
             <div className="text-[11px] font-medium mb-1">Current month</div>
             <p className="text-[11px]" style={{ color: "var(--ink-soft)" }}>
-              Every time a new user signs up with your referral code, you earn {REFERRAL_REWARD_PERCENT}% off your immediate current billing cycle, up to a maximum of {MAX_REWARD_CREDIT_PERCENT}% off — so even with a lot of referrals in one month, your bill is never discounted by more than that. When the month ends and the next billing cycle begins, that discount resets to 0% for the new month until fresh referrals are made during that cycle.
+              Every time a new user signs up with your referral code, you earn {REFERRAL_REWARD_PERCENT}% off your immediate current billing cycle, up to a maximum of {MAX_REWARD_CREDIT_PERCENT}% off. When the month ends and the next billing cycle begins, that discount resets to 0% for the new month until fresh referrals are made during that cycle.
             </p>
           </div>
           <div className="flex gap-3 pt-1">
@@ -9487,10 +9487,6 @@ function SettingsView({ account, onUpdateField, onLogOut, onDeleteAccount, trial
               </p>
             )}
           </div>
-
-          <p className="text-[10px]" style={{ color: "var(--ink-soft)" }}>
-            <b>Note on referral credits:</b> The {REFERRAL_REWARD_PERCENT}% reward credit applies only to the current billing month and does not accumulate or roll over to future months. It resets to 0% at the start of each new billing cycle. Reward credit is capped at a maximum of {MAX_REWARD_CREDIT_PERCENT}% off any single bill, no matter how many referrals you bring in during that month.
-          </p>
         </div>
       ) : (
         <div className="rounded-xl border p-4 sm:p-5 mt-4" style={{ borderColor: "var(--line)", background: "var(--surface)" }}>
