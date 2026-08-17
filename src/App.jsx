@@ -5214,47 +5214,48 @@ function POSView({
               </div>
             )}
 
-            <div className="mt-3 pt-3 border-t mono-font text-sm sm:text-base" style={{ borderColor: "var(--line)" }}>
-              <div className="flex justify-between" style={{ color: "var(--ink-soft)" }}>
-                <span>Subtotal</span><span>{money(subtotal)}</span>
-              </div>
-              {discountAmount > 0 && (
-                <div className="flex justify-between" style={{ color: "var(--alert)" }}>
-                  <span>Discount</span><span>-{money(discountAmount)}</span>
+            {cartDetailed.length > 0 && (
+              <>
+                <div className="mt-3 pt-3 border-t mono-font text-sm sm:text-base" style={{ borderColor: "var(--line)" }}>
+                  <div className="flex justify-between" style={{ color: "var(--ink-soft)" }}>
+                    <span>Subtotal</span><span>{money(subtotal)}</span>
+                  </div>
+                  {discountAmount > 0 && (
+                    <div className="flex justify-between" style={{ color: "var(--alert)" }}>
+                      <span>Discount</span><span>-{money(discountAmount)}</span>
+                    </div>
+                  )}
+                  <div className="flex justify-between mt-1">
+                    <span className="font-medium">Total</span>
+                    <span className="text-lg sm:text-xl font-semibold">{money(cartTotal)}</span>
+                  </div>
                 </div>
-              )}
-              <div className="flex justify-between mt-1">
-                <span className="font-medium">Total</span>
-                <span className="text-lg sm:text-xl font-semibold">{money(cartTotal)}</span>
-              </div>
-            </div>
-            <div className="flex gap-2 mt-3">
-              <button
-                onClick={clearCart}
-                disabled={cartDetailed.length === 0}
-                className="flex-1 text-sm sm:text-base py-2 sm:py-2.5 rounded-lg border disabled:opacity-40"
-                style={{ borderColor: "var(--line)", color: "var(--ink-soft)" }}
-              >
-                Clear
-              </button>
-              <button
-                onClick={checkout}
-                disabled={cartDetailed.length === 0}
-                className="flex-[2] text-sm sm:text-base py-2 sm:py-2.5 rounded-lg font-medium disabled:opacity-40"
-                style={{ background: "var(--primary)", color: "#fff" }}
-              >
-                Charge {cartDetailed.length > 0 ? money(cartTotal) : ""}
-              </button>
-            </div>
-            <button
-              onClick={openParkModal}
-              disabled={cartDetailed.length === 0}
-              className="w-full mt-2 flex items-center justify-center gap-1.5 text-sm py-2 rounded-lg border disabled:opacity-40"
-              style={{ borderColor: "var(--line)", color: "var(--ink-soft)" }}
-              title="Send this order to the kitchen and pay for it later"
-            >
-              <ClipboardList size={14} /> Park as a tab (pay later)
-            </button>
+                <div className="flex gap-2 mt-3">
+                  <button
+                    onClick={clearCart}
+                    className="flex-1 text-sm sm:text-base py-2 sm:py-2.5 rounded-lg border disabled:opacity-40"
+                    style={{ borderColor: "var(--line)", color: "var(--ink-soft)" }}
+                  >
+                    Clear
+                  </button>
+                  <button
+                    onClick={checkout}
+                    className="flex-[2] text-sm sm:text-base py-2 sm:py-2.5 rounded-lg font-medium disabled:opacity-40"
+                    style={{ background: "var(--primary)", color: "#fff" }}
+                  >
+                    Charge {money(cartTotal)}
+                  </button>
+                </div>
+                <button
+                  onClick={openParkModal}
+                  className="w-full mt-2 flex items-center justify-center gap-1.5 text-sm py-2 rounded-lg border disabled:opacity-40"
+                  style={{ borderColor: "var(--line)", color: "var(--ink-soft)" }}
+                  title="Send this order to the kitchen and pay for it later"
+                >
+                  <ClipboardList size={14} /> Park as a tab (pay later)
+                </button>
+              </>
+            )}
           </div>
           <div className="ticket-edge-bottom shrink-0" />
         </div>
