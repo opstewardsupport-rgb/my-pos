@@ -1490,7 +1490,55 @@ export default function CafePOS() {
     };
   }, []);
 
-  // Re-reads the signed-in owner's row and, if anything actually changed,
+  // ---- Cross-device sync of café data (catalog, sales, employees, shifts,
+  // waste log, parked tabs, order counter) ----
+  // Everything above (fetchBusiness) is the owner's ACCOUNT — trial,
+  // subscription, referral — which already lived in Supabase and therefore
+  // already followed the owner to any device. Day-to-day café data used to
+  // live ONLY in this one browser's localStorage (see safeGet/safeSet
+  // above), which is why logging into the same account on a second device
+  // showed nothing. These two functions read/write a single JSON blob
+  // (`pos_data`) on that same `businesses` row, so the café's real data
+  // travels with the account the same way the subscription already does.
+  // Requires a one-time Supabase migration — see the SQL block near the top
+  // of this file (search "pos_data").
+  const fetchPosData = useCallback(async (userId) => {
+    if (!userId) return null;
+    try {
+      const { data, error } = await supabase
+        .from("businesses")
+        .select("pos_data, pos_data_updated_at")
+        .eq("id", userId)
+        .maybeSingle();
+      if (error || !data) return null;
+      return data;
+    } catch (err) {
+      console.error("fetchPosData failed:", err);
+      return null;
+    }
+  }, []);
+
+  // Fire-and-forget upload of the full current snapshot. Local storage (see
+  // safeSet calls throughout this file) stays the fast, offline-safe copy
+  // that every screen actually reads and writes to instantly — this just
+  // mirrors that same snapshot up to Supabase in the background so a DIFFERENT
+  // device can pick it up next time it logs in. If it fails (e.g. no
+  // connection), the local copy is completely unaffected; it'll just try
+  // again on the next change.
+  const pushPosData = useCallback(async (userId, blob) => {
+    if (!userId) return false;
+    try {
+      const { error } = await supabase
+        .from("businesses")
+        .update({ pos_data: blob, pos_data_updated_at: new Date().toISOString() })
+        .eq("id", userId);
+      if (error) throw error;
+      return true;
+    } catch (err) {
+      console.error("pushPosData failed:", err);
+      return false;
+    }
+  }, []);
   // updates account state — this is what lets the app notice a payment
   // went through (api/paymongo-webhook.js flipping subscription_status in
   // the database) WITHOUT the owner having to manually refresh the page.
@@ -3967,6 +4015,7 @@ function useInstallPrompt() {
   const [deferredPrompt, setDeferredPrompt] = useState(null);
   const [isStandalone, setIsStandalone] = useState(false);
   const [isIOS, setIsIOS] = useState(false);
+  const [isIOSNonSafari, setIsIOSNonSafari] = useState(false);
   const [isAndroid, setIsAndroid] = useState(false);
   const [inAppBrowser, setInAppBrowser] = useState(null);
 
@@ -3977,7 +4026,22 @@ function useInstallPrompt() {
     setIsStandalone(!!standalone);
 
     const ua = window.navigator.userAgent || "";
-    setIsIOS(/iphone|ipad|ipod/i.test(ua) && !window.MSStream);
+    // iPadOS (13+) ships a desktop-style UA by default — it identifies as
+    // "Macintosh" with no "iPad" token at all unless the person has manually
+    // turned off "Request Desktop Website". The old regex-only check missed
+    // every iPad because of this. The standard workaround: a "Mac" that also
+    // reports multi-touch support is actually an iPad wearing a Mac costume.
+    const iPadDesktopMode =
+      navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1;
+    const iosDevice = (/iphone|ipad|ipod/i.test(ua) && !window.MSStream) || iPadDesktopMode;
+    setIsIOS(iosDevice);
+    // On iOS, Apple requires every browser to use Safari's underlying engine,
+    // but only Safari itself is allowed to expose "Add to Home Screen" / PWA
+    // install. Chrome, Firefox, Edge, etc. on iOS are all Safari in a
+    // different skin and CANNOT install a PWA no matter what menu you look
+    // in — the person has to actually switch to Safari first. These UA
+    // tokens are how each of those browsers self-identifies on iOS.
+    setIsIOSNonSafari(iosDevice && /CriOS|FxiOS|EdgiOS|OPiOS|mercury/i.test(ua));
     setIsAndroid(/Android/i.test(ua));
     setInAppBrowser(detectInAppBrowser(ua));
 
@@ -4013,11 +4077,11 @@ function useInstallPrompt() {
     return choice.outcome; // "accepted" | "dismissed"
   }, [deferredPrompt]);
 
-  return { canPrompt: !!deferredPrompt, promptInstall, isStandalone, isIOS, isAndroid, inAppBrowser };
+  return { canPrompt: !!deferredPrompt, promptInstall, isStandalone, isIOS, isIOSNonSafari, isAndroid, inAppBrowser };
 }
 
 function InstallAppButton({ size = "normal" }) {
-  const { canPrompt, promptInstall, isStandalone, isIOS, isAndroid, inAppBrowser } = useInstallPrompt();
+  const { canPrompt, promptInstall, isStandalone, isIOS, isIOSNonSafari, isAndroid, inAppBrowser } = useInstallPrompt();
   const [showHelp, setShowHelp] = useState(false);
   const [copied, setCopied] = useState(false);
 
@@ -4112,6 +4176,31 @@ function InstallAppButton({ size = "normal" }) {
                   bottom of the screen) and choose <b>Open in Safari</b>.{" "}
                   <b>Android:</b> tap the same icon and choose <b>Open in Chrome</b>,
                   or paste the copied link into Chrome.
+                </p>
+              </>
+            ) : isIOSNonSafari ? (
+              <>
+                {/* Apple only allows Safari itself to install a PWA — Chrome,
+                    Firefox, and Edge on iOS all run on Safari's engine but
+                    have no "Add to Home Screen" capability at all, in any
+                    menu. The only fix is switching to actual Safari. */}
+                <p className="text-xs leading-relaxed" style={{ color: "var(--ink-soft)" }}>
+                  On iPhone/iPad, only <b>Safari</b> can install this app — Chrome,
+                  Firefox, and Edge on iOS aren't allowed to, even though the
+                  button looks the same. Open this page in Safari instead, then
+                  tap <b>Install app</b> again.
+                </p>
+                <button
+                  onClick={copyLink}
+                  className="w-full text-xs px-3 py-2 rounded-lg border font-medium"
+                  style={{ borderColor: "var(--line)", color: "var(--ink-soft)" }}
+                >
+                  {copied ? "Link copied!" : "Copy this page's link"}
+                </button>
+                <p className="text-[11px] leading-relaxed" style={{ color: "var(--ink-soft)" }}>
+                  In Safari: paste the link (or find this page in your Safari
+                  history/bookmarks), then tap the <b>Share</b> icon and choose{" "}
+                  <b>Add to Home Screen</b>.
                 </p>
               </>
             ) : isIOS ? (
