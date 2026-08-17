@@ -63,6 +63,34 @@
    alter table public.businesses
      add column if not exists currency_code text default 'PHP';
 
+   -- Set once, the moment an account's FIRST payment is confirmed (see
+   -- markSubscriptionActive in the app code) — unlike subscription_period_end
+   -- (which moves forward on every renewal), this stays fixed for the life
+   -- of that subscription, so the "Subscription Start Date" in the New Paid
+   -- Subscription email always reflects when this subscription actually
+   -- began, not the most recent renewal. Reset again if the owner
+   -- unsubscribes and later resubscribes, since that's treated as a new
+   -- first payment. Safe to run even if this column already exists.
+   alter table public.businesses
+     add column if not exists subscription_start_date timestamptz;
+
+   -- A snapshot of exactly what was charged on the most recent payment
+   -- (first subscription OR renewal), written by markSubscriptionActive()
+   -- in the app code at the moment payment is confirmed. Feeds the pricing
+   -- fields (Original Price/Balance, Discount %, Final Amount) in the New
+   -- Paid Subscription and Subscription Renewal emails below — stored
+   -- rather than recomputed in SQL so the email always matches exactly what
+   -- the subscriber was shown and charged, not a re-derived guess. Safe to
+   -- run even if these columns already exist.
+   alter table public.businesses
+     add column if not exists last_payment_currency text;
+   alter table public.businesses
+     add column if not exists last_payment_original_amount numeric;
+   alter table public.businesses
+     add column if not exists last_payment_discount_percent numeric;
+   alter table public.businesses
+     add column if not exists last_payment_final_amount numeric;
+
    -- THIS IS THE PIECE THAT WAS MISSING: nothing in this project ever
    -- actually WROTE a referral_code onto a business row — the app and the
    -- redeem_referral() function below only ever READ it. So if you flip an
@@ -540,13 +568,13 @@
    OPTIONAL — EMAIL NOTIFICATIONS SETUP (run once, separately from the block
    above)
    =============================================================================
-   Sends YOU an email the moment something business-relevant happens: a new
-   sign-up, a first-time subscription, a renewal, a referral code being used,
-   or an account being deleted. This has to run on the SERVER (a database
-   trigger), not in this file's browser code — the browser's key is
-   deliberately powerless to do anything as sensitive as sending email on
-   your behalf, the same reason it can't delete accounts or grant discounts
-   (see the block above).
+   Sends YOU a detailed email the moment something business-relevant
+   happens: a new free-trial sign-up, a first-time paid subscription, a
+   renewal, an unsubscribe, or an account deletion. This has to run on the
+   SERVER (a database trigger), not in this file's browser code — the
+   browser's key is deliberately powerless to do anything as sensitive as
+   sending email on your behalf, the same reason it can't delete accounts or
+   grant discounts (see the block above).
 
    HOW TO SET THIS UP (about 5 minutes, no coding):
      1. Go to https://resend.com and create a free account.
@@ -561,6 +589,10 @@
         replace REPLACE_WITH_YOUR_RESEND_API_KEY with the key from step 2,
         and REPLACE_WITH_YOUR_EMAIL with the inbox from step 3.
      6. Click "Run".
+     7. This block ALSO needs the last_payment_ and subscription_start_date
+        columns added by the ONE-TIME SUPABASE SETUP block above — run that
+        one first (or again; every statement in it is safe to re-run) if
+        you haven't already.
 
    IMPORTANT — KEEP THIS KEY PRIVATE: unlike the SUPABASE_ANON_KEY used
    elsewhere in this file (which is safe to be public), your Resend API key
@@ -602,9 +634,64 @@
    end;
    $$;
 
-   -- 1) NEW SIGN-UP — fires the instant a new businesses row is created,
-   -- which covers both a normal sign-up and the handle_new_user() trigger
-   -- fallback above, so it can never be missed either way.
+   -- Shared formatter for a money amount + currency code, used by every
+   -- pricing line below so "1699" and "35" both come out looking like
+   -- "1,699.00 PHP" / "35.00 USD" instead of a bare number with no currency
+   -- attached. Falls back to 0.00/PHP for null inputs (e.g. an account that
+   -- predates the last_payment_* columns) rather than erroring.
+   create or replace function public.format_money(p_amount numeric, p_currency text)
+   returns text
+   language sql
+   immutable
+   as $$
+     select trim(to_char(coalesce(p_amount, 0), 'FM999,999,999,990.00')) || ' ' || coalesce(nullif(p_currency, ''), 'PHP');
+   $$;
+
+   -- Shared "who referred this account, if anyone" formatter — used by the
+   -- New Paid Subscription, Unsubscribe, and Account Deletion emails below,
+   -- all of which need to show "Referral Code Used" (or "None"). Looks up
+   -- the REFERRER's row (referred_by points at the code owner's account id,
+   -- not at a redemption record) and reports their referral code alongside
+   -- their business name and email, since a bare code isn't useful to you
+   -- without knowing whose it is.
+   create or replace function public.referral_source_html(p_referred_by uuid)
+   returns text
+   language plpgsql
+   security definer
+   set search_path = public
+   as $$
+   declare
+     v_code text;
+     v_name text;
+     v_email text;
+   begin
+     if p_referred_by is null then
+       return 'None';
+     end if;
+
+     select referral_code, business_name, email
+       into v_code, v_name, v_email
+       from public.businesses
+       where id = p_referred_by;
+
+     if v_code is null then
+       -- The referrer's account no longer exists (e.g. they later deleted
+       -- it) — referred_by still points at the id, so say so rather than
+       -- silently showing "None", which would misleadingly suggest no code
+       -- was ever used at all.
+       return 'None (referring account no longer exists)';
+     end if;
+
+     return coalesce(v_code, '(unknown code)') || ' — ' ||
+       coalesce(nullif(v_name, ''), '(no business name)') || ' · ' ||
+       coalesce(v_email, '(no email)');
+   end;
+   $$;
+
+   -- 1) NEW USER / FREE TRIAL SIGNUP — fires the instant a new businesses
+   -- row is created, which covers both a normal sign-up and the
+   -- handle_new_user() trigger fallback above, so it can never be missed
+   -- either way.
    drop function if exists public.notify_on_signup() cascade;
    create or replace function public.notify_on_signup()
    returns trigger
@@ -612,12 +699,23 @@
    security definer
    set search_path = public
    as $$
+   declare
+     v_trial_start timestamptz := coalesce(new.trial_start_date, now());
+     -- Matches TRIAL_DAYS (3) in the app code (cafe-pos.jsx) — update this
+     -- interval to match if you ever change that constant.
+     v_trial_end timestamptz := coalesce(new.trial_start_date, now()) + interval '3 days';
    begin
      perform public.notify_owner(
        '🎉 New sign-up: ' || coalesce(nullif(new.business_name, ''), new.email, 'someone'),
-       '<p>A new account just signed up.</p>' ||
-       '<p><b>Business:</b> ' || coalesce(nullif(new.business_name, ''), '(not set yet)') || '<br>' ||
-       '<b>Email:</b> ' || coalesce(new.email, '(unknown)') || '</p>'
+       '<p>A new free-trial account just signed up.</p>' ||
+       '<p>' ||
+         '<b>User Email Address:</b> ' || coalesce(new.email, '(unknown)') || '<br>' ||
+         '<b>Business Name:</b> ' || coalesce(nullif(new.business_name, ''), '(not set yet)') || '<br>' ||
+         '<b>Selected Currency:</b> ' || coalesce(new.currency_code, 'PHP') || '<br>' ||
+         '<b>Free Trial Start Date:</b> ' || to_char(v_trial_start, 'Mon DD, YYYY HH12:MI AM') || '<br>' ||
+         '<b>Free Trial End Date:</b> ' || to_char(v_trial_end, 'Mon DD, YYYY HH12:MI AM') ||
+       '</p>' ||
+       '<p style="color:#888;font-size:11px;">Account ID: ' || new.id || '</p>'
      );
      return new;
    end;
@@ -628,12 +726,16 @@
      after insert on public.businesses
      for each row execute function public.notify_on_signup();
 
-   -- 2) FIRST SUBSCRIPTION vs RENEWAL vs REFERRAL USED — all three are just
-   -- different kinds of UPDATE on the same businesses row, so one trigger
-   -- covers them. Distinguishes a first payment (subscription_status was NOT
-   -- already 'active') from a renewal (it already was, and the paid period
-   -- just moved forward) — matches exactly how markSubscriptionActive() in
-   -- the app itself tells the two apart.
+   -- 2) FIRST SUBSCRIPTION vs RENEWAL vs REFERRAL-CODE-USED vs UNSUBSCRIBE —
+   -- all four are just different kinds of UPDATE on the same businesses
+   -- row, so one trigger covers them. Distinguishes a first payment
+   -- (subscription_status was NOT already 'active') from a renewal (it
+   -- already was, and the paid period just moved forward) — matches
+   -- exactly how markSubscriptionActive() in the app itself tells the two
+   -- apart. The pricing fields (original/discount/final) are read from
+   -- last_payment_* — a snapshot markSubscriptionActive() writes at the
+   -- same moment it flips subscription_status, so these numbers always
+   -- match exactly what the subscriber was shown and charged.
    drop function if exists public.notify_on_subscription_change() cascade;
    create or replace function public.notify_on_subscription_change()
    returns trigger
@@ -641,24 +743,80 @@
    security definer
    set search_path = public
    as $$
+   declare
+     v_currency text := coalesce(new.last_payment_currency, new.currency_code, 'PHP');
+     v_active_referred_count int;
    begin
+     -- ---- NEW PAID SUBSCRIPTION (first-ever payment) ----
      if new.subscription_status = 'active' and old.subscription_status is distinct from 'active' then
        perform public.notify_owner(
          '💰 New subscriber: ' || coalesce(nullif(new.business_name, ''), new.email, 'someone'),
-         '<p><b>' || coalesce(nullif(new.business_name, ''), new.email, 'A business') || '</b> just subscribed for the first time.</p>'
+         '<p><b>' || coalesce(nullif(new.business_name, ''), new.email, 'A business') || '</b> just subscribed for the first time.</p>' ||
+         '<p>' ||
+           '<b>User Email Address:</b> ' || coalesce(new.email, '(unknown)') || '<br>' ||
+           '<b>Business Name:</b> ' || coalesce(nullif(new.business_name, ''), '(not set)') || '<br>' ||
+           '<b>Currency:</b> ' || v_currency || '<br>' ||
+           '<b>Subscription Start Date:</b> ' || to_char(coalesce(new.subscription_start_date, now()), 'Mon DD, YYYY HH12:MI AM') || '<br>' ||
+           '<b>Next Renewal Date:</b> ' || coalesce(to_char(new.subscription_period_end, 'Mon DD, YYYY HH12:MI AM'), '(not set)') || '<br>' ||
+           '<b>Referral Code Used:</b> ' || public.referral_source_html(new.referred_by) || '<br>' ||
+           '<b>Original Price:</b> ' || public.format_money(new.last_payment_original_amount, v_currency) || '<br>' ||
+           '<b>Discount Percentage Applied:</b> ' || coalesce(new.last_payment_discount_percent, 0)::text || '%<br>' ||
+           '<b>Final Paid Amount:</b> ' || public.format_money(new.last_payment_final_amount, v_currency) || '<br>' ||
+           '<b>Payment Reference:</b> ' || coalesce(nullif(new.payment_reference, ''), '(none provided)') ||
+         '</p>' ||
+         '<p style="color:#888;font-size:11px;">Account ID: ' || new.id || '</p>'
        );
+
+     -- ---- SUBSCRIPTION RENEWAL (already active, paid period just moved) ----
      elsif new.subscription_status = 'active' and old.subscription_status = 'active'
        and new.subscription_period_end is distinct from old.subscription_period_end then
+
+       select count(*) into v_active_referred_count
+         from public.businesses
+         where referred_by = new.id and subscription_status = 'active';
+
        perform public.notify_owner(
          '🔁 Renewal: ' || coalesce(nullif(new.business_name, ''), new.email, 'someone'),
-         '<p><b>' || coalesce(nullif(new.business_name, ''), new.email, 'A business') || '</b> just renewed their subscription.</p>'
+         '<p><b>' || coalesce(nullif(new.business_name, ''), new.email, 'A business') || '</b> just renewed their subscription.</p>' ||
+         '<p>' ||
+           '<b>User Email Address:</b> ' || coalesce(new.email, '(unknown)') || '<br>' ||
+           '<b>Business Name:</b> ' || coalesce(nullif(new.business_name, ''), '(not set)') || '<br>' ||
+           '<b>Date of Renewal:</b> ' || to_char(now(), 'Mon DD, YYYY HH12:MI AM') || '<br>' ||
+           '<b>Next Billing Date:</b> ' || coalesce(to_char(new.subscription_period_end, 'Mon DD, YYYY HH12:MI AM'), '(not set)') || '<br>' ||
+           '<b>Active Referred User Count:</b> ' || coalesce(v_active_referred_count, 0)::text || '<br>' ||
+           '<b>Original Balance:</b> ' || public.format_money(new.last_payment_original_amount, v_currency) || '<br>' ||
+           '<b>Total Discount Percentage:</b> ' || coalesce(new.last_payment_discount_percent, 0)::text || '%<br>' ||
+           '<b>Final Amount Due:</b> ' || public.format_money(new.last_payment_final_amount, v_currency) || '<br>' ||
+           '<b>Payment Reference:</b> ' || coalesce(nullif(new.payment_reference, ''), '(none provided)') ||
+         '</p>' ||
+         '<p style="color:#888;font-size:11px;">Account ID: ' || new.id || '</p>'
        );
      end if;
 
+     -- ---- REFERRAL CODE USED (notifies the CODE OWNER that someone just
+     -- redeemed it) — a separate, lighter-weight heads-up distinct from the
+     -- full New Paid Subscription email above, which goes out regardless of
+     -- whether a code was involved. Fires whenever referral_count goes up,
+     -- which only ever happens inside finalize_referral_redemption(). ----
      if coalesce(new.referral_count, 0) > coalesce(old.referral_count, 0) then
        perform public.notify_owner(
          '🤝 Referral code used: ' || coalesce(nullif(new.business_name, ''), new.email, 'someone'),
          '<p><b>' || coalesce(nullif(new.business_name, ''), new.email, 'A business') || '</b>''s referral code was just used by a new paying subscriber.</p>'
+       );
+     end if;
+
+     -- ---- UNSUBSCRIBE (subscription cancelled, account NOT deleted) ----
+     if new.subscription_status = 'cancelled' and old.subscription_status is distinct from 'cancelled' then
+       perform public.notify_owner(
+         '📉 Unsubscribed: ' || coalesce(nullif(new.business_name, ''), new.email, 'someone'),
+         '<p><b>' || coalesce(nullif(new.business_name, ''), new.email, 'A business') || '</b> just unsubscribed. Their account is still active — only the paid subscription was cancelled.</p>' ||
+         '<p>' ||
+           '<b>Event Type:</b> Unsubscribed<br>' ||
+           '<b>User Email Address:</b> ' || coalesce(new.email, '(unknown)') || '<br>' ||
+           '<b>Business Name:</b> ' || coalesce(nullif(new.business_name, ''), '(not set)') || '<br>' ||
+           '<b>Referral Code Used at Initial Signup:</b> ' || public.referral_source_html(new.referred_by) ||
+         '</p>' ||
+         '<p style="color:#888;font-size:11px;">Account ID: ' || new.id || '</p>'
        );
      end if;
 
@@ -673,7 +831,8 @@
 
    -- 3) ACCOUNT DELETED — fires from inside delete_own_account() above,
    -- right before that row is actually removed, so you find out when
-   -- you're losing a customer.
+   -- you're losing a customer. Uses OLD (not NEW) throughout, since the row
+   -- is gone by the time this runs.
    drop function if exists public.notify_on_delete() cascade;
    create or replace function public.notify_on_delete()
    returns trigger
@@ -684,7 +843,14 @@
    begin
      perform public.notify_owner(
        '👋 Account deleted: ' || coalesce(nullif(old.business_name, ''), old.email, 'someone'),
-       '<p><b>' || coalesce(nullif(old.business_name, ''), old.email, 'A business') || '</b> just deleted their account.</p>'
+       '<p><b>' || coalesce(nullif(old.business_name, ''), old.email, 'A business') || '</b> just deleted their account.</p>' ||
+       '<p>' ||
+         '<b>Event Type:</b> Account Deleted<br>' ||
+         '<b>User Email Address:</b> ' || coalesce(old.email, '(unknown)') || '<br>' ||
+         '<b>Business Name:</b> ' || coalesce(nullif(old.business_name, ''), '(not set)') || '<br>' ||
+         '<b>Referral Code Used at Initial Signup:</b> ' || public.referral_source_html(old.referred_by) ||
+       '</p>' ||
+       '<p style="color:#888;font-size:11px;">Account ID: ' || old.id || '</p>'
      );
      return old;
    end;
@@ -1481,6 +1647,7 @@ export default function CafePOS() {
       trialStartDate: data.trial_start_date,
       subscriptionStatus: data.subscription_status || "trial",
       subscriptionPeriodEnd: data.subscription_period_end || null,
+      subscriptionStartDate: data.subscription_start_date || null,
       paymentReference: data.payment_reference || "",
       // Set once at sign-up (see SignUpView) and never changed afterward —
       // this is the account's single, permanent billing/display currency.
@@ -2122,6 +2289,48 @@ export default function CafePOS() {
     // good, so it doesn't silently reapply to every future renewal.
     const isFirstPayment = accountRef.current?.subscriptionStatus !== "active";
     const periodEnd = new Date(Date.now() + SUBSCRIPTION_PERIOD_DAYS * MS_PER_DAY).toISOString();
+
+    // On a first payment, actually "spend" any referral code that was
+    // applied-but-not-yet-paid (pending_referral_code) BEFORE the update
+    // below flips subscription_status to "active" — this is the ONLY
+    // moment a code is ever marked used, for both this account and the
+    // referrer, and it's why a code clicked "Apply" and then abandoned
+    // never blocks a later, real attempt. Awaited (unlike before) and done
+    // FIRST specifically so referred_by is already committed on this row
+    // by the time the subscription-change email trigger fires from the
+    // update further down — otherwise the "New Paid Subscription" email
+    // would always show "Referral Code Used: None", even when one was
+    // used, because the two writes used to race. See
+    // finalize_referral_redemption() in the SQL setup block at the top of
+    // this file, which is also the real enforcement: it's a no-op if this
+    // account never applied a code, and a safe no-op if this exact
+    // referral was somehow already finalized before (so this can never
+    // double-credit a referrer or double-count a redemption, even if this
+    // function ever runs twice for the same first payment). A failure here
+    // is logged but never blocks the subscriber's own upgrade below.
+    if (isFirstPayment) {
+      try {
+        const { error: rewardErr } = await supabase.rpc("finalize_referral_redemption");
+        if (rewardErr) console.error("finalize_referral_redemption failed:", rewardErr);
+      } catch (rewardErr) {
+        console.error("finalize_referral_redemption failed:", rewardErr);
+      }
+    }
+
+    // Snapshot the pricing that's about to be charged, in the subscriber's
+    // own currency, BEFORE discount_percent/reward_credits are reset below
+    // — this is what gets emailed to the owner (see notify_on_subscription_change
+    // in the SQL setup block) and is intentionally the exact numbers the
+    // subscriber was shown on the Upgrade screen, not a re-derived guess:
+    // first payment uses their one-time referral discount (discountPercent),
+    // a renewal uses whatever reward credit they'd built up (rewardCredits,
+    // capped the same way UpgradeView caps it for display/charging).
+    const originalAmount = lockedSubscriptionPrice(currencyCode);
+    const discountPercentApplied = isFirstPayment
+      ? (accountRef.current?.discountPercent || 0)
+      : Math.min(accountRef.current?.rewardCredits || 0, MAX_REWARD_CREDIT_PERCENT);
+    const finalAmount = originalAmount - originalAmount * (discountPercentApplied / 100);
+
     // Every time a billing cycle starts (first payment OR a renewal), the
     // 3% referral reward credit resets back to 0% for the new month — it
     // does not accumulate or roll over. Fresh referrals made DURING the new
@@ -2131,8 +2340,22 @@ export default function CafePOS() {
       subscription_period_end: periodEnd,
       payment_reference: referenceNote || null,
       reward_credits: 0,
+      last_payment_currency: currencyCode,
+      last_payment_original_amount: originalAmount,
+      last_payment_discount_percent: discountPercentApplied,
+      last_payment_final_amount: finalAmount,
     };
-    if (isFirstPayment) updates.discount_percent = 0;
+    if (isFirstPayment) {
+      updates.discount_percent = 0;
+      // Set once, the first time an account ever goes active — and reset
+      // again if they unsubscribe and later resubscribe, since that's
+      // treated as a fresh "first" subscription (see unsubscribeAccount /
+      // isFirstPayment above). Kept separate from subscription_period_end
+      // (which moves every renewal) so "Subscription Start Date" in the
+      // New Paid Subscription email always reflects this specific
+      // subscription, not the most recent renewal.
+      updates.subscription_start_date = new Date().toISOString();
+    }
     const { error } = await supabase.from("businesses").update(updates).eq("id", authUser.id);
     if (error) {
       notify("Couldn't confirm the upgrade — " + error.message, "err");
@@ -2145,35 +2368,14 @@ export default function CafePOS() {
       paymentReference: referenceNote || "",
       discountPercent: isFirstPayment ? 0 : (accountRef.current?.discountPercent || 0),
       rewardCredits: 0,
+      subscriptionStartDate: isFirstPayment ? updates.subscription_start_date : accountRef.current?.subscriptionStartDate,
     };
     accountRef.current = next;
     setAccount(next);
 
-    // Actually "spend" any referral code that was applied-but-not-yet-paid
-    // (pending_referral_code) — this is the ONLY moment a code is ever
-    // marked used, for both this account and the referrer, and it's why a
-    // code clicked "Apply" and then abandoned never blocks a later, real
-    // attempt. Also credits this person's referrer (if any) with their
-    // one-time 3% reward — but only now, on an actual confirmed FIRST
-    // payment, never at code-apply time. See finalize_referral_redemption()
-    // in the SQL setup block at the top of this file, which is also the
-    // real enforcement: it's a no-op if this account never applied a code,
-    // and a safe no-op if this exact referral was somehow already finalized
-    // before (so this can never double-credit a referrer or double-count a
-    // redemption, even if this function ever runs twice for the same first
-    // payment). Deliberately fire-and-forget with respect to the UI: if
-    // this call fails, the subscriber's own upgrade has still fully
-    // succeeded above, so we log the failure for debugging rather than
-    // showing the subscriber an error about someone else's reward credit.
-    if (isFirstPayment) {
-      supabase.rpc("finalize_referral_redemption").then(({ error: rewardErr }) => {
-        if (rewardErr) console.error("finalize_referral_redemption failed:", rewardErr);
-      });
-    }
-
     notify(isFirstPayment ? "You're upgraded — thanks for subscribing!" : "Renewed — thanks for staying with us! Your reward credit has reset to 0% for the new billing cycle.");
     return true;
-  }, [authUser, notify]);
+  }, [authUser, notify, currencyCode]);
 
   // Applies a referral/discount code from the Subscribe popup, for an owner
   // who's already signed in, before their first payment (unlike the old
