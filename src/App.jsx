@@ -8519,7 +8519,9 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
 
       {hasSubscribedBefore && rewardCreditPercent > 0 && (
         <div className="rounded-lg px-3 py-2 mb-4 text-xs" style={{ background: "#EAF0E2", color: "var(--primary-dark)" }}>
-          You're earning {rewardCreditPercent}% off from your referrals — it's already reflected in the price above.
+          {rewardCreditPercent >= MAX_REWARD_CREDIT_PERCENT
+            ? `You've hit the maximum reward credit of ${MAX_REWARD_CREDIT_PERCENT}% off for this billing cycle — it's already reflected in the price above. Extra referrals this month won't lower your bill any further, but the credit resets to 0% next cycle so fresh referrals count again then.`
+            : `You're earning ${rewardCreditPercent}% off from your referrals — it's already reflected in the price above.`}
         </div>
       )}
 
@@ -8992,6 +8994,14 @@ function SettingsView({ account, onUpdateField, onLogOut, onDeleteAccount, trial
               <span>Updated remaining bill</span>
               <span>{fmt(updatedRemainingBill)}</span>
             </div>
+            {/* ---- Explicit note once the reward credit has hit the 50%
+                safety cap, so it's visible right on the bill itself and
+                not just in the general explainer text above. ---- */}
+            {rewardCreditPercent >= MAX_REWARD_CREDIT_PERCENT && (
+              <p className="text-[10px] mt-2 pt-2" style={{ color: "var(--primary-dark)", borderTop: "1px dashed var(--line)" }}>
+                You've reached the maximum reward credit ({MAX_REWARD_CREDIT_PERCENT}% off) for this billing cycle. Additional referrals this month won't reduce your bill further — the cap resets to 0% at the start of your next cycle.
+              </p>
+            )}
           </div>
 
           <p className="text-[10px]" style={{ color: "var(--ink-soft)" }}>
