@@ -10392,7 +10392,7 @@ function SettingsView({ account, onUpdateField, onLogOut, onDeleteAccount, onUns
         ) : (
           <div className="space-y-2.5">
             <p className="text-[11px]" style={{ color: "var(--alert)" }}>
-              This will permanently delete your login and business account. Sales, catalog, and other data stored on this device are not affected. Type <b>DELETE</b> to confirm.
+              This will permanently delete your login and all business data tied to this account — catalog, sales history, staff, shifts, and everything else. This cannot be undone. Type <b>DELETE</b> to confirm.
             </p>
             <input
               type="text"
@@ -10549,10 +10549,10 @@ function TermsGuidelinesModal({ onClose }) {
         </Section>
 
         <Section title="Your data">
-          <Point>Your catalog, sales, staff, shifts, and waste logs are stored on this device's browser only — not synced to the cloud or other devices.</Point>
-          <Point>Clearing browser data, losing the device, or switching devices can permanently lose that data. Back it up if you need to keep it.</Point>
+          <Point>Your catalog, sales, staff, shifts, and waste logs are tied to your account, not to any one device — log in from a new phone, tablet, or computer and you'll see the exact same data.</Point>
+          <Point>Each device keeps a temporary local copy so the app stays fast and still works offline — but your account in the cloud is always the real, permanent copy.</Point>
           <Point>Sales history older than {RETENTION_MONTHS} months is purged automatically.</Point>
-          <Point>Deleting your account removes your login, not this device's local data.</Point>
+          <Point>Deleting your account permanently removes your login and all the business data tied to it — this cannot be undone.</Point>
         </Section>
 
         <Section title="Staying logged in">
