@@ -4042,7 +4042,16 @@ export default function CafePOS() {
 
   const historyStats = useMemo(() => {
     const active = historySales.filter((s) => !s.voided);
-    const voided = historySales.filter((s) => s.voided);
+    // Waste is split out from "voided" here because the two mean different
+    // things for the books: a void returns its ingredients to stock (no real
+    // loss, just a correction), while waste means the ingredients are gone —
+    // an actual cost. So a sale that was fully logged to waste isn't counted
+    // in the Voided cards below; its items are counted in the waste cards
+    // instead. Waste is tallied per item (not per order) since that's what
+    // "number of items / total cost" actually needs, and it works correctly
+    // even for orders that mix a void item with a wasted item.
+    const voided = historySales.filter((s) => s.voided && !s.wasteLogged);
+    const wastedItems = historySales.flatMap((s) => s.items.filter((it) => it.wasteLogged));
     return {
       activeCount: active.length,
       activeRevenue: active.reduce((s, x) => s + x.total, 0),
@@ -4050,6 +4059,8 @@ export default function CafePOS() {
       // Fully-voided sales recompute to $0 (nothing active left) — show what
       // was originally charged instead, for an accurate "voided amount" figure.
       voidedRevenue: voided.reduce((s, x) => s + (x.originalTotal ?? x.total), 0),
+      wastedItemCount: wastedItems.reduce((s, it) => s + it.qty, 0),
+      wastedCost: +wastedItems.reduce((s, it) => s + (it.cost || 0) * it.qty, 0).toFixed(2),
     };
   }, [historySales]);
 
@@ -6795,11 +6806,15 @@ function SalesHistoryView({
         rangeEnd={historyRangeEnd} setRangeEnd={setHistoryRangeEnd}
       />
 
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-6">
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-3">
         <Stat label="Active sales" value={stats.activeCount} />
         <Stat label="Active revenue" value={money(stats.activeRevenue)} accent />
         <Stat label="Voided sales" value={stats.voidedCount} />
         <Stat label="Voided amount" value={money(stats.voidedRevenue)} />
+      </div>
+      <div className="grid grid-cols-2 gap-3 mb-6">
+        <Stat label="Items logged to waste" value={stats.wastedItemCount} />
+        <Stat label="Waste cost" value={money(stats.wastedCost)} />
       </div>
 
       {sales.length === 0 ? (
