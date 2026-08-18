@@ -1592,6 +1592,7 @@ export default function CafePOS() {
   const [historyRangeStart, setHistoryRangeStart] = useState(todayKey());
   const [historyRangeEnd, setHistoryRangeEnd] = useState(todayKey());
   const [voidModal, setVoidModal] = useState(null); // sale being voided
+  const [wasteSaleModal, setWasteSaleModal] = useState(null); // sale being logged to waste
   const [restoreModal, setRestoreModal] = useState(null); // sale being restored (needs manager approval)
   const [detailSale, setDetailSale] = useState(null); // sale being viewed in detail
   const [restockId, setRestockId] = useState(null);
@@ -2226,7 +2227,7 @@ export default function CafePOS() {
   // apply it immediately if they'd rather not wait.
   const isQuietMoment = () =>
     cart.length === 0 &&
-    !ingModal && !prodModal && !receipt && !voidModal && !restoreModal &&
+    !ingModal && !prodModal && !receipt && !voidModal && !wasteSaleModal && !restoreModal &&
     !catModal && !parkModalOpen && !settleTabTarget && !employeeModal &&
     !detailSale && !restockId && !checkoutError;
 
@@ -2242,7 +2243,7 @@ export default function CafePOS() {
     return () => clearInterval(interval);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
-    updateWaitingToApply, cart, ingModal, prodModal, receipt, voidModal,
+    updateWaitingToApply, cart, ingModal, prodModal, receipt, voidModal, wasteSaleModal,
     restoreModal, catModal, parkModalOpen, settleTabTarget, employeeModal,
     detailSale, restockId, checkoutError,
   ]);
@@ -3647,7 +3648,18 @@ export default function CafePOS() {
       return;
     }
 
-    const wantsRestore = new Set(restoreIndices.filter((idx) => itemIsVoided(sale, sale.items[idx])));
+    // Items voided via "Log to waste" never had their ingredients returned to
+    // stock (they were recorded as waste instead), so they can't go through
+    // the ordinary restore path — that would deduct stock a second time for
+    // ingredients that were only ever taken out once. Silently drop them here
+    // and let the caller know, same as a stock-shortage block below.
+    const blockedWasted = restoreIndices.filter((idx) => sale.items[idx]?.wasted && itemIsVoided(sale, sale.items[idx]));
+    if (blockedWasted.length > 0) {
+      notify("Can't restore item(s) already logged to waste — that's final.", "err");
+    }
+    const wantsRestore = new Set(
+      restoreIndices.filter((idx) => itemIsVoided(sale, sale.items[idx]) && !sale.items[idx]?.wasted)
+    );
     const restoreNeeds = {};
     wantsRestore.forEach((idx) => {
       const it = sale.items[idx];
@@ -3732,6 +3744,100 @@ export default function CafePOS() {
     const sale = sales.find((s) => s.id === id);
     if (!sale) return;
     applySaleItemChanges(id, { restoreIndices: sale.items.map((_, i) => i), approvedById, approvedByName });
+  };
+
+  // ---------- Log (voided) sale items to waste ----------
+  // Same approval gate as void, but for the case where the food was already
+  // prepped/cooked and physically can't go back on the shelf — e.g. the
+  // wrong order got made. Items are voided (removed from revenue, just like
+  // a normal void) but their ingredients are NOT returned to stock; instead
+  // one waste-log entry per ingredient is recorded (mirroring logProductWaste
+  // in ---------- Waste / spoilage ---------- above), tied together with a
+  // batchId and back to this sale via saleId/orderNo so Inventory's waste log
+  // and Reports' waste totals pick it up automatically. Items logged this way
+  // are flagged `wasted: true` so they can't later be un-done through the
+  // ordinary Restore flow (see the `wasted` guard in applySaleItemChanges).
+  const applySaleItemWaste = (id, { wasteIndices = [], reason, note, approvedById, approvedByName }) => {
+    const sale = sales.find((s) => s.id === id);
+    if (!sale) return;
+    const indices = wasteIndices.filter((idx) => !itemIsVoided(sale, sale.items[idx]));
+    if (indices.length === 0) return;
+    if (!approvedByName) {
+      notify("Logging to waste requires manager approval.", "err");
+      return;
+    }
+
+    const now = Date.now();
+    const byId = currentEmployee?.id || null;
+    const byName = currentEmployee?.name || "Unassigned";
+    const batchId = uid("wbatch");
+    const trimmedNote = (note || "").trim();
+    const entries = [];
+
+    const items = sale.items.map((it, idx) => {
+      if (!indices.includes(idx)) return it;
+      (it.recipe || []).forEach((r) => {
+        const ing = ingredientMap[r.ingredientId];
+        const amt = +(r.amount * it.qty).toFixed(4);
+        entries.push({
+          id: uid("waste"),
+          timestamp: now,
+          batchId,
+          ingredientId: r.ingredientId,
+          ingredientName: ing?.name || "Deleted ingredient",
+          unit: ing?.unit || "",
+          amount: amt,
+          reason: reason || WASTE_REASONS[0],
+          note: trimmedNote,
+          cost: ing ? +(ing.cost * amt).toFixed(2) : 0,
+          loggedById: byId,
+          loggedByName: byName,
+          productId: it.productId || null,
+          productName: it.name,
+          productQty: it.qty,
+          saleId: sale.id,
+          orderNo: sale.orderNo,
+        });
+      });
+      return {
+        ...it,
+        voided: true,
+        wasted: true,
+        voidReason: reason,
+        voidNote: trimmedNote,
+        voidedAt: now,
+        voidedById: byId,
+        voidedByName: byName,
+      };
+    });
+
+    const updated = {
+      ...recomputeSaleTotals({ ...sale, items }),
+      voidReason: reason,
+      voidNote: trimmedNote,
+      voidedAt: now,
+      voidedById: byId,
+      voidedByName: byName,
+      approvedById: approvedById || null,
+      approvedByName: approvedByName || null,
+      wasted: true,
+    };
+
+    persistSales(sales.map((s) => (s.id === id ? updated : s)));
+    if (entries.length) persistWaste([...wasteLogs, ...entries]);
+    notify(
+      updated.voided
+        ? "Order logged to waste — ingredients recorded as waste, not returned to stock."
+        : "Item(s) logged to waste — order total updated, ingredients recorded as waste."
+    );
+  };
+
+  // Quick full-order action for the simple "Log to waste" button in history.
+  const logSaleToWaste = (id, reason, note, approvedById, approvedByName) => {
+    const sale = sales.find((s) => s.id === id);
+    if (!sale) return;
+    const wasteIndices = sale.items.map((_, i) => i).filter((i) => !itemIsVoided(sale, sale.items[i]));
+    applySaleItemWaste(id, { wasteIndices, reason, note, approvedById, approvedByName });
   };
 
   // ---------- Kitchen board ----------
@@ -4257,6 +4363,7 @@ export default function CafePOS() {
             sales={historySales}
             stats={historyStats}
             openVoid={(sale) => setVoidModal(sale)}
+            openWasteSale={(sale) => setWasteSaleModal(sale)}
             openRestore={(sale) => setRestoreModal(sale)}
             detailSale={detailSale}
             setDetailSale={setDetailSale}
@@ -4402,6 +4509,17 @@ export default function CafePOS() {
           onConfirm={(voidIndices, restoreIndices, reason, note, approvedById, approvedByName) => {
             applySaleItemChanges(voidModal.id, { voidIndices, restoreIndices, reason, note, approvedById, approvedByName });
             setVoidModal(null);
+          }}
+        />
+      )}
+      {wasteSaleModal && (
+        <WasteSaleModal
+          sale={wasteSaleModal}
+          approverOptions={approverOptions}
+          onClose={() => setWasteSaleModal(null)}
+          onConfirm={(wasteIndices, reason, note, approvedById, approvedByName) => {
+            applySaleItemWaste(wasteSaleModal.id, { wasteIndices, reason, note, approvedById, approvedByName });
+            setWasteSaleModal(null);
           }}
         />
       )}
@@ -6458,6 +6576,110 @@ function VoidSaleModal({ sale, approverOptions, onClose, onConfirm }) {
   );
 }
 
+// Like VoidSaleModal, but for the case where the food was already prepped or
+// cooked and physically can't go back on the shelf (e.g. the wrong order got
+// made). Voids the checked items exactly like VoidSaleModal does — they leave
+// Reports the same way — but their ingredients are recorded in the Inventory
+// waste log instead of being returned to stock, and (unlike a normal void)
+// this can't be undone with Restore afterward. Items already voided/restored
+// aren't eligible and show up disabled in the list.
+function WasteSaleModal({ sale, approverOptions, onClose, onConfirm }) {
+  const [reason, setReason] = useState(WASTE_REASONS[0]);
+  const [note, setNote] = useState("");
+  const [approverId, setApproverId] = useState(approverOptions[0]?.id || "");
+  const [pin, setPin] = useState("");
+  const eligible = sale.items.map((it) => !itemIsVoided(sale, it));
+  const [checked, setChecked] = useState(() => eligible.slice());
+  const toggle = (idx) => setChecked((c) => c.map((v, i) => (i === idx ? !v : v)));
+
+  const wasteIndices = checked.reduce((acc, v, i) => (v && eligible[i] ? [...acc, i] : acc), []);
+  const needsNote = reason === "Other" && wasteIndices.length > 0;
+  const approver = approverOptions.find((e) => e.id === approverId) || null;
+  const pinOk = !!approver && !!approver.pin && pin === approver.pin;
+  const multiItem = sale.items.length > 1;
+
+  const submit = () => {
+    if (needsNote && !note.trim()) return;
+    if (!pinOk) return;
+    if (wasteIndices.length === 0) { onClose(); return; }
+    onConfirm(wasteIndices, reason, note.trim(), approver.id, approver.name);
+  };
+
+  return (
+    <ModalWrap onClose={onClose}>
+      <div className="p-5">
+        <h3 className="display-font text-lg mb-1" style={{ fontWeight: 600 }}>
+          {multiItem ? "Log items to waste" : "Log sale to waste"}
+        </h3>
+        <p className="text-xs mb-4" style={{ color: "var(--ink-soft)" }}>
+          Order #{sale.orderNo} · {money(sale.originalTotal ?? sale.total)} · {new Date(sale.timestamp).toLocaleString()}
+        </p>
+
+        {multiItem && (
+          <div className="rounded-lg border mb-4 overflow-hidden" style={{ borderColor: "var(--line)" }}>
+            {sale.items.map((it, idx) => (
+              <label
+                key={idx}
+                className="flex items-center gap-2.5 px-3 py-2 text-sm"
+                style={{
+                  borderBottom: idx < sale.items.length - 1 ? "1px solid var(--line)" : "none",
+                  background: checked[idx] && eligible[idx] ? "#FBF1EC" : "transparent",
+                  opacity: eligible[idx] ? 1 : 0.5,
+                  cursor: eligible[idx] ? "pointer" : "default",
+                }}
+              >
+                <input type="checkbox" checked={checked[idx] && eligible[idx]} disabled={!eligible[idx]} onChange={() => toggle(idx)} />
+                <span className="flex-1">{it.qty} × {it.name}{!eligible[idx] ? " (already voided)" : ""}</span>
+                <span className="mono-font text-xs" style={{ color: "var(--ink-soft)" }}>{money(it.price * it.qty)}</span>
+              </label>
+            ))}
+          </div>
+        )}
+
+        <div className="rounded-lg px-3 py-2 mb-4 text-xs" style={{ background: "var(--bg)", color: "var(--ink-soft)" }}>
+          {multiItem
+            ? "Checked items will be voided and their ingredients recorded as waste — use this when the food was already prepped and can't go back on the shelf. Can't be undone with Restore."
+            : "This sale will stay in Sales History marked as voided, its amount will no longer be counted in Reports, and its ingredients will be recorded as waste instead of returned to stock. Can't be undone with Restore."}
+        </div>
+
+        <ApproverPinField approverOptions={approverOptions} approverId={approverId} setApproverId={setApproverId} pin={pin} setPin={setPin} />
+
+        {wasteIndices.length > 0 && (
+          <div className="space-y-3 mt-3">
+            <Field label="Reason for waste">
+              <select value={reason} onChange={(e) => setReason(e.target.value)} className="w-full border rounded-lg px-3 py-2 text-sm" style={{ borderColor: "var(--line)" }}>
+                {WASTE_REASONS.map((r) => <option key={r} value={r}>{r}</option>)}
+              </select>
+            </Field>
+            <Field label={needsNote ? "Note (required)" : "Note (optional)"}>
+              <textarea
+                value={note}
+                onChange={(e) => setNote(e.target.value)}
+                rows={3}
+                placeholder="Add any details about this waste…"
+                className="w-full border rounded-lg px-3 py-2 text-sm resize-none"
+                style={{ borderColor: "var(--line)" }}
+              />
+            </Field>
+          </div>
+        )}
+
+        <div className="flex gap-2 mt-5">
+          <button onClick={onClose} className="flex-1 py-2 rounded-lg text-sm border" style={{ borderColor: "var(--line)" }}>Cancel</button>
+          <button
+            onClick={submit}
+            disabled={wasteIndices.length === 0 || (needsNote && !note.trim()) || !pinOk}
+            className="flex-1 py-2 rounded-lg text-sm font-medium disabled:opacity-50"
+            style={{ background: "var(--alert)", color: "#fff" }}
+          >
+            {multiItem ? "Log to waste" : "Log sale to waste"}
+          </button>
+        </div>
+      </div>
+    </ModalWrap>
+  );
+}
+
 // Voided orders can only be brought back into Reports with a manager's
 // sign-off — this is a lightweight approval gate for the quick "Restore"
 // action on a fully-voided order (as opposed to the per-item management
@@ -6549,7 +6771,7 @@ function DateFilterBar({ mode, setMode, day, setDay, rangeStart, setRangeStart, 
 function SalesHistoryView({
   historyMode, setHistoryMode, historyDay, setHistoryDay,
   historyRangeStart, setHistoryRangeStart, historyRangeEnd, setHistoryRangeEnd,
-  sales, stats, openVoid, openRestore, detailSale, setDetailSale,
+  sales, stats, openVoid, openWasteSale, openRestore, detailSale, setDetailSale,
 }) {
   return (
     <div>
@@ -6592,7 +6814,7 @@ function SalesHistoryView({
                     )}
                     {s.voided ? (
                       <span className="text-[10px] px-1.5 py-0.5 rounded-full flex items-center gap-1" style={{ background: "#F3E3DC", color: "var(--alert)" }}>
-                        <Ban size={10} /> Voided
+                        {s.wasted ? <Trash2 size={10} /> : <Ban size={10} />} {s.wasted ? "Wasted" : "Voided"}
                       </span>
                     ) : (
                       <span className="text-[10px] px-1.5 py-0.5 rounded-full" style={{ background: "#EAF0E2", color: "var(--primary-dark)" }}>
@@ -6632,15 +6854,24 @@ function SalesHistoryView({
                   <div className={`mono-font font-semibold text-sm ${s.voided ? "line-through" : ""}`} style={{ color: s.voided ? "var(--ink-soft)" : "var(--ink)" }}>
                     {money(s.total)}
                   </div>
-                  <div className="mt-1.5">
+                  <div className="mt-1.5 flex flex-col items-end gap-1.5">
                     {s.voided ? (
-                      <button onClick={() => openRestore(s)} className="flex items-center gap-1 text-xs px-2 py-1 rounded-lg border" style={{ borderColor: "var(--line)", color: "var(--primary-dark)" }}>
-                        <Undo2 size={12} /> Restore
-                      </button>
+                      s.wasted ? (
+                        <span className="text-[11px]" style={{ color: "var(--ink-soft)" }}>Logged to waste — final</span>
+                      ) : (
+                        <button onClick={() => openRestore(s)} className="flex items-center gap-1 text-xs px-2 py-1 rounded-lg border" style={{ borderColor: "var(--line)", color: "var(--primary-dark)" }}>
+                          <Undo2 size={12} /> Restore
+                        </button>
+                      )
                     ) : (
-                      <button onClick={() => openVoid(s)} className="flex items-center gap-1 text-xs px-2 py-1 rounded-lg border" style={{ borderColor: "var(--line)", color: "var(--alert)" }}>
-                        <Ban size={12} /> Void
-                      </button>
+                      <>
+                        <button onClick={() => openVoid(s)} className="flex items-center gap-1 text-xs px-2 py-1 rounded-lg border" style={{ borderColor: "var(--line)", color: "var(--alert)" }}>
+                          <Ban size={12} /> Void
+                        </button>
+                        <button onClick={() => openWasteSale(s)} className="flex items-center gap-1 text-xs px-2 py-1 rounded-lg border" style={{ borderColor: "var(--line)", color: "var(--alert)" }}>
+                          <Trash2 size={12} /> Log to waste
+                        </button>
+                      </>
                     )}
                   </div>
                 </div>
