@@ -6806,15 +6806,18 @@ function SalesHistoryView({
         rangeEnd={historyRangeEnd} setRangeEnd={setHistoryRangeEnd}
       />
 
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-3">
+      <div className="text-xs font-semibold mb-2" style={{ color: "var(--ink-soft)" }}>Sales & voids</div>
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-5">
         <Stat label="Active sales" value={stats.activeCount} />
         <Stat label="Active revenue" value={money(stats.activeRevenue)} accent />
         <Stat label="Voided sales" value={stats.voidedCount} />
         <Stat label="Voided amount" value={money(stats.voidedRevenue)} />
       </div>
+
+      <div className="text-xs font-semibold mb-2" style={{ color: "var(--ink-soft)" }}>Waste</div>
       <div className="grid grid-cols-2 gap-3 mb-6">
         <Stat label="Items logged to waste" value={stats.wastedItemCount} />
-        <Stat label="Waste cost" value={money(stats.wastedCost)} />
+        <Stat label="Total waste amount" value={money(stats.wastedCost)} alert />
       </div>
 
       {sales.length === 0 ? (
@@ -9055,11 +9058,11 @@ function PrintableReport({ periodLabel, stats, lowStock, sales }) {
   );
 }
 
-function Stat({ label, value, accent, small }) {
+function Stat({ label, value, accent, alert, small }) {
   return (
     <div className={`rounded-xl border ${small ? "p-2.5" : "p-3.5"}`} style={{ borderColor: "var(--line)", background: "var(--surface)" }}>
       <div className="text-xs mb-1" style={{ color: "var(--ink-soft)" }}>{label}</div>
-      <div className={`mono-font font-semibold ${small ? "text-sm" : "text-lg"}`} style={{ color: accent ? "var(--accent)" : "var(--ink)" }}>{value}</div>
+      <div className={`mono-font font-semibold ${small ? "text-sm" : "text-lg"}`} style={{ color: alert ? "var(--alert)" : accent ? "var(--accent)" : "var(--ink)" }}>{value}</div>
     </div>
   );
 }
