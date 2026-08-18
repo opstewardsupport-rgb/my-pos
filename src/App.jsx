@@ -6806,18 +6806,11 @@ function SalesHistoryView({
         rangeEnd={historyRangeEnd} setRangeEnd={setHistoryRangeEnd}
       />
 
-      <div className="text-xs font-semibold mb-2" style={{ color: "var(--ink-soft)" }}>Sales & voids</div>
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-5">
-        <Stat label="Active sales" value={stats.activeCount} />
-        <Stat label="Active revenue" value={money(stats.activeRevenue)} accent />
-        <Stat label="Voided sales" value={stats.voidedCount} />
-        <Stat label="Voided amount" value={money(stats.voidedRevenue)} />
-      </div>
-
-      <div className="text-xs font-semibold mb-2" style={{ color: "var(--ink-soft)" }}>Waste</div>
-      <div className="grid grid-cols-2 gap-3 mb-6">
-        <Stat label="Items logged to waste" value={stats.wastedItemCount} />
-        <Stat label="Total waste amount" value={money(stats.wastedCost)} alert />
+      <div className="grid grid-cols-4 gap-3 mb-6">
+        <Stat label="Active sales" value={stats.activeCount} small />
+        <Stat label="Active revenue" value={money(stats.activeRevenue)} accent small />
+        <Stat label="Voided sales" value={stats.voidedCount} small />
+        <Stat label="Total waste amount" value={money(stats.wastedCost)} alert small />
       </div>
 
       {sales.length === 0 ? (
