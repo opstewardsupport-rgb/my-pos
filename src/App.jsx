@@ -91,6 +91,25 @@
    alter table public.businesses
      add column if not exists last_payment_final_amount numeric;
 
+   -- Holds EVERY piece of day-to-day café data as one JSON blob — catalog
+   -- (ingredients/products/categories), sales history, parked tabs,
+   -- currency, employees, the current employee, shifts, the waste log, and
+   -- the order counter. This is what makes logging into the same account
+   -- from a different phone/tablet/computer show the exact same data:
+   -- without it, that data only ever lived in one browser's localStorage
+   -- (see safeGet/safeSet and scopedKey() in the app code), so a second
+   -- device showed nothing. Read/written by fetchPosData()/pushPosData() in
+   -- the app code — see the load effect and the debounced auto-push effect
+   -- right after them for exactly when each runs. A single JSON column
+   -- (rather than a proper table per data type) keeps this to one read and
+   -- one write per sync, and matches the scale of this app: one owner, one
+   -- café, not a multi-tenant dataset that needs to be queried directly in
+   -- SQL. Safe to run even if these columns already exist.
+   alter table public.businesses
+     add column if not exists pos_data jsonb;
+   alter table public.businesses
+     add column if not exists pos_data_updated_at timestamptz;
+
    -- THIS IS THE PIECE THAT WAS MISSING: nothing in this project ever
    -- actually WROTE a referral_code onto a business row — the app and the
    -- redeem_referral() function below only ever READ it. So if you flip an
@@ -1477,14 +1496,17 @@ const UNITS = [
 ];
 const unitLabel = (u) => (UNITS.find((x) => x.id === u) || { id: u }).id || u;
 
-// Café-local data (catalog, sales, shifts, waste log, employee PINs) stays
-// on this device in localStorage — it's operational point-of-sale data, not
-// account data, so there's no need to round-trip it through the network on
-// every keystroke. Only the owner's account, trial, referral and
-// subscription info live in Supabase (see below), so that part works
-// correctly across every device the owner logs into. Every key passed in
-// here is expected to already be scoped per-account via scopedKey() — a
-// null key (no signed-in user yet) is a deliberate no-op, not an error.
+// Café-operational data (catalog, sales, shifts, waste log, employee PINs)
+// is written here, to localStorage, on every change — this is the fast,
+// synchronous, offline-safe copy every screen in the app actually reads
+// from. It is NOT the account's real source of truth, though: the account's
+// row in Supabase is (see fetchPosData/pushPosData and the two effects
+// right after it, further down) — this is purely a local cache that gets
+// mirrored to/from the cloud so the same data follows the owner to any
+// device they log into, the same way their subscription already does.
+// Every key passed in here is expected to already be scoped per-account via
+// scopedKey() — a null key (no signed-in user yet) is a deliberate no-op,
+// not an error.
 async function safeGet(key) {
   if (!key) return null;
   try {
@@ -1625,6 +1647,22 @@ export default function CafePOS() {
   // see the `trialInfo.expired` gate below.
   const [showUpgrade, setShowUpgrade] = useState(false);
 
+  // ---- Cross-device cloud sync bookkeeping (see fetchPosData/pushPosData
+  // and the two effects below) ----
+  // True once the café-data load effect has fully finished for the
+  // CURRENTLY signed-in account — guards the auto-push effect so it never
+  // fires on the render(s) that are just seeding state FROM a fresh load
+  // (which would otherwise immediately re-upload the same data we just
+  // downloaded, or worse, upload an empty/default snapshot over real cloud
+  // data for the instant before the load finishes). Reset to false the
+  // moment the signed-in user id changes, so a second account (or a second
+  // login) in the same browser session is re-armed correctly.
+  const initialLoadDoneRef = useRef(false);
+  // Debounce handle for the auto-push effect — one pending upload at a
+  // time, restarted on every further change, so ten changes in five
+  // seconds becomes one network write instead of ten.
+  const cloudSyncTimerRef = useRef(null);
+
   // Reads the signed-in owner's row from `businesses` and reshapes it for
   // the UI. Returns null if the row doesn't exist yet (e.g. the insert after
   // sign-up hasn't landed) or the request fails.
@@ -1666,9 +1704,11 @@ export default function CafePOS() {
   // above), which is why logging into the same account on a second device
   // showed nothing. These two functions read/write a single JSON blob
   // (`pos_data`) on that same `businesses` row, so the café's real data
-  // travels with the account the same way the subscription already does.
-  // Requires a one-time Supabase migration — see the SQL block near the top
-  // of this file (search "pos_data").
+  // travels with the account the same way the subscription already does —
+  // see the load effect and the debounced auto-push effect further down for
+  // where these two are actually called. Requires a one-time Supabase
+  // migration — see the SQL block near the top of this file (search
+  // "pos_data").
   const fetchPosData = useCallback(async (userId) => {
     if (!userId) return null;
     try {
@@ -1828,13 +1868,35 @@ export default function CafePOS() {
     };
   }, [account]);
 
-  // Loads (or seeds) this ACCOUNT's local café data — catalog, sales,
-  // employees, shifts, waste log, currency, order counter. Re-runs any time
-  // the signed-in user id changes: on login, on logout, and on switching to
-  // a different account in the same browser — each with its own completely
-  // separate bucket of localStorage, via scopedKey() (see its comment near
-  // CATALOG_KEY above). Nothing is read or written to storage until we
-  // actually know which account we're loading for.
+  // Loads (or seeds) this ACCOUNT's café data — catalog, sales, employees,
+  // shifts, waste log, currency, order counter, parked tabs. Re-runs any
+  // time the signed-in user id changes: on login, on logout, and on
+  // switching to a different account in the same browser.
+  //
+  // Cross-device sync: the account's `businesses` row in Supabase (see
+  // fetchPosData/pushPosData above) is the SOURCE OF TRUTH once it has any
+  // data in it — every device that logs into this account loads from there
+  // first, which is what makes "log in on a second phone/tablet/computer
+  // and see the same history" actually work. Local storage (scopedKey(),
+  // safeGet/safeSet) stays in the loop purely as a fast, offline-friendly
+  // cache: it's what every screen actually reads/writes to instantly while
+  // using the app, and it's mirrored down here on every load so the app
+  // still works (read-only, on slightly stale data) with no connection.
+  //
+  // Conflict handling is deliberately simple, matching the scale of a
+  // single-owner café POS rather than a general multi-writer sync engine:
+  // whichever device saves LAST wins. Two devices editing the SAME account
+  // at the exact same moment (e.g. two cashiers ringing up sales on two
+  // registers) can overwrite each other's most recent change — acceptable
+  // for how this app is actually used (one active register at a time), but
+  // worth knowing if you ever expand to multiple simultaneous registers.
+  //
+  // First-ever login for an account (pos_data is still null in the cloud —
+  // e.g. right after sign-up, or an account created before this sync
+  // existed) falls back to whatever's already on THIS device (or fresh
+  // sample data if there's nothing there either), then immediately pushes
+  // that up to the cloud so it becomes the seed every other device loads
+  // from next.
   useEffect(() => {
     const userId = authUser?.id || null;
 
@@ -1854,20 +1916,67 @@ export default function CafePOS() {
       setShifts([]);
       setWasteLogs([]);
       setLoading(true);
+      initialLoadDoneRef.current = false;
       return;
     }
 
+    initialLoadDoneRef.current = false;
+
     (async () => {
       setLoading(true);
-      let cat = await safeGet(scopedKey(CATALOG_KEY, userId));
-      let sal = await safeGet(scopedKey(SALES_KEY, userId));
-      let parked = await safeGet(scopedKey(PARKED_ORDERS_KEY, userId));
-      let cur = await safeGet(scopedKey(CURRENCY_KEY, userId));
-      let emps = await safeGet(scopedKey(EMPLOYEES_KEY, userId));
-      let curEmpId = await safeGet(scopedKey(CURRENT_EMPLOYEE_KEY, userId));
-      let shiftsData = await safeGet(scopedKey(SHIFTS_KEY, userId));
-      let wasteData = await safeGet(scopedKey(WASTE_KEY, userId));
-      let orderCounter = await safeGet(scopedKey(ORDER_COUNTER_KEY, userId));
+
+      const cloud = await fetchPosData(userId);
+      const cloudBlob = cloud?.pos_data || null;
+      // Distinguishes "the cloud genuinely has nothing yet" from "the cloud
+      // has data, but this particular device also happens to be brand new"
+      // — only the former should trigger the local-fallback-then-seed-cloud
+      // path below.
+      const hasCloudData = !!cloudBlob && typeof cloudBlob === "object";
+
+      let cat, sal, parked, cur, emps, curEmpId, shiftsData, wasteData, orderCounter;
+
+      if (hasCloudData) {
+        // Cloud is the source of truth: load from it, and mirror every
+        // field down into local storage so this device has a fresh offline
+        // cache and so the rest of this function (which reads local
+        // storage for anything the cloud blob is missing — e.g. an older
+        // blob saved before a field like parkedOrders existed) sees
+        // consistent data either way.
+        cat = cloudBlob.catalog || null;
+        sal = cloudBlob.sales || null;
+        parked = cloudBlob.parkedOrders || null;
+        cur = cloudBlob.currencyCode || null;
+        emps = cloudBlob.employees || null;
+        curEmpId = cloudBlob.currentEmployeeId || null;
+        shiftsData = cloudBlob.shifts || null;
+        wasteData = cloudBlob.wasteLogs || null;
+        orderCounter = cloudBlob.orderCounter || null;
+        await Promise.all([
+          cat && safeSet(scopedKey(CATALOG_KEY, userId), cat),
+          sal && safeSet(scopedKey(SALES_KEY, userId), sal),
+          parked && safeSet(scopedKey(PARKED_ORDERS_KEY, userId), parked),
+          cur && safeSet(scopedKey(CURRENCY_KEY, userId), cur),
+          emps && safeSet(scopedKey(EMPLOYEES_KEY, userId), emps),
+          curEmpId && safeSet(scopedKey(CURRENT_EMPLOYEE_KEY, userId), curEmpId),
+          shiftsData && safeSet(scopedKey(SHIFTS_KEY, userId), shiftsData),
+          wasteData && safeSet(scopedKey(WASTE_KEY, userId), wasteData),
+          orderCounter && safeSet(scopedKey(ORDER_COUNTER_KEY, userId), orderCounter),
+        ]);
+      } else {
+        // Nothing in the cloud yet for this account — fall back to
+        // whatever's on this device (or seed fresh defaults), exactly like
+        // before cross-device sync existed.
+        cat = await safeGet(scopedKey(CATALOG_KEY, userId));
+        sal = await safeGet(scopedKey(SALES_KEY, userId));
+        parked = await safeGet(scopedKey(PARKED_ORDERS_KEY, userId));
+        cur = await safeGet(scopedKey(CURRENCY_KEY, userId));
+        emps = await safeGet(scopedKey(EMPLOYEES_KEY, userId));
+        curEmpId = await safeGet(scopedKey(CURRENT_EMPLOYEE_KEY, userId));
+        shiftsData = await safeGet(scopedKey(SHIFTS_KEY, userId));
+        wasteData = await safeGet(scopedKey(WASTE_KEY, userId));
+        orderCounter = await safeGet(scopedKey(ORDER_COUNTER_KEY, userId));
+      }
+
       if (!cat) { cat = seedCatalog(); await safeSet(scopedKey(CATALOG_KEY, userId), cat); }
       if (!cat.categories) {
         const found = Array.from(new Set(cat.products.map((p) => p.category)));
@@ -1934,6 +2043,20 @@ export default function CafePOS() {
         orderCounter = maxExisting + 1;
         await safeSet(scopedKey(ORDER_COUNTER_KEY, userId), orderCounter);
       }
+
+      if (!hasCloudData) {
+        // First time this account has ever had café data (fresh sign-up, or
+        // an account that predates cloud sync): seed the cloud now so the
+        // NEXT device that logs into this account finds real data instead
+        // of empty defaults. Awaited so a failure is at least logged, but
+        // never blocks getting into the app on this device either way.
+        pushPosData(userId, {
+          catalog: cat, sales: sal, parkedOrders: parked, currencyCode: cur,
+          employees: emps, currentEmployeeId: curEmpId, shifts: shiftsData,
+          wasteLogs: wasteData, orderCounter,
+        });
+      }
+
       setCatalog(cat);
       setSales(sal);
       setParkedOrders(parked);
@@ -1944,8 +2067,43 @@ export default function CafePOS() {
       setShifts(shiftsData);
       setWasteLogs(wasteData);
       setLoading(false);
+      // Marks the load as complete for THIS account — see the auto-push
+      // effect below, which stays dormant until this flips true so it
+      // never fires on the renders this very function just triggered.
+      initialLoadDoneRef.current = true;
     })();
-  }, [authUser?.id]);
+  }, [authUser?.id, fetchPosData, pushPosData]);
+
+  // Cross-device cloud sync, the other half: whenever any piece of café
+  // data changes — from ANY of the actions throughout this file (a sale,
+  // an edited product, a new employee, a closed shift, ...) — mirror the
+  // full current snapshot up to Supabase after a short pause in activity.
+  // Debounced (rather than firing on every single keystroke/tap) so a
+  // flurry of changes becomes one upload, not dozens. Local storage (see
+  // the persist* functions throughout this file) is still the copy every
+  // screen reads/writes to instantly; this effect is purely the
+  // "eventually mirror it to the cloud too" side of that, so a second
+  // device logging in later sees it (via the load effect above).
+  useEffect(() => {
+    const userId = authUser?.id || null;
+    if (!userId || !initialLoadDoneRef.current) return;
+
+    if (cloudSyncTimerRef.current) clearTimeout(cloudSyncTimerRef.current);
+    cloudSyncTimerRef.current = setTimeout(() => {
+      pushPosData(userId, {
+        catalog, sales, parkedOrders, currencyCode, employees,
+        currentEmployeeId, shifts, wasteLogs, orderCounter: nextOrderNo,
+      });
+    }, 1200);
+
+    return () => {
+      if (cloudSyncTimerRef.current) clearTimeout(cloudSyncTimerRef.current);
+    };
+  }, [
+    authUser?.id, pushPosData,
+    catalog, sales, parkedOrders, currencyCode, employees,
+    currentEmployeeId, shifts, wasteLogs, nextOrderNo,
+  ]);
 
   const changeCurrency = useCallback(async (code) => {
     setCurrencyCode(code);
@@ -3076,7 +3234,7 @@ export default function CafePOS() {
     persistCatalog(nextCatalog);
     persistSales([...sales, sale]);
     setNextOrderNo((n) => n + 1);
-    safeSet(ORDER_COUNTER_KEY, nextOrderNo + 1);
+    safeSet(scopedKey(ORDER_COUNTER_KEY, authUserIdRef.current), nextOrderNo + 1);
     setCart([]);
     setCheckoutError(null);
     setCashReceived("");
@@ -3172,7 +3330,7 @@ export default function CafePOS() {
     };
     persistParkedOrders([...parkedOrders, tab]);
     setNextOrderNo((n) => n + 1);
-    safeSet(ORDER_COUNTER_KEY, nextOrderNo + 1);
+    safeSet(scopedKey(ORDER_COUNTER_KEY, authUserIdRef.current), nextOrderNo + 1);
     setCart([]);
     setCheckoutError(null);
     setParkModalOpen(false);
@@ -3714,11 +3872,20 @@ export default function CafePOS() {
   );
 
   const resetAll = async () => {
+    // Was writing to the four UNSCOPED keys (e.g. plain "cafe_pos_catalog_v1"
+    // instead of that same key suffixed with this account's id via
+    // scopedKey()) — meaning a reset here saved into a bucket no other part
+    // of the app ever reads from, and the account's REAL catalog/sales/
+    // shifts/waste data in cloud storage was never touched at all. Fixed to
+    // use the same scoped keys as every other write in this file, so a
+    // reset here is a reset everywhere the account is used, including on
+    // other devices (see the auto-push effect above, which mirrors this to
+    // the cloud once state updates below).
     const cat = seedCatalog();
-    await safeSet(CATALOG_KEY, cat);
-    await safeSet(SALES_KEY, []);
-    await safeSet(SHIFTS_KEY, []);
-    await safeSet(WASTE_KEY, []);
+    await safeSet(scopedKey(CATALOG_KEY, authUserIdRef.current), cat);
+    await safeSet(scopedKey(SALES_KEY, authUserIdRef.current), []);
+    await safeSet(scopedKey(SHIFTS_KEY, authUserIdRef.current), []);
+    await safeSet(scopedKey(WASTE_KEY, authUserIdRef.current), []);
     setCatalog(cat);
     setSales([]);
     setShifts([]);
@@ -4961,6 +5128,22 @@ function POSView({
   nextOrderNo, openParkModal,
 }) {
   const [cameraOpen, setCameraOpen] = useState(false);
+  // Which split-payment line (if any) the on-screen numeric keypad below is
+  // currently wired to — see the "By amount" split rendering further down.
+  // Only ever points at a CASH leg that isn't the last one (the last leg is
+  // always "rest of total", never manually typed — see isLastAmount there),
+  // since that's the only kind of split field this keypad makes sense for.
+  const [activeSplitLeg, setActiveSplitLeg] = useState(null);
+  const splitLegNeedsKeypad = (idx) => splitPayments[idx]?.method === "cash" && idx !== splitPayments.length - 1;
+  // Falls back to the first qualifying cash leg automatically (so the
+  // keypad shows up without the cashier having to tap the field first,
+  // matching how the plain "Cash" payment method's keypad is always
+  // visible) whenever the explicitly-tapped leg no longer qualifies —
+  // e.g. its method was just switched to "online", or it was removed.
+  const effectiveSplitLeg = splitLegNeedsKeypad(activeSplitLeg)
+    ? activeSplitLeg
+    : splitPayments.findIndex((_, i) => splitLegNeedsKeypad(i));
+
   const cats = [{ id: "all", label: "All" }, ...categories.map((c) => ({ id: c.id, label: c.name }))];
 
   // Project what this cart would leave in stock, so a barista sees a warning
@@ -5209,8 +5392,10 @@ function POSView({
                     <div className="space-y-1.5">
                       {splitPaymentsResolved.map((line, idx) => {
                         const isLastAmount = splitMode === "amount" && idx === splitPayments.length - 1;
+                        const showKeypadHere = splitMode === "amount" && !isLastAmount && line.method === "cash" && idx === effectiveSplitLeg;
                         return (
-                          <div key={idx} className="flex items-center gap-1.5">
+                          <div key={idx}>
+                          <div className="flex items-center gap-1.5">
                             <div className="flex rounded-lg border overflow-hidden shrink-0" style={{ borderColor: "var(--line)" }}>
                               <button
                                 type="button"
@@ -5242,6 +5427,26 @@ function POSView({
                                 <span className="flex-1 text-xs" style={{ color: "var(--ink-soft)" }}>
                                   {line.method === "cash" ? "Cash" : "Online"} (rest of total)
                                 </span>
+                              ) : line.method === "cash" ? (
+                                // Cash legs use the same read-only + on-screen-keypad
+                                // pattern as the plain "Cash" payment method (see
+                                // NumericKeypad below and the one under the main
+                                // Cash tab) — inputMode="none" keeps the device's
+                                // own number keyboard from popping up and fighting
+                                // the on-screen one for space.
+                                <input
+                                  type="text"
+                                  inputMode="none"
+                                  readOnly
+                                  value={splitPayments[idx].amount}
+                                  onClick={() => setActiveSplitLeg(idx)}
+                                  onFocus={() => setActiveSplitLeg(idx)}
+                                  placeholder={`Payment ${idx + 1} amount`}
+                                  className="flex-1 min-w-0 border rounded-lg px-2.5 py-1.5 text-xs mono-font"
+                                  style={{
+                                    borderColor: idx === effectiveSplitLeg ? "var(--primary)" : "var(--line)",
+                                  }}
+                                />
                               ) : (
                                 <input
                                   type="number"
@@ -5267,6 +5472,13 @@ function POSView({
                                 <X size={12} color="var(--ink-soft)" />
                               </button>
                             )}
+                          </div>
+                          {showKeypadHere && (
+                            <NumericKeypad
+                              value={splitPayments[idx].amount}
+                              onChange={(v) => updateSplitAmount(idx, v)}
+                            />
+                          )}
                           </div>
                         );
                       })}
@@ -6773,6 +6985,8 @@ function SettleTabModal({ tab, onClose, onConfirm }) {
   const [proofProcessing, setProofProcessing] = useState(false);
   const [cameraOpen, setCameraOpen] = useState(false);
   const [error, setError] = useState(null);
+  // Same as POSView's activeSplitLeg — see its comment there.
+  const [activeSplitLeg, setActiveSplitLeg] = useState(null);
 
   const subtotal = tab.items.reduce((s, it) => s + it.price * it.qty, 0);
   const discountAmount = useMemo(() => {
@@ -6805,6 +7019,10 @@ function SettleTabModal({ tab, onClose, onConfirm }) {
   };
   const updateSplitMethod = (idx, method) => setSplitPayments((prev) => prev.map((p, i) => (i === idx ? { ...p, method } : p)));
   const updateSplitAmount = (idx, amount) => setSplitPayments((prev) => prev.map((p, i) => (i === idx ? { ...p, amount } : p)));
+  const splitLegNeedsKeypad = (idx) => splitPayments[idx]?.method === "cash" && idx !== splitPayments.length - 1;
+  const effectiveSplitLeg = splitLegNeedsKeypad(activeSplitLeg)
+    ? activeSplitLeg
+    : splitPayments.findIndex((_, i) => splitLegNeedsKeypad(i));
 
   const uploadProof = async (file) => {
     if (!file) return;
@@ -6968,8 +7186,12 @@ function SettleTabModal({ tab, onClose, onConfirm }) {
 
           {paymentMethod === "split" && (
             <div className="mb-3 space-y-2">
-              {splitPayments.map((p, idx) => (
-                <div key={idx} className="flex items-center gap-2">
+              {splitPayments.map((p, idx) => {
+                const isLast = idx === splitPayments.length - 1;
+                const showKeypadHere = !isLast && p.method === "cash" && idx === effectiveSplitLeg;
+                return (
+                <div key={idx}>
+                <div className="flex items-center gap-2">
                   <select
                     value={p.method}
                     onChange={(e) => updateSplitMethod(idx, e.target.value)}
@@ -6979,20 +7201,42 @@ function SettleTabModal({ tab, onClose, onConfirm }) {
                     <option value="cash">Cash</option>
                     <option value="online">Online</option>
                   </select>
-                  <input
-                    type="number"
-                    value={idx === splitPayments.length - 1 ? "" : p.amount}
-                    disabled={idx === splitPayments.length - 1}
-                    onChange={(e) => updateSplitAmount(idx, e.target.value)}
-                    placeholder={idx === splitPayments.length - 1 ? `${money(splitResolved[idx]?.amount || 0)} (remainder)` : "Amount"}
-                    className="flex-1 border rounded-lg px-2 py-1.5 text-xs disabled:opacity-60 min-w-0"
-                    style={{ borderColor: "var(--line)" }}
-                  />
+                  {!isLast && p.method === "cash" ? (
+                    // Same read-only + on-screen-keypad pattern as the plain
+                    // "Cash" payment method above — inputMode="none" keeps
+                    // the device's own number keyboard out of the way.
+                    <input
+                      type="text"
+                      inputMode="none"
+                      readOnly
+                      value={p.amount}
+                      onClick={() => setActiveSplitLeg(idx)}
+                      onFocus={() => setActiveSplitLeg(idx)}
+                      placeholder="Amount"
+                      className="flex-1 border rounded-lg px-2 py-1.5 text-xs min-w-0"
+                      style={{ borderColor: idx === effectiveSplitLeg ? "var(--primary)" : "var(--line)" }}
+                    />
+                  ) : (
+                    <input
+                      type="number"
+                      value={isLast ? "" : p.amount}
+                      disabled={isLast}
+                      onChange={(e) => updateSplitAmount(idx, e.target.value)}
+                      placeholder={isLast ? `${money(splitResolved[idx]?.amount || 0)} (remainder)` : "Amount"}
+                      className="flex-1 border rounded-lg px-2 py-1.5 text-xs disabled:opacity-60 min-w-0"
+                      style={{ borderColor: "var(--line)" }}
+                    />
+                  )}
                   {splitPayments.length > 2 && (
                     <button onClick={() => removeSplitLine(idx)} className="shrink-0"><X size={13} color="var(--ink-soft)" /></button>
                   )}
                 </div>
-              ))}
+                {showKeypadHere && (
+                  <NumericKeypad value={p.amount} onChange={(v) => updateSplitAmount(idx, v)} />
+                )}
+                </div>
+                );
+              })}
               <button onClick={addSplitLine} className="text-xs flex items-center gap-1" style={{ color: "var(--primary)" }}>
                 <Plus size={12} /> Add another payment
               </button>
