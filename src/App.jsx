@@ -1671,6 +1671,15 @@ export default function CafePOS() {
   // time, restarted on every further change, so ten changes in five
   // seconds becomes one network write instead of ten.
   const cloudSyncTimerRef = useRef(null);
+  // NEW — handle for the silent auto-retry loop: whenever a push to the
+  // cloud fails, this fires performCloudSync() again after a short pause,
+  // and keeps doing so until a push finally succeeds. Cleared the moment a
+  // push succeeds, a new change arrives, or the owner logs out.
+  const cloudRetryTimerRef = useRef(null);
+  // NEW — always holds the most recent snapshot of café data that needs to
+  // go to the cloud. Read by performCloudSync() so a retry always sends the
+  // latest data, never a stale copy from when the failure first happened.
+  const cloudSyncPayloadRef = useRef(null);
 
   // Reads the signed-in owner's row from `businesses` and reshapes it for
   // the UI. Returns null if the row doesn't exist yet (e.g. the insert after
@@ -2083,6 +2092,39 @@ export default function CafePOS() {
     })();
   }, [authUser?.id, fetchPosData, pushPosData]);
 
+  const notify = useCallback((msg, type = "ok") => {
+    setToast({ msg, type });
+    setTimeout(() => setToast(null), 2600);
+  }, []);
+
+  // NEW — does one actual push attempt to Supabase using whatever's
+  // currently sitting in cloudSyncPayloadRef. On success, marks the badge
+  // "synced" and cancels any pending retry. On failure, marks the badge
+  // "error" and quietly schedules another attempt 15–20 seconds later
+  // (randomized so many devices retrying at once don't all hit the server
+  // in the same instant) — no toast, no interruption, it just keeps trying
+  // in the background until it succeeds. Also used directly by the "Retry
+  // now" tap on the red sync badge, and by the debounced effect below.
+  const performCloudSync = useCallback(() => {
+    const userId = authUserIdRef.current;
+    if (!userId || !cloudSyncPayloadRef.current) return;
+    if (cloudRetryTimerRef.current) {
+      clearTimeout(cloudRetryTimerRef.current);
+      cloudRetryTimerRef.current = null;
+    }
+    setSyncStatus("syncing");
+    pushPosData(userId, cloudSyncPayloadRef.current).then((ok) => {
+      if (ok) {
+        setSyncStatus("synced");
+        setLastSyncedAt(Date.now());
+      } else {
+        setSyncStatus("error");
+        const jitterMs = 15000 + Math.random() * 5000; // 15–20 seconds
+        cloudRetryTimerRef.current = setTimeout(performCloudSync, jitterMs);
+      }
+    });
+  }, [pushPosData]);
+
   // Cross-device cloud sync, the other half: whenever any piece of café
   // data changes — from ANY of the actions throughout this file (a sale,
   // an edited product, a new employee, a closed shift, ...) — mirror the
@@ -2093,34 +2135,91 @@ export default function CafePOS() {
   // screen reads/writes to instantly; this effect is purely the
   // "eventually mirror it to the cloud too" side of that, so a second
   // device logging in later sees it (via the load effect above).
+  //
+  // NEW: the actual push now goes through performCloudSync() above, which
+  // silently keeps retrying every 15–20s if it fails, instead of giving up
+  // after one attempt.
   useEffect(() => {
     const userId = authUser?.id || null;
     if (!userId || !initialLoadDoneRef.current) return;
 
+    // NEW — keep the latest snapshot ready for performCloudSync() to read,
+    // whether it's called from this debounce, a manual retry tap, or the
+    // silent retry loop.
+    cloudSyncPayloadRef.current = {
+      catalog, sales, parkedOrders, currencyCode, employees,
+      currentEmployeeId, shifts, wasteLogs, orderCounter: nextOrderNo,
+    };
+
     if (cloudSyncTimerRef.current) clearTimeout(cloudSyncTimerRef.current);
-    cloudSyncTimerRef.current = setTimeout(() => {
-      setSyncStatus("syncing");
-      pushPosData(userId, {
-        catalog, sales, parkedOrders, currencyCode, employees,
-        currentEmployeeId, shifts, wasteLogs, orderCounter: nextOrderNo,
-      }).then((ok) => {
-        if (ok) {
-          setSyncStatus("synced");
-          setLastSyncedAt(Date.now());
-        } else {
-          setSyncStatus("error");
-        }
-      });
-    }, 1200);
+    // NEW — a fresh change supersedes any retry that was already scheduled
+    // for older data; the debounce below will kick off a sync with the
+    // latest snapshot instead.
+    if (cloudRetryTimerRef.current) {
+      clearTimeout(cloudRetryTimerRef.current);
+      cloudRetryTimerRef.current = null;
+    }
+    cloudSyncTimerRef.current = setTimeout(performCloudSync, 1200);
 
     return () => {
       if (cloudSyncTimerRef.current) clearTimeout(cloudSyncTimerRef.current);
     };
   }, [
-    authUser?.id, pushPosData,
+    authUser?.id, performCloudSync,
     catalog, sales, parkedOrders, currencyCode, employees,
     currentEmployeeId, shifts, wasteLogs, nextOrderNo,
   ]);
+
+  // NEW — stop the silent retry loop if the owner logs out mid-retry, so it
+  // doesn't keep trying to push a signed-out account's data in the background.
+  useEffect(() => {
+    if (!authUser?.id && cloudRetryTimerRef.current) {
+      clearTimeout(cloudRetryTimerRef.current);
+      cloudRetryTimerRef.current = null;
+    }
+  }, [authUser?.id]);
+
+  // NEW — manual "Refresh" button: unlike the sync above (which only ever
+  // sends THIS device's changes up), this pulls the latest data down from
+  // the cloud and applies it here. This is what a cashier taps after using
+  // the account on a different phone/tablet/computer and wanting to see
+  // those changes on this device right away, instead of waiting for their
+  // next natural reload.
+  const refreshFromCloud = useCallback(async () => {
+    const userId = authUserIdRef.current;
+    if (!userId) return;
+    setSyncStatus("syncing");
+    const cloud = await fetchPosData(userId);
+    const cloudBlob = cloud?.pos_data || null;
+    if (cloudBlob && typeof cloudBlob === "object") {
+      if (cloudBlob.catalog) setCatalog(cloudBlob.catalog);
+      if (cloudBlob.sales) setSales(purgeOldSales(cloudBlob.sales));
+      if (cloudBlob.parkedOrders) setParkedOrders(cloudBlob.parkedOrders);
+      if (cloudBlob.currencyCode) setCurrencyCode(cloudBlob.currencyCode);
+      if (cloudBlob.employees) setEmployees(cloudBlob.employees);
+      if (cloudBlob.currentEmployeeId) setCurrentEmployeeId(cloudBlob.currentEmployeeId);
+      if (cloudBlob.shifts) setShifts(cloudBlob.shifts);
+      if (cloudBlob.wasteLogs) setWasteLogs(cloudBlob.wasteLogs);
+      if (cloudBlob.orderCounter) setNextOrderNo(cloudBlob.orderCounter);
+      await Promise.all([
+        cloudBlob.catalog && safeSet(scopedKey(CATALOG_KEY, userId), cloudBlob.catalog),
+        cloudBlob.sales && safeSet(scopedKey(SALES_KEY, userId), cloudBlob.sales),
+        cloudBlob.parkedOrders && safeSet(scopedKey(PARKED_ORDERS_KEY, userId), cloudBlob.parkedOrders),
+        cloudBlob.currencyCode && safeSet(scopedKey(CURRENCY_KEY, userId), cloudBlob.currencyCode),
+        cloudBlob.employees && safeSet(scopedKey(EMPLOYEES_KEY, userId), cloudBlob.employees),
+        cloudBlob.currentEmployeeId && safeSet(scopedKey(CURRENT_EMPLOYEE_KEY, userId), cloudBlob.currentEmployeeId),
+        cloudBlob.shifts && safeSet(scopedKey(SHIFTS_KEY, userId), cloudBlob.shifts),
+        cloudBlob.wasteLogs && safeSet(scopedKey(WASTE_KEY, userId), cloudBlob.wasteLogs),
+        cloudBlob.orderCounter && safeSet(scopedKey(ORDER_COUNTER_KEY, userId), cloudBlob.orderCounter),
+      ]);
+      setSyncStatus("synced");
+      setLastSyncedAt(Date.now());
+      notify("Synced with your other devices.");
+    } else {
+      setSyncStatus("error");
+      notify("Couldn't refresh — check your connection and try again.", "err");
+    }
+  }, [fetchPosData, notify]);
 
   const changeCurrency = useCallback(async (code) => {
     setCurrencyCode(code);
@@ -2129,11 +2228,6 @@ export default function CafePOS() {
   }, []);
 
   CURRENT_SYMBOL = (CURRENCIES.find((c) => c.code === currencyCode) || CURRENCIES[0]).symbol;
-
-  const notify = useCallback((msg, type = "ok") => {
-    setToast({ msg, type });
-    setTimeout(() => setToast(null), 2600);
-  }, []);
 
   // Once a new version has taken over in the background (see useAppUpdate
   // above), don't reload immediately — wait until the register is actually
@@ -4026,6 +4120,8 @@ export default function CafePOS() {
         openEmployeeModal={() => setEmployeeModal(true)}
         syncStatus={syncStatus}
         lastSyncedAt={lastSyncedAt}
+        onRetrySync={performCloudSync}
+        onRefresh={refreshFromCloud}
       />
       <Nav view={view} setView={setView} lowCount={lowStock.length} shiftOpen={!!activeShift} kitchenCount={kitchenPreparing.length} tabsCount={parkedOrders.length} />
 
@@ -4792,7 +4888,7 @@ function UpdateBanner({ onRefreshNow }) {
 // dot + one word, not a banner or popup. "idle" (nothing pushed yet this
 // session, e.g. right after login) renders nothing, since there's nothing
 // meaningful to report yet.
-function SyncStatusBadge({ status, lastSyncedAt }) {
+function SyncStatusBadge({ status, lastSyncedAt, onRetry }) {
   if (!status || status === "idle") return null;
 
   const timeAgoLabel = (ts) => {
@@ -4809,19 +4905,36 @@ function SyncStatusBadge({ status, lastSyncedAt }) {
   const config = {
     syncing: { color: "var(--ink-soft)", dot: "#B7B0A6", label: "Syncing…" },
     synced: { color: "var(--ink-soft)", dot: "#4C9A6A", label: lastSyncedAt ? `Synced ${timeAgoLabel(lastSyncedAt)}` : "Synced" },
-    error: { color: "var(--alert)", dot: "var(--alert)", label: "Not synced — check connection" },
+    // NEW — shorter label since "Retry now" is appended in the button below.
+    error: { color: "var(--alert)", dot: "var(--alert)", label: "Not synced" },
   }[status];
   if (!config) return null;
+
+  // NEW — the app is already quietly retrying this in the background every
+  // 15–20 seconds on its own (see performCloudSync in the main component).
+  // This turns the red badge into a real button so a cashier can force an
+  // immediate retry instead of waiting for the next automatic attempt.
+  // Shown on all screen sizes (not just sm+) since a failed sync is worth
+  // surfacing on a phone too, not just hidden on mobile.
+  if (status === "error") {
+    return (
+      <button
+        onClick={onRetry}
+        className="flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-full border font-medium"
+        style={{ borderColor: "var(--alert)", color: "var(--alert)", background: "#F3E3DC" }}
+        title="Your last change couldn't be saved to the cloud. We're quietly retrying every 15–20 seconds in the background — tap to retry right now instead."
+      >
+        <span style={{ width: 6, height: 6, borderRadius: "50%", background: "var(--alert)", flexShrink: 0 }} />
+        {config.label} · Retry now
+      </button>
+    );
+  }
 
   return (
     <span
       className="hidden sm:flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-full border"
       style={{ borderColor: "var(--line)", color: config.color, background: "var(--surface)" }}
-      title={
-        status === "error"
-          ? "Your last change couldn't be saved to the cloud. It's safe on this device, but won't show up on other devices until this succeeds — check your internet connection."
-          : "Your data is backed up to the cloud and will show up on any device you log into."
-      }
+      title="Your data is backed up to the cloud and will show up on any device you log into."
     >
       <span
         style={{
@@ -4834,7 +4947,7 @@ function SyncStatusBadge({ status, lastSyncedAt }) {
   );
 }
 
-function Header({ businessName, low, confirmReset, setConfirmReset, resetAll, currencyCode, changeCurrency, employees, currentEmployee, selectEmployee, openEmployeeModal, syncStatus, lastSyncedAt }) {
+function Header({ businessName, low, confirmReset, setConfirmReset, resetAll, currencyCode, changeCurrency, employees, currentEmployee, selectEmployee, openEmployeeModal, syncStatus, lastSyncedAt, onRetrySync, onRefresh }) {
   return (
     <header className="max-w-6xl mx-auto px-4 sm:px-6 pt-6 pb-3 flex items-start justify-between no-print">
       <div>
@@ -4877,7 +4990,20 @@ function Header({ businessName, low, confirmReset, setConfirmReset, resetAll, cu
           {(CURRENCIES.find((c) => c.code === currencyCode) || CURRENCIES[0]).code}{" "}
           {(CURRENCIES.find((c) => c.code === currencyCode) || CURRENCIES[0]).symbol}
         </span>
-        {syncStatus !== undefined && <SyncStatusBadge status={syncStatus} lastSyncedAt={lastSyncedAt} />}
+        {syncStatus !== undefined && (
+          <SyncStatusBadge status={syncStatus} lastSyncedAt={lastSyncedAt} onRetry={onRetrySync} />
+        )}
+        {onRefresh && (
+          <button
+            onClick={onRefresh}
+            disabled={syncStatus === "syncing"}
+            className="flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-full border disabled:opacity-50"
+            style={{ borderColor: "var(--line)", color: "var(--ink-soft)" }}
+            title="Pull the latest data from your account — use this if you made changes on another device"
+          >
+            <RefreshCw size={12} className={syncStatus === "syncing" ? "animate-spin" : ""} /> Refresh
+          </button>
+        )}
         <button
           onClick={() => (confirmReset ? resetAll() : setConfirmReset(true))}
           onBlur={() => setConfirmReset(false)}
