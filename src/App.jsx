@@ -1426,7 +1426,7 @@ const saleOnlineAmount = (sale) =>
     ? sale.payments.filter((p) => p.method === "online").reduce((s, p) => s + p.amount, 0)
     : sale.paymentMethod === "online" ? sale.total : 0;
 
-const WASTE_REASONS = ["Spoilage", "Breakage", "Staff meal", "Other"];
+const WASTE_REASONS = ["Spoilage", "Breakage", "Staff meal", "Wrong order", "Other"];
 
 function seedCatalog() {
   const ing = (name, unit, stock, low, cost) => ({ id: uid("ing"), name, unit, stock, low, cost });
