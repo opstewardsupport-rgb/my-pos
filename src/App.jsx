@@ -2098,6 +2098,8 @@ export default function CafePOS() {
     setTimeout(() => setToast(null), 2600);
   }, []);
 
+  const thermalPrinter = useThermalPrinter(notify);
+
   // NEW — does one actual push attempt to Supabase using whatever's
   // currently sitting in cloudSyncPayloadRef. On success, marks the badge
   // "synced" and cancels any pending retry. On failure, marks the badge
@@ -4407,6 +4409,7 @@ export default function CafePOS() {
             trialInfo={trialInfo}
             currencyCode={currencyCode}
             openUpgrade={() => setShowUpgrade(true)}
+            thermalPrinter={thermalPrinter}
           />
         )}
       </main>
@@ -4491,8 +4494,8 @@ export default function CafePOS() {
           onConfirm={confirmHandoff}
         />
       )}
-      {receipt && <ReceiptModal sale={receipt} onClose={() => setReceipt(null)} />}
-      {detailSale && <ReceiptModal sale={detailSale} onClose={() => setDetailSale(null)} closeLabel="Close" />}
+      {receipt && <ReceiptModal sale={receipt} onClose={() => setReceipt(null)} thermalPrinter={thermalPrinter} notify={notify} />}
+      {detailSale && <ReceiptModal sale={detailSale} onClose={() => setDetailSale(null)} closeLabel="Close" thermalPrinter={thermalPrinter} notify={notify} />}
       {parkModalOpen && (
         <ParkOrderModal
           nextOrderNo={nextOrderNo}
@@ -6209,6 +6212,213 @@ function buildReceiptHTML(sale) {
 </html>`;
 
   return html;
+}
+
+// =============================================================================
+// BLUETOOTH THERMAL PRINTER (ESC/POS) — optional, alongside browser print
+// =============================================================================
+// Most cheap 58mm/80mm "Bluetooth thermal receipt printer" hardware (the
+// generic kind sold for small shops, not a big brand like Epson/Star) uses
+// this exact GATT service/characteristic pair over Bluetooth LE — it's the
+// de facto standard these clone boards ship with, not an official spec. If
+// a given printer uses different UUIDs it just won't show up in the device
+// picker (requestDevice filters on this service), and the app quietly falls
+// back to the existing browser print dialog — nothing breaks.
+const THERMAL_PRINTER_SERVICE_UUID = "000018f0-0000-1000-8000-00805f9b34fb";
+const THERMAL_PRINTER_CHAR_UUID = "00002af1-0000-1000-8000-00805f9b34fb";
+const THERMAL_WIDTH_KEY = "cafe_pos_printer_width_v1"; // device-local, not account data — every device wired to its own printer picks its own paper width
+
+// Cheap ESC/POS boards print single-byte text, not UTF-8 — anything outside
+// printable ASCII usually comes out as garbage or a blank box. Swap the
+// specific symbols this app actually produces (currency signs, curly
+// punctuation, the × in "2 × Latte") for an ASCII-safe stand-in, then drop
+// anything else that slips through.
+function sanitizeForPrinter(s) {
+  return String(s ?? "")
+    .replace(/₱/g, "P")
+    .replace(/€/g, "EUR")
+    .replace(/£/g, "GBP")
+    .replace(/¥/g, "JPY")
+    .replace(/₹/g, "INR")
+    .replace(/฿/g, "THB")
+    .replace(/₫/g, "VND")
+    .replace(/[""]/g, '"')
+    .replace(/['']/g, "'")
+    .replace(/[–—]/g, "-")
+    .replace(/×/g, "x")
+    .replace(/…/g, "...")
+    .replace(/☕/g, "")
+    .replace(/[^\x00-\x7E]/g, "?");
+}
+
+// Lays "left" and "right" out on one line with right-aligned amounts, like a
+// receipt column — e.g. "2 x Latte             P240.00". Falls back to two
+// lines when the item name alone is too long for the paper width, so the
+// amount never gets crushed or wrapped mid-number.
+function printerRow(left, right, width) {
+  const l = sanitizeForPrinter(left);
+  const r = sanitizeForPrinter(right);
+  if (l.length + r.length + 1 > width) {
+    return `${l}\n${r.padStart(width, " ")}`;
+  }
+  return l + " ".repeat(width - l.length - r.length) + r;
+}
+
+function printerCenter(s, width) {
+  const t = sanitizeForPrinter(s);
+  if (t.length >= width) return t.slice(0, width);
+  return " ".repeat(Math.floor((width - t.length) / 2)) + t;
+}
+
+// Builds the raw ESC/POS byte stream for one sale receipt. `width` is
+// characters-per-line (32 for common 58mm paper, 48 for 80mm).
+function buildEscPosReceipt(sale, width = 32) {
+  const bytes = [];
+  const cmd = (...vals) => vals.forEach((v) => bytes.push(v));
+  const raw = (str) => {
+    const s = sanitizeForPrinter(str);
+    for (let i = 0; i < s.length; i++) bytes.push(s.charCodeAt(i) & 0xff);
+  };
+  const line = (str = "") => { raw(str); cmd(0x0a); };
+  const divider = () => line("-".repeat(width));
+  const bold = (on) => cmd(0x1b, 0x45, on ? 0x01 : 0x00);
+  const align = (a) => cmd(0x1b, 0x61, a === "center" ? 0x01 : a === "right" ? 0x02 : 0x00);
+
+  cmd(0x1b, 0x40); // initialize printer
+  align("center");
+  bold(true);
+  line("The Counter");
+  bold(false);
+  line(`Order #${sale.orderNo}`);
+  line(new Date(sale.timestamp).toLocaleString());
+  if (sale.employeeName) line(`Served by ${sale.employeeName}`);
+  if (sale.tabLabel) line(`Tab: ${sale.tabLabel}`);
+  align("left");
+  divider();
+
+  if (sale.voided) {
+    bold(true);
+    line(sale.wasteLogged ? "LOGGED TO WASTE — not counted in reports" : "VOIDED — not counted in reports");
+    bold(false);
+    if (sale.voidReason) line(`Reason: ${sale.voidReason}`);
+    if (sale.approvedByName) line(`Approved by ${sale.approvedByName}`);
+    divider();
+  } else if (sale.restoredAt) {
+    bold(true);
+    line("RESTORED");
+    bold(false);
+    divider();
+  }
+
+  sale.items.forEach((i) => {
+    line(printerRow(`${i.qty} x ${i.name}`, money(i.price * i.qty), width));
+  });
+  divider();
+
+  line(printerRow("Subtotal", money(sale.subtotal ?? sale.total), width));
+  if (sale.discountAmount > 0) {
+    line(printerRow(`Discount${sale.discountType === "percent" ? ` (${sale.discountValue}%)` : ""}`, `-${money(sale.discountAmount)}`, width));
+  }
+  bold(true);
+  line(printerRow("TOTAL", money(sale.total), width));
+  bold(false);
+  divider();
+
+  line(printerRow("Payment", (sale.paymentMethod || "cash").toUpperCase(), width));
+  if (sale.paymentMethod === "cash") {
+    line(printerRow("Cash received", money(sale.amountTendered), width));
+    line(printerRow("Change", money(sale.change), width));
+  } else if (sale.paymentMethod === "split" && sale.payments) {
+    sale.payments.forEach((p) => line(printerRow(p.method, money(p.amount), width)));
+  }
+
+  line();
+  align("center");
+  line("Thanks for stopping by");
+  line();
+  line();
+  line();
+  cmd(0x1d, 0x56, 0x42, 0x00); // partial cut (most clone boards support this; ignored harmlessly if not)
+  return new Uint8Array(bytes);
+}
+
+// Connects to, remembers, and writes to a paired Bluetooth thermal printer.
+// Entirely optional: `supported` is false on any browser without Web
+// Bluetooth (all of iOS/iPadOS Safari, and Safari in general), and every
+// caller falls back to the existing browser print dialog when there's no
+// active connection — this hook only ever adds a faster path, never removes
+// the old one.
+function useThermalPrinter(notify) {
+  const [supported] = useState(() => typeof navigator !== "undefined" && !!navigator.bluetooth);
+  const [connected, setConnected] = useState(false);
+  const [connecting, setConnecting] = useState(false);
+  const [printerName, setPrinterName] = useState(null);
+  const [paperWidth, setPaperWidth] = useState(() => {
+    try { return window.localStorage.getItem(THERMAL_WIDTH_KEY) || "32"; } catch { return "32"; }
+  });
+  const deviceRef = useRef(null);
+  const charRef = useRef(null);
+
+  const handleDisconnected = useCallback(() => {
+    setConnected(false);
+    setPrinterName(null);
+    charRef.current = null;
+  }, []);
+
+  const connect = useCallback(async () => {
+    if (!supported || connecting) return;
+    setConnecting(true);
+    try {
+      const device = await navigator.bluetooth.requestDevice({
+        filters: [{ services: [THERMAL_PRINTER_SERVICE_UUID] }],
+      });
+      device.addEventListener("gattserverdisconnected", handleDisconnected);
+      const server = await device.gatt.connect();
+      const service = await server.getPrimaryService(THERMAL_PRINTER_SERVICE_UUID);
+      const characteristic = await service.getCharacteristic(THERMAL_PRINTER_CHAR_UUID);
+      deviceRef.current = device;
+      charRef.current = characteristic;
+      setPrinterName(device.name || "Thermal printer");
+      setConnected(true);
+      notify?.(`Connected to ${device.name || "printer"}.`);
+    } catch (e) {
+      if (e?.name !== "NotFoundError") { // user closed the device picker — not a real error
+        notify?.(`Couldn't connect: ${e?.message || "printer not found"}`, "error");
+      }
+    } finally {
+      setConnecting(false);
+    }
+  }, [supported, connecting, handleDisconnected, notify]);
+
+  const disconnect = useCallback(() => {
+    try { deviceRef.current?.gatt?.disconnect(); } catch {}
+    handleDisconnected();
+  }, [handleDisconnected]);
+
+  const setWidth = useCallback((w) => {
+    setPaperWidth(w);
+    try { window.localStorage.setItem(THERMAL_WIDTH_KEY, w); } catch {}
+  }, []);
+
+  // Bluetooth LE writes are capped at a small packet size (varies by
+  // device/OS, often as low as ~20 bytes), so a whole receipt has to go out
+  // in chunks, awaited one at a time — sending it all in one call silently
+  // truncates on many printers.
+  const print = useCallback(async (sale) => {
+    if (!charRef.current) throw new Error("No printer connected");
+    const bytes = buildEscPosReceipt(sale, Number(paperWidth) || 32);
+    const CHUNK = 100;
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+      const slice = bytes.slice(i, i + CHUNK);
+      if (charRef.current.writeValueWithoutResponse) {
+        await charRef.current.writeValueWithoutResponse(slice);
+      } else {
+        await charRef.current.writeValue(slice);
+      }
+    }
+  }, [paperWidth]);
+
+  return { supported, connected, connecting, printerName, paperWidth, setWidth, connect, disconnect, print };
 }
 
 // Sends a receipt to the browser's print dialog via a real popup window
@@ -10486,7 +10696,7 @@ function CompleteProfileView({ account, onSave, onLogOut }) {
   );
 }
 
-function SettingsView({ account, onUpdateField, onLogOut, onDeleteAccount, onUnsubscribe, trialInfo, currencyCode = "PHP", openUpgrade }) {
+function SettingsView({ account, onUpdateField, onLogOut, onDeleteAccount, onUnsubscribe, trialInfo, currencyCode = "PHP", openUpgrade, thermalPrinter }) {
   const [confirmLogout, setConfirmLogout] = useState(false);
   const [copied, setCopied] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
@@ -10568,6 +10778,65 @@ function SettingsView({ account, onUpdateField, onLogOut, onDeleteAccount, onUns
           minLength={6}
           helper="Type a new password to change it"
         />
+      </div>
+
+      {/* ---- Receipt printer (Bluetooth thermal) ---- */}
+      <div className="rounded-xl border p-4 sm:p-5 mt-4" style={{ borderColor: "var(--line)", background: "var(--surface)" }}>
+        <div className="flex items-center gap-2 text-xs font-medium mb-1" style={{ color: "var(--ink-soft)" }}>
+          <Printer size={13} /> Receipt printer
+        </div>
+        {!thermalPrinter?.supported ? (
+          <p className="text-[11px] mt-2" style={{ color: "var(--ink-soft)" }}>
+            Bluetooth printing isn't available in this browser (this includes all of Safari on iPhone/iPad). Receipts will use the regular print dialog instead — no setup needed.
+          </p>
+        ) : (
+          <>
+            <p className="text-[11px] mt-1 mb-3" style={{ color: "var(--ink-soft)" }}>
+              Pair a Bluetooth thermal receipt printer to print with one tap, skipping the print dialog. Works with most generic 58mm/80mm Bluetooth thermal printers.
+            </p>
+            {thermalPrinter.connected ? (
+              <div className="flex items-center justify-between gap-2 rounded-lg px-3 py-2 mb-3" style={{ background: "var(--bg)" }}>
+                <div className="flex items-center gap-1.5 text-xs font-medium">
+                  <span className="w-1.5 h-1.5 rounded-full" style={{ background: "#2F6B45" }} />
+                  {thermalPrinter.printerName || "Printer"} connected
+                </div>
+                <button
+                  onClick={thermalPrinter.disconnect}
+                  className="text-[11px] px-2 py-1 rounded-md border font-medium"
+                  style={{ borderColor: "var(--line)", color: "var(--ink-soft)" }}
+                >
+                  Disconnect
+                </button>
+              </div>
+            ) : (
+              <button
+                onClick={thermalPrinter.connect}
+                disabled={thermalPrinter.connecting}
+                className="flex items-center gap-1.5 text-xs px-3 py-2 rounded-lg font-medium mb-3 disabled:opacity-60"
+                style={{ background: "var(--primary)", color: "#fff" }}
+              >
+                <Printer size={13} /> {thermalPrinter.connecting ? "Connecting…" : "Connect printer"}
+              </button>
+            )}
+            <div className="text-xs font-medium mb-1.5" style={{ color: "var(--ink-soft)" }}>Paper width</div>
+            <div className="flex gap-2">
+              {[{ v: "32", label: "58mm" }, { v: "48", label: "80mm" }].map((opt) => (
+                <button
+                  key={opt.v}
+                  onClick={() => thermalPrinter.setWidth(opt.v)}
+                  className="flex-1 py-1.5 rounded-lg text-xs font-medium border"
+                  style={{
+                    borderColor: thermalPrinter.paperWidth === opt.v ? "var(--primary)" : "var(--line)",
+                    background: thermalPrinter.paperWidth === opt.v ? "var(--bg)" : "transparent",
+                    color: thermalPrinter.paperWidth === opt.v ? "var(--primary-dark)" : "var(--ink-soft)",
+                  }}
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+          </>
+        )}
       </div>
 
       {/* ---- Subscription status ---- */}
