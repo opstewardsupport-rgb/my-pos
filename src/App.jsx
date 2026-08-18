@@ -1555,6 +1555,15 @@ function fileToResizedDataURL(file, maxWidth = 480, quality = 0.72) {
 export default function CafePOS() {
   const updateWaitingToApply = useAppUpdate();
   const [loading, setLoading] = useState(true);
+  // Cross-device sync status shown in the header (see SyncStatusBadge) —
+  // "idle" before the first push of this session, "syncing" while a push is
+  // in flight, "synced" after the most recent push succeeded, "error" after
+  // the most recent push failed (e.g. no connection). Purely informational:
+  // the app always keeps working off the local copy either way (see
+  // pushPosData/fetchPosData above) — this just makes a silent failure
+  // visible instead of only showing up in the browser console.
+  const [syncStatus, setSyncStatus] = useState("idle");
+  const [lastSyncedAt, setLastSyncedAt] = useState(null);
   const [catalog, setCatalog] = useState({ ingredients: [], products: [], categories: [] });
   const [sales, setSales] = useState([]);
   // Open tabs — carts sent to the kitchen but not paid yet. See
@@ -2090,9 +2099,17 @@ export default function CafePOS() {
 
     if (cloudSyncTimerRef.current) clearTimeout(cloudSyncTimerRef.current);
     cloudSyncTimerRef.current = setTimeout(() => {
+      setSyncStatus("syncing");
       pushPosData(userId, {
         catalog, sales, parkedOrders, currencyCode, employees,
         currentEmployeeId, shifts, wasteLogs, orderCounter: nextOrderNo,
+      }).then((ok) => {
+        if (ok) {
+          setSyncStatus("synced");
+          setLastSyncedAt(Date.now());
+        } else {
+          setSyncStatus("error");
+        }
       });
     }, 1200);
 
@@ -4007,6 +4024,8 @@ export default function CafePOS() {
         currentEmployee={currentEmployee}
         selectEmployee={requestEmployeeChange}
         openEmployeeModal={() => setEmployeeModal(true)}
+        syncStatus={syncStatus}
+        lastSyncedAt={lastSyncedAt}
       />
       <Nav view={view} setView={setView} lowCount={lowStock.length} shiftOpen={!!activeShift} kitchenCount={kitchenPreparing.length} tabsCount={parkedOrders.length} />
 
@@ -4365,6 +4384,10 @@ function Shell({ children }) {
           border-radius: 6px;
         }
         .print-only { display: none; }
+        @keyframes pulse {
+          0%, 100% { opacity: 1; }
+          50% { opacity: 0.35; }
+        }
         @media print {
           .no-print { display: none !important; }
           .print-only { display: block !important; }
@@ -4761,7 +4784,57 @@ function UpdateBanner({ onRefreshNow }) {
   );
 }
 
-function Header({ businessName, low, confirmReset, setConfirmReset, resetAll, currencyCode, changeCurrency, employees, currentEmployee, selectEmployee, openEmployeeModal }) {
+// Small, quiet header indicator for cross-device cloud sync (see
+// pushPosData/the debounced auto-push effect above, which set syncStatus).
+// Exists because a failed save used to only show up as a line in the
+// browser console — invisible to whoever's actually running the register.
+// This makes that visible at a glance without being alarming: a subtle
+// dot + one word, not a banner or popup. "idle" (nothing pushed yet this
+// session, e.g. right after login) renders nothing, since there's nothing
+// meaningful to report yet.
+function SyncStatusBadge({ status, lastSyncedAt }) {
+  if (!status || status === "idle") return null;
+
+  const timeAgoLabel = (ts) => {
+    if (!ts) return "";
+    const secs = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+    if (secs < 10) return "just now";
+    if (secs < 60) return `${secs}s ago`;
+    const mins = Math.floor(secs / 60);
+    if (mins < 60) return `${mins}m ago`;
+    const hrs = Math.floor(mins / 60);
+    return `${hrs}h ago`;
+  };
+
+  const config = {
+    syncing: { color: "var(--ink-soft)", dot: "#B7B0A6", label: "Syncing…" },
+    synced: { color: "var(--ink-soft)", dot: "#4C9A6A", label: lastSyncedAt ? `Synced ${timeAgoLabel(lastSyncedAt)}` : "Synced" },
+    error: { color: "var(--alert)", dot: "var(--alert)", label: "Not synced — check connection" },
+  }[status];
+  if (!config) return null;
+
+  return (
+    <span
+      className="hidden sm:flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-full border"
+      style={{ borderColor: "var(--line)", color: config.color, background: "var(--surface)" }}
+      title={
+        status === "error"
+          ? "Your last change couldn't be saved to the cloud. It's safe on this device, but won't show up on other devices until this succeeds — check your internet connection."
+          : "Your data is backed up to the cloud and will show up on any device you log into."
+      }
+    >
+      <span
+        style={{
+          width: 6, height: 6, borderRadius: "50%", background: config.dot, flexShrink: 0,
+          animation: status === "syncing" ? "pulse 1.2s ease-in-out infinite" : "none",
+        }}
+      />
+      {config.label}
+    </span>
+  );
+}
+
+function Header({ businessName, low, confirmReset, setConfirmReset, resetAll, currencyCode, changeCurrency, employees, currentEmployee, selectEmployee, openEmployeeModal, syncStatus, lastSyncedAt }) {
   return (
     <header className="max-w-6xl mx-auto px-4 sm:px-6 pt-6 pb-3 flex items-start justify-between no-print">
       <div>
@@ -4804,6 +4877,7 @@ function Header({ businessName, low, confirmReset, setConfirmReset, resetAll, cu
           {(CURRENCIES.find((c) => c.code === currencyCode) || CURRENCIES[0]).code}{" "}
           {(CURRENCIES.find((c) => c.code === currencyCode) || CURRENCIES[0]).symbol}
         </span>
+        {syncStatus !== undefined && <SyncStatusBadge status={syncStatus} lastSyncedAt={lastSyncedAt} />}
         <button
           onClick={() => (confirmReset ? resetAll() : setConfirmReset(true))}
           onBlur={() => setConfirmReset(false)}
