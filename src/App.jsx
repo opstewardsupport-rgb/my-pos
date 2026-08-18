@@ -1671,18 +1671,6 @@ export default function CafePOS() {
   // time, restarted on every further change, so ten changes in five
   // seconds becomes one network write instead of ten.
   const cloudSyncTimerRef = useRef(null);
-  // Always holds the most recent café-data snapshot, kept fresh by a small
-  // effect right below the debounced auto-push effect. Exists so that
-  // attemptCloudSync (below) — which can fire minutes later from a retry
-  // timer, long after the render that scheduled it is gone — always pushes
-  // whatever's current instead of a stale closure over old state.
-  const cloudSnapshotRef = useRef(null);
-  // Handle for the automatic retry loop: set whenever a push fails, cleared
-  // the moment one succeeds (or a fresh edit reschedules via the debounced
-  // effect, or the owner taps "Retry now" on the red badge, or they log
-  // out). This is what makes a failed save recover on its own instead of
-  // sitting red until the owner happens to touch something else.
-  const retrySyncTimerRef = useRef(null);
 
   // Reads the signed-in owner's row from `businesses` and reshapes it for
   // the UI. Returns null if the row doesn't exist yet (e.g. the insert after
@@ -2105,104 +2093,34 @@ export default function CafePOS() {
   // screen reads/writes to instantly; this effect is purely the
   // "eventually mirror it to the cloud too" side of that, so a second
   // device logging in later sees it (via the load effect above).
-  // Keeps cloudSnapshotRef current on every render where any piece of café
-  // data changed — same dependency list as the debounced push effect below,
-  // just without the debounce, so a retry firing between edits always has
-  // the latest snapshot to push rather than whatever was current when the
-  // retry was originally scheduled.
-  useEffect(() => {
-    cloudSnapshotRef.current = {
-      catalog, sales, parkedOrders, currencyCode, employees,
-      currentEmployeeId, shifts, wasteLogs, orderCounter: nextOrderNo,
-    };
-  }, [
-    catalog, sales, parkedOrders, currencyCode, employees,
-    currentEmployeeId, shifts, wasteLogs, nextOrderNo,
-  ]);
-
-  const clearRetrySyncTimer = useCallback(() => {
-    if (retrySyncTimerRef.current) {
-      clearTimeout(retrySyncTimerRef.current);
-      retrySyncTimerRef.current = null;
-    }
-  }, []);
-
-  // One push attempt of whatever's currently in cloudSnapshotRef, for the
-  // given user. Used by both the debounced auto-push effect below (on every
-  // real change) and the automatic retry loop it kicks off on failure. On
-  // success, any pending retry is cancelled. On failure, it quietly
-  // reschedules itself 15–20s out — a small random spread so a whole café's
-  // worth of devices that lost wifi at the same moment don't all retry on
-  // the exact same second — and keeps doing that until a push finally
-  // succeeds, a fresh edit supersedes it via the debounced effect, or the
-  // owner logs out. This is what makes a failed save recover on its own
-  // instead of sitting red until something else happens to change.
-  const attemptCloudSync = useCallback((userId) => {
-    if (!userId || !cloudSnapshotRef.current) return;
-    setSyncStatus("syncing");
-    pushPosData(userId, cloudSnapshotRef.current).then((ok) => {
-      // The owner logged out (or switched accounts) while this was in
-      // flight — don't let a late response resurrect stale sync UI.
-      if (authUserIdRef.current !== userId) return;
-      if (ok) {
-        clearRetrySyncTimer();
-        setSyncStatus("synced");
-        setLastSyncedAt(Date.now());
-      } else {
-        setSyncStatus("error");
-        clearRetrySyncTimer();
-        const delay = 15000 + Math.random() * 5000; // 15–20s
-        retrySyncTimerRef.current = setTimeout(() => attemptCloudSync(userId), delay);
-      }
-    });
-  }, [pushPosData, clearRetrySyncTimer]);
-
-  // Lets the red badge itself be tapped for an immediate retry instead of
-  // waiting for the next automatic attempt — see SyncStatusBadge's onRetry.
-  const retryCloudSyncNow = useCallback(() => {
-    const userId = authUserIdRef.current;
-    if (!userId) return;
-    clearRetrySyncTimer();
-    attemptCloudSync(userId);
-  }, [attemptCloudSync, clearRetrySyncTimer]);
-
-  // Cross-device cloud sync, the other half: whenever any piece of café
-  // data changes — from ANY of the actions throughout this file (a sale,
-  // an edited product, a new employee, a closed shift, ...) — mirror the
-  // full current snapshot up to Supabase after a short pause in activity.
-  // Debounced (rather than firing on every single keystroke/tap) so a
-  // flurry of changes becomes one upload, not dozens. Local storage (see
-  // the persist* functions throughout this file) is still the copy every
-  // screen reads/writes to instantly; this effect is purely the
-  // "eventually mirror it to the cloud too" side of that, so a second
-  // device logging in later sees it (via the load effect above).
   useEffect(() => {
     const userId = authUser?.id || null;
     if (!userId || !initialLoadDoneRef.current) return;
 
     if (cloudSyncTimerRef.current) clearTimeout(cloudSyncTimerRef.current);
-    // A fresh edit supersedes any retry that was already pending from an
-    // earlier failure — this debounced push will cover it instead.
-    clearRetrySyncTimer();
     cloudSyncTimerRef.current = setTimeout(() => {
-      attemptCloudSync(userId);
+      setSyncStatus("syncing");
+      pushPosData(userId, {
+        catalog, sales, parkedOrders, currencyCode, employees,
+        currentEmployeeId, shifts, wasteLogs, orderCounter: nextOrderNo,
+      }).then((ok) => {
+        if (ok) {
+          setSyncStatus("synced");
+          setLastSyncedAt(Date.now());
+        } else {
+          setSyncStatus("error");
+        }
+      });
     }, 1200);
 
     return () => {
       if (cloudSyncTimerRef.current) clearTimeout(cloudSyncTimerRef.current);
     };
   }, [
-    authUser?.id, attemptCloudSync, clearRetrySyncTimer,
+    authUser?.id, pushPosData,
     catalog, sales, parkedOrders, currencyCode, employees,
     currentEmployeeId, shifts, wasteLogs, nextOrderNo,
   ]);
-
-  // Stop the automatic retry loop on logout/account switch or unmount, so
-  // it never keeps trying to push a previous owner's data in the
-  // background after they've signed out of this device.
-  useEffect(() => {
-    return () => clearRetrySyncTimer();
-  }, [authUser?.id, clearRetrySyncTimer]);
 
   const changeCurrency = useCallback(async (code) => {
     setCurrencyCode(code);
@@ -4108,7 +4026,6 @@ export default function CafePOS() {
         openEmployeeModal={() => setEmployeeModal(true)}
         syncStatus={syncStatus}
         lastSyncedAt={lastSyncedAt}
-        onRetrySync={retryCloudSyncNow}
       />
       <Nav view={view} setView={setView} lowCount={lowStock.length} shiftOpen={!!activeShift} kitchenCount={kitchenPreparing.length} tabsCount={parkedOrders.length} />
 
@@ -4875,7 +4792,7 @@ function UpdateBanner({ onRefreshNow }) {
 // dot + one word, not a banner or popup. "idle" (nothing pushed yet this
 // session, e.g. right after login) renders nothing, since there's nothing
 // meaningful to report yet.
-function SyncStatusBadge({ status, lastSyncedAt, onRetry }) {
+function SyncStatusBadge({ status, lastSyncedAt }) {
   if (!status || status === "idle") return null;
 
   const timeAgoLabel = (ts) => {
@@ -4892,31 +4809,17 @@ function SyncStatusBadge({ status, lastSyncedAt, onRetry }) {
   const config = {
     syncing: { color: "var(--ink-soft)", dot: "#B7B0A6", label: "Syncing…" },
     synced: { color: "var(--ink-soft)", dot: "#4C9A6A", label: lastSyncedAt ? `Synced ${timeAgoLabel(lastSyncedAt)}` : "Synced" },
-    // Kept short on purpose — the fact that it's automatically retrying
-    // (see attemptCloudSync) lives in the title tooltip, not the label
-    // itself, so the badge doesn't get noisy every 15–20s.
-    error: { color: "var(--alert)", dot: "var(--alert)", label: "Not synced — tap to retry" },
+    error: { color: "var(--alert)", dot: "var(--alert)", label: "Not synced — check connection" },
   }[status];
   if (!config) return null;
 
-  // Only the error state is interactive — tapping it fires an immediate
-  // retry instead of waiting for the next automatic attempt (see
-  // retryCloudSyncNow). "syncing"/"synced" stay plain, non-clickable spans.
-  const isError = status === "error";
-  const Tag = isError ? "button" : "span";
-
   return (
-    <Tag
-      type={isError ? "button" : undefined}
-      onClick={isError ? onRetry : undefined}
+    <span
       className="hidden sm:flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-full border"
-      style={{
-        borderColor: "var(--line)", color: config.color, background: "var(--surface)",
-        cursor: isError ? "pointer" : "default", font: "inherit",
-      }}
+      style={{ borderColor: "var(--line)", color: config.color, background: "var(--surface)" }}
       title={
-        isError
-          ? "Your last change couldn't be saved to the cloud. It's safe on this device, and we'll keep retrying automatically — tap to retry now."
+        status === "error"
+          ? "Your last change couldn't be saved to the cloud. It's safe on this device, but won't show up on other devices until this succeeds — check your internet connection."
           : "Your data is backed up to the cloud and will show up on any device you log into."
       }
     >
@@ -4927,11 +4830,11 @@ function SyncStatusBadge({ status, lastSyncedAt, onRetry }) {
         }}
       />
       {config.label}
-    </Tag>
+    </span>
   );
 }
 
-function Header({ businessName, low, confirmReset, setConfirmReset, resetAll, currencyCode, changeCurrency, employees, currentEmployee, selectEmployee, openEmployeeModal, syncStatus, lastSyncedAt, onRetrySync }) {
+function Header({ businessName, low, confirmReset, setConfirmReset, resetAll, currencyCode, changeCurrency, employees, currentEmployee, selectEmployee, openEmployeeModal, syncStatus, lastSyncedAt }) {
   return (
     <header className="max-w-6xl mx-auto px-4 sm:px-6 pt-6 pb-3 flex items-start justify-between no-print">
       <div>
@@ -4974,7 +4877,7 @@ function Header({ businessName, low, confirmReset, setConfirmReset, resetAll, cu
           {(CURRENCIES.find((c) => c.code === currencyCode) || CURRENCIES[0]).code}{" "}
           {(CURRENCIES.find((c) => c.code === currencyCode) || CURRENCIES[0]).symbol}
         </span>
-        {syncStatus !== undefined && <SyncStatusBadge status={syncStatus} lastSyncedAt={lastSyncedAt} onRetry={onRetrySync} />}
+        {syncStatus !== undefined && <SyncStatusBadge status={syncStatus} lastSyncedAt={lastSyncedAt} />}
         <button
           onClick={() => (confirmReset ? resetAll() : setConfirmReset(true))}
           onBlur={() => setConfirmReset(false)}
@@ -9370,10 +9273,12 @@ function AutoSaveField({ label, value, onSave, type = "text", placeholder, minLe
 //    api/paypal-webhook.js activates the account the moment it's paid. See
 //    PAYPAL_CREATE_ORDER_ENDPOINT near the top of this file.
 // Either way, there's no fixed-price link to keep in sync with an
-// ever-changing discount, and the amount charged always matches the amount
-// shown. If the live checkout call itself fails (see paymongoState/
-// paypalState below), the owner sees an error with a one-tap retry — there
-// is deliberately no manual-payment fallback path.
+// ever-changing discount, the amount charged always matches the amount
+// shown, and the account is activated automatically — no manual
+// reconciling needed. onConfirm/markSubscriptionActive is still there as a
+// fallback for the manual-payment note (needsManualPayment below), for the
+// rare case a live checkout call fails or a currency PayPal doesn't settle
+// in at all.
 function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onApplyCode, onClose, onLogOut, onRefreshAccount, notify }) {
   const [code, setCode] = useState("");
   const [codeBusy, setCodeBusy] = useState(false);
@@ -9386,8 +9291,9 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
   // below): "idle" before the subscriber has clicked Pay, "loading" while
   // api/create-paymongo-link.js is being called, "ready" once it's handed
   // back a checkout url (at which point showCheckout flips on), and "error"
-  // if that call fails for any reason — shown with a one-tap retry rather
-  // than a fallback payment method.
+  // if that call fails for any reason — in which case the manual-payment
+  // fallback (manualPaymentNote/manualPaymentAmount below) is shown instead
+  // so a subscriber is never just stuck with a dead "Pay now" button.
   const [paymongoState, setPaymongoState] = useState({ status: "idle", url: "", error: "" });
   // Same idea as paymongoState, for international subscribers — see
   // startPayPalCheckout below and PAYPAL_CREATE_ORDER_ENDPOINT near the top
@@ -9397,6 +9303,16 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
   // box can flash/highlight and make the before → after change obvious
   // instead of just silently re-rendering with new numbers.
   const [justApplied, setJustApplied] = useState(false);
+  // Reference number/text the subscriber types in after paying manually
+  // (GCash/bank transfer for PH, or PayPal.me for international currencies
+  // PayPal itself can't settle in — see needsManualPayment below). Submitting
+  // this calls onConfirm/markSubscriptionActive, which is the ONLY thing
+  // that actually activates the account on the manual-payment path, since
+  // there's no webhook to do it automatically the way PayMongo/PayPal
+  // checkout does.
+  const [manualRef, setManualRef] = useState("");
+  const [manualBusy, setManualBusy] = useState(false);
+  const [manualError, setManualError] = useState("");
 
   const applyCode = async () => {
     if (codeBusy) return;
@@ -9459,9 +9375,16 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
   // amount AND any currency — see the big comment above this component and
   // startPayPalCheckout below (it auto-switches to USD for currencies
   // PayPal itself can't settle in, e.g. INR/IDR/VND — see
-  // PAYPAL_SUPPORTED_CURRENCIES above). If the live API call itself fails
-  // (paymongoState/paypalState below), the checkout UI shows that error
-  // with a one-tap retry rather than a manual-payment fallback.
+  // PAYPAL_SUPPORTED_CURRENCIES above). The ONLY remaining reason either
+  // falls back to manual payment is the live API call itself failing:
+  //  - PayMongo (PH): the live call to api/create-paymongo-link.js failed
+  //    (see paymongoState below).
+  //  - PayPal (everyone else): the live call to api/create-paypal-order.js
+  //    failed (see paypalState below) — no longer gated on currency at all,
+  //    since startPayPalCheckout now always sends a currency PayPal accepts.
+  const needsManualPayment = isPHCustomer
+    ? paymongoState.status === "error"
+    : paypalState.status === "error";
   // True when this subscriber's billing currency isn't one PayPal itself
   // settles in — used by startPayPalCheckout below to switch the LIVE order
   // to USD instead (still fully automatic), and by the UI to explain why
@@ -9472,11 +9395,16 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
   // startPayMongoCheckout/startPayPalCheckout below), which is what
   // triggers fetching them.
   const payLink = isPHCustomer ? paymongoState.url : paypalState.url;
-  // USD equivalent of the final price — only needed when PayPal itself
-  // can't settle in the subscriber's own currency (see paypalNeedsUsd),
-  // since USD is the one every PayPal account can send/receive.
+  const manualPaymentNote = isPHCustomer ? MANUAL_PAYMENT_NOTE_PH : MANUAL_PAYMENT_NOTE_INTL;
+  // For the PH manual fallback this is the real PHP amount (what GCash/
+  // bank transfer actually settles in). For the international manual
+  // fallback (unsupported currency only, see above) this is a USD amount
+  // instead of the subscriber's own currency, since by definition PayPal
+  // won't take their own currency — USD is the one every PayPal account can
+  // send/receive.
   const usdFullPrice = lockedSubscriptionPrice("USD");
   const usdFinalPrice = usdFullPrice - usdFullPrice * (discountPercent / 100);
+  const manualPaymentAmount = isPHCustomer ? fmtPhp(phpFinalPrice) : formatSubscriptionAmount(usdFinalPrice, "USD");
 
   // Whenever the amount actually due changes — a referral code just got
   // applied, reward credits changed, whatever — throw away any PayMongo
