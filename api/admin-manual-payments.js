@@ -174,18 +174,34 @@ export default async function handler(req, res) {
   }
 
   if (req.method === "GET") {
-    const { data, error } = await supabaseAdmin
+    // Pending: the live, current state — straight from businesses.
+    const { data: pending, error: pendingError } = await supabaseAdmin
       .from("businesses")
       .select("id, business_name, email, payment_reference, manual_payment_submitted_at, currency_code")
       .eq("manual_payment_status", "pending")
       .order("manual_payment_submitted_at", { ascending: true });
 
-    if (error) {
-      res.status(500).json({ error: error.message });
+    if (pendingError) {
+      res.status(500).json({ error: pendingError.message });
       return;
     }
 
-    res.status(200).json({ pending: data });
+    // History: past decisions, from the permanent log table (see
+    // setup-manual-payment-history.sql) since businesses itself gets reset
+    // back to a clean slate after each decision. Most recent first, capped
+    // at 100 so this stays fast as the log grows.
+    const { data: history, error: historyError } = await supabaseAdmin
+      .from("manual_payment_reviews")
+      .select("id, business_id, business_name, email, reference, action, reviewed_at")
+      .order("reviewed_at", { ascending: false })
+      .limit(100);
+
+    if (historyError) {
+      res.status(500).json({ error: historyError.message });
+      return;
+    }
+
+    res.status(200).json({ pending, history });
     return;
   }
 
@@ -226,6 +242,19 @@ export default async function handler(req, res) {
         });
         if (rpcError) throw rpcError;
 
+        // Record this decision permanently — see setup-manual-payment-history.sql
+        // for why this can't just be read back off the businesses row later.
+        // A failure here is logged but never blocks the response: the
+        // activation already succeeded, and the customer's active account
+        // matters more than the history log being perfectly complete.
+        await supabaseAdmin.from("manual_payment_reviews").insert({
+          business_id: businessId,
+          business_name: business.business_name,
+          email: business.email,
+          reference: finalReference,
+          action: "approved",
+        });
+
         // Email sending failures deliberately do NOT roll back the
         // activation above — the customer's account being active is the
         // important part; a failed email is annoying but recoverable
@@ -252,6 +281,14 @@ export default async function handler(req, res) {
         p_business_id: businessId,
       });
       if (rpcError) throw rpcError;
+
+      await supabaseAdmin.from("manual_payment_reviews").insert({
+        business_id: businessId,
+        business_name: business.business_name,
+        email: business.email,
+        reference: business.payment_reference,
+        action: "rejected",
+      });
 
       try {
         await sendRejectionEmail({ to: business.email, businessName: business.business_name });
