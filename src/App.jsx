@@ -91,63 +91,6 @@
    alter table public.businesses
      add column if not exists last_payment_final_amount numeric;
 
-   -- SECURITY FIX — manual-payment review queue. Previously the app's
-   -- manual-payment fallback (GCash/bank transfer for PH, PayPal.me for
-   -- everyone else) called markSubscriptionActive() directly from the
-   -- browser the instant ANY text was typed into the reference box — that
-   -- function then wrote subscription_status = 'active' straight from the
-   -- client. Nothing verified the reference was real, so anyone could grant
-   -- themselves a free subscription forever just by typing garbage into
-   -- that box (or replaying the same Supabase call from devtools). These
-   -- two columns + submit_manual_payment() below replace that: the client
-   -- can now only ever mark a reference "pending", never "active" — only
-   -- you, running activate_subscription() by hand in the SQL Editor after
-   -- actually checking your GCash/bank/PayPal dashboard, can flip the
-   -- account on. Safe to run even if these columns already exist.
-   alter table public.businesses
-     add column if not exists manual_payment_status text; -- null | 'pending' | 'rejected'
-   alter table public.businesses
-     add column if not exists manual_payment_submitted_at timestamptz;
-
-   -- Called by the app the moment an owner submits a reference on the
-   -- manual-payment fallback. Deliberately does NOT touch
-   -- subscription_status/subscription_period_end at all — it only records
-   -- that a reference is awaiting your review, on the caller's OWN row
-   -- (auth.uid()), and lets the trg_notify_on_subscription_change trigger
-   -- below email you so you know to go check it. The actual activation
-   -- happens later, by you, via activate_subscription() (see the "PAYPAL
-   -- AUTOMATIC ACTIVATION SETUP" block further down this file) — that
-   -- function is deliberately NOT granted to `authenticated`, so it can
-   -- only ever be run from the Supabase SQL Editor or your service-role
-   -- key, never from a customer's browser.
-   drop function if exists submit_manual_payment(text) cascade;
-   create or replace function submit_manual_payment(p_reference text)
-   returns void
-   language plpgsql
-   security definer
-   set search_path = public
-   as $$
-   declare
-     v_caller_id uuid := auth.uid();
-     v_clean text := nullif(trim(p_reference), '');
-   begin
-     if v_caller_id is null then
-       raise exception 'You must be logged in to submit a payment reference.';
-     end if;
-     if v_clean is null then
-       raise exception 'A payment reference is required.';
-     end if;
-
-     update public.businesses
-       set payment_reference = v_clean,
-           manual_payment_status = 'pending',
-           manual_payment_submitted_at = now()
-       where id = v_caller_id;
-   end;
-   $$;
-
-   grant execute on function submit_manual_payment(text) to authenticated;
-
    -- Holds EVERY piece of day-to-day café data as one JSON blob — catalog
    -- (ingredients/products/categories), sales history, parked tabs,
    -- currency, employees, the current employee, shifts, the waste log, and
@@ -445,44 +388,30 @@
    -- referral_count — so someone who clicked Apply and then never paid
    -- never counts as having "used" a code at all, for either side.
    --
-   -- Also adds the referrer's RECURRING 3% reward credit for having
-   -- referred the caller — not a one-time bump. The referrer keeps earning
-   -- this 3% (as part of active_referral_count * 3, capped at
-   -- MAX_REWARD_CREDIT_PERCENT/50% total across ALL their active referrals
-   -- combined) for as long as THIS specific referred account stays an
-   -- active, paying subscriber. The moment this account unsubscribes or
-   -- deletes its account, that 3% is automatically removed from the
-   -- referrer's ongoing discount — see handle_referral_deactivation() and
-   -- handle_referral_deletion() further below, which are the other half of
-   -- this mechanism.
-   --
-   -- Runs on EVERY confirmed payment (first payment AND every renewal — see
-   -- markSubscriptionActive() in the app code, which calls this every time,
-   -- not just on a first payment), so it can also detect a REACTIVATION: an
-   -- account that unsubscribed (which cleared its referral_reward_granted
-   -- flag below and decremented the referrer's active_referral_count) and
-   -- later resubscribes gets counted again, restoring the referrer's 3%
-   -- for it.
+   -- Also grants the referrer their one-time 3% reward credit for having
+   -- referred the caller — but ONLY the first time this runs for a given
+   -- caller, and ONLY if the caller actually has a code queued up or
+   -- already finalized. This is what makes the reward reflect a real
+   -- paying referral instead of just someone typing in a code and
+   -- abandoning the upgrade screen.
    --
    -- Guards against ever double-crediting or double-counting the same
    -- referral:
-   --   - referral_reward_granted on the CALLER's row is the live "am I
-   --     currently counted toward my referrer's active_referral_count" flag
-   --     — checked up front, so a call that finds it already true (a normal
-   --     renewal that isn't a reactivation) is a safe no-op; it only
-   --     proceeds to add a fresh 3% when this account isn't currently
-   --     counted (a first-ever payment, or a resubscribe after having been
-   --     decremented).
+   --   - referral_reward_granted on the CALLER's row flips to true the
+   --     first time this runs for them and is checked up front, so a
+   --     second call (e.g. a renewal, or the confirm button being pressed
+   --     twice) is a safe no-op.
    --   - pending_referral_code is cleared the moment it's finalized (or
    --     found unusable), so it's never finalized twice.
    --   - the same permanent referral_redemptions uniqueness redeem_referral()
    --     checks before allowing an apply is re-checked here too, so a race
    --     between two tabs both applying-then-paying can't double-insert.
-   -- Unlike the old one-time version of this reward, this does NOT gate on
-   -- the REFERRER'S OWN subscription status — the credit is entirely about
-   -- whether the REFERRED account is active, and simply sits there ready to
-   -- apply the next time the referrer has a bill, whether or not they
-   -- happen to be actively subscribed at this exact moment.
+   -- Mirrors the same subscriber-only eligibility redeem_referral() checks:
+   -- the referrer only actually receives the 3% if THEY are currently an
+   -- active, non-lapsed subscriber at the moment their referral pays — if
+   -- not, the referral still gets marked as "granted" (so it's never
+   -- retried later once the referrer's status changes), it just doesn't
+   -- add any credit.
    drop function if exists grant_referral_reward_on_payment() cascade;
    drop function if exists finalize_referral_redemption() cascade;
    create or replace function finalize_referral_redemption()
@@ -499,7 +428,9 @@
      v_already_granted boolean;
      v_referrer_id uuid;
      v_referrer_email text;
-     v_new_active_count int;
+     v_referrer_status text;
+     v_referrer_period_end timestamptz;
+     v_referrer_is_eligible boolean;
    begin
      if v_caller_id is null then
        return;
@@ -554,39 +485,36 @@
        end if;
      end if;
 
-     -- Nothing to (re-)count: this account was never referred (no code was
-     -- ever applied, or it turned out unusable above), or this account is
-     -- already counted as an active referral for its referrer right now
-     -- (a normal renewal, not a first payment or a reactivation).
+     -- Nothing to reward: this account was never referred (no code was
+     -- ever applied, or it turned out unusable above), or this exact
+     -- referral has already been credited once before.
      if v_referred_by is null or v_already_granted then
        return;
      end if;
 
-     -- Bump the referrer's count of currently-active referred subscribers,
-     -- then recompute their reward credit from that new count — capped at
-     -- 50 so it stops growing once the referrer hits the maximum discount,
-     -- matching MAX_REWARD_CREDIT_PERCENT in the app code (cafe-pos.jsx).
-     -- If you ever change that constant, change the 3 and 50 here (and in
-     -- the other identical pair of UPDATEs in
-     -- finalize_referral_redemption_for below) to match, or the two will
-     -- drift out of sync. Deliberately NOT gated on the referrer's own
-     -- subscription status — the credit is about the REFERRED account being
-     -- active, and just sits ready for whenever the referrer next has a
-     -- bill.
-     update public.businesses
-       set active_referral_count = coalesce(active_referral_count, 0) + 1
-       where id = v_referred_by
-       returning active_referral_count into v_new_active_count;
-
-     update public.businesses
-       set reward_credits = least(v_new_active_count * 3, 50)
+     select subscription_status, subscription_period_end
+       into v_referrer_status, v_referrer_period_end
+       from public.businesses
        where id = v_referred_by;
 
-     -- Marks this account as currently counted, so a normal future renewal
-     -- is a no-op (see the check above) and so
-     -- handle_referral_deactivation()/handle_referral_deletion() below know
-     -- to decrement the referrer when THIS account eventually stops being
-     -- active.
+     v_referrer_is_eligible := (v_referrer_status = 'active')
+       and (v_referrer_period_end is null or v_referrer_period_end > now());
+
+     if v_referrer_is_eligible then
+       -- Capped at 50 so accumulation genuinely stops once a referrer hits
+       -- the maximum discount for the month — matches MAX_REWARD_CREDIT_PERCENT
+       -- in the app code (cafe-pos.jsx). If you ever change that constant,
+       -- change the 50 here (and in the other identical UPDATE below) to
+       -- match, or the two will drift out of sync.
+       update public.businesses
+         set reward_credits = least(coalesce(reward_credits, 0) + 3, 50)
+         where id = v_referred_by;
+     end if;
+
+     -- Marked granted regardless of the eligibility outcome above, so this
+     -- referral is never re-evaluated or re-credited again later — it's a
+     -- one-time perk tied to this one first payment, not something that
+     -- keeps checking back in on the referrer's status.
      update public.businesses
        set referral_reward_granted = true
        where id = v_caller_id;
@@ -595,119 +523,12 @@
 
    grant execute on function finalize_referral_redemption() to authenticated;
 
-   -- Tracks whether THIS account currently counts toward its referrer's
-   -- active_referral_count / reward_credits below. Kept the same column
-   -- name as before, but its meaning changed from a one-time "has this
-   -- referral ever been rewarded" flag to a live "is this referral
-   -- currently active" flag: it flips true the moment this account's first
-   -- (or reactivating) payment is finalized (see
-   -- finalize_referral_redemption() above), and back to false the moment
-   -- this account unsubscribes or deletes its account (see
-   -- handle_referral_deactivation()/handle_referral_deletion() below) — so
-   -- finalize_referral_redemption() can correctly re-grant the referrer's
-   -- credit if this account later resubscribes. Safe to run even if this
-   -- column already exists.
+   -- Tracks whether THIS account's referral reward (the 3% it owes its
+   -- referrer) has already been granted, so finalize_referral_redemption()
+   -- above can never fire twice for the same referral. Safe to run even if
+   -- this column already exists.
    alter table public.businesses
      add column if not exists referral_reward_granted boolean not null default false;
-
-   -- How many of a business's referred sign-ups currently have an ACTIVE
-   -- paid subscription. This — not a lifetime referral_count — is what
-   -- reward_credits is derived from (least(active_referral_count * 3, 50)),
-   -- so a referrer's discount rises and falls in step with how many of the
-   -- people they referred are still paying customers right now, rather than
-   -- accumulating permanently or resetting every billing cycle. Incremented
-   -- by finalize_referral_redemption()/finalize_referral_redemption_for()
-   -- the moment a referred account's payment is confirmed, and decremented
-   -- by handle_referral_deactivation() (unsubscribe) or
-   -- handle_referral_deletion() (account deletion) right below. Safe to run
-   -- even if this column already exists.
-   alter table public.businesses
-     add column if not exists active_referral_count integer not null default 0;
-
-   -- Recurring-referral upkeep, part 1 of 2: fires whenever a business's
-   -- subscription_status changes AWAY FROM 'active' — i.e. the app's
-   -- unsubscribeAccount() setting it to 'cancelled'. If this account was
-   -- currently counted toward its referrer's active_referral_count (see
-   -- referral_reward_granted above), that referral is no longer active:
-   -- decrement the referrer's active_referral_count, recompute their
-   -- reward_credits from the new count, and clear this account's own
-   -- referral_reward_granted flag so a later resubscribe correctly
-   -- re-counts it (see finalize_referral_redemption() above). A BEFORE
-   -- trigger, so it can set NEW.referral_reward_granted directly instead of
-   -- issuing a second UPDATE on this same row (which would just retrigger
-   -- this same function harmlessly, but there's no reason to). Deliberately
-   -- does NOT fire for a subscription simply lapsing (subscription_period_end
-   -- passing without an explicit unsubscribe) — this app has no server-side
-   -- cron to detect that, so subscription_status stays 'active' in the
-   -- database until the owner explicitly unsubscribes or deletes their
-   -- account; only those two actions ever remove a referral from the count.
-   drop function if exists public.handle_referral_deactivation() cascade;
-   create or replace function public.handle_referral_deactivation()
-   returns trigger
-   language plpgsql
-   security definer
-   set search_path = public
-   as $$
-   declare
-     v_new_active_count int;
-   begin
-     if old.subscription_status = 'active'
-        and new.subscription_status is distinct from 'active'
-        and old.referred_by is not null
-        and coalesce(old.referral_reward_granted, false) then
-       update public.businesses
-         set active_referral_count = greatest(coalesce(active_referral_count, 0) - 1, 0)
-         where id = old.referred_by
-         returning active_referral_count into v_new_active_count;
-
-       update public.businesses
-         set reward_credits = least(coalesce(v_new_active_count, 0) * 3, 50)
-         where id = old.referred_by;
-
-       new.referral_reward_granted := false;
-     end if;
-     return new;
-   end;
-   $$;
-
-   drop trigger if exists trg_referral_deactivation on public.businesses;
-   create trigger trg_referral_deactivation
-     before update on public.businesses
-     for each row execute function public.handle_referral_deactivation();
-
-   -- Recurring-referral upkeep, part 2 of 2: the same decrement as above,
-   -- but for when a referred account is DELETED instead of merely
-   -- unsubscribed (see delete_own_account() near the top of this file). An
-   -- AFTER DELETE trigger, since OLD is still fully available after the row
-   -- is gone and there's no NEW row left to update.
-   drop function if exists public.handle_referral_deletion() cascade;
-   create or replace function public.handle_referral_deletion()
-   returns trigger
-   language plpgsql
-   security definer
-   set search_path = public
-   as $$
-   declare
-     v_new_active_count int;
-   begin
-     if old.referred_by is not null and coalesce(old.referral_reward_granted, false) then
-       update public.businesses
-         set active_referral_count = greatest(coalesce(active_referral_count, 0) - 1, 0)
-         where id = old.referred_by
-         returning active_referral_count into v_new_active_count;
-
-       update public.businesses
-         set reward_credits = least(coalesce(v_new_active_count, 0) * 3, 50)
-         where id = old.referred_by;
-     end if;
-     return old;
-   end;
-   $$;
-
-   drop trigger if exists trg_referral_deletion on public.businesses;
-   create trigger trg_referral_deletion
-     after delete on public.businesses
-     for each row execute function public.handle_referral_deletion();
 
    -- FIX: some signups ended up with an auth.users account but NO row in
    -- businesses at all (Settings showed blank Business name / Email because
@@ -1003,35 +824,6 @@
        );
      end if;
 
-     -- ---- MANUAL PAYMENT SUBMITTED — AWAITING YOUR VERIFICATION ----
-     -- Fires the moment submit_manual_payment() (see the SQL near the top
-     -- of this file) marks a reference "pending" — i.e. the owner typed a
-     -- reference into the manual-payment fallback box. This account is
-     -- NOT active yet; go check the reference against your GCash/bank/
-     -- PayPal dashboard, then either run
-     --   select public.activate_subscription('<account id below>', '<reference>');
-     -- to unlock it, or
-     --   update public.businesses set manual_payment_status = 'rejected' where id = '<account id below>';
-     -- if it doesn't check out.
-     if new.manual_payment_status = 'pending' and old.manual_payment_status is distinct from 'pending' then
-       perform public.notify_owner(
-         '🕓 Manual payment awaiting verification: ' || coalesce(nullif(new.business_name, ''), new.email, 'someone'),
-         '<p><b>' || coalesce(nullif(new.business_name, ''), new.email, 'A business') || '</b> submitted a manual payment reference — nothing has been activated yet.</p>' ||
-         '<p>' ||
-           '<b>User Email Address:</b> ' || coalesce(new.email, '(unknown)') || '<br>' ||
-           '<b>Business Name:</b> ' || coalesce(nullif(new.business_name, ''), '(not set)') || '<br>' ||
-           '<b>Reference Submitted:</b> ' || coalesce(nullif(new.payment_reference, ''), '(none)') || '<br>' ||
-           '<b>Submitted At:</b> ' || to_char(coalesce(new.manual_payment_submitted_at, now()), 'Mon DD, YYYY HH12:MI AM') ||
-         '</p>' ||
-         '<p>Verify this against your GCash/bank/PayPal dashboard, then either run:<br>' ||
-         '<code>select public.activate_subscription(''' || new.id || ''', ''' || coalesce(nullif(new.payment_reference, ''), '') || ''');</code><br>' ||
-         'to activate, or:<br>' ||
-         '<code>update public.businesses set manual_payment_status = ''rejected'' where id = ''' || new.id || ''';</code><br>' ||
-         'if it does not check out.</p>' ||
-         '<p style="color:#888;font-size:11px;">Account ID: ' || new.id || '</p>'
-       );
-     end if;
-
      -- ---- UNSUBSCRIBE (subscription cancelled, account NOT deleted) ----
      if new.subscription_status = 'cancelled' and old.subscription_status is distinct from 'cancelled' then
        perform public.notify_owner(
@@ -1199,12 +991,6 @@
    -- PayPal order/capture id, so it shows up in Settings the same way a
    -- manual payment reference does, and you can look it up in your PayPal
    -- dashboard if a subscriber ever has a billing question.
-   --
-   -- Note: this function only changes data — it doesn't send any email
-   -- itself. The admin dashboard (api/admin-manual-payments.js) sends the
-   -- "you're active" customer email via Gmail right after calling this;
-   -- the PayPal webhook path doesn't currently email the customer at all
-   -- (PayPal's own receipt covers that).
    drop function if exists public.activate_subscription(uuid, text) cascade;
    create or replace function public.activate_subscription(p_business_id uuid, p_reference text)
    returns void
@@ -1218,25 +1004,12 @@
      select (subscription_status = 'active') into v_was_active
        from public.businesses where id = p_business_id;
 
-     -- reward_credits is deliberately NOT reset here. It's maintained
-     -- entirely by finalize_referral_redemption_for() and the deactivation/
-     -- deletion triggers, based on how many of THIS account's own referred
-     -- sign-ups are currently active subscribers — that has nothing to do
-     -- with this account paying its OWN bill, so this account's own
-     -- self-payment must never zero it out. It only ever goes down when
-     -- one of this account's referred accounts unsubscribes or deletes
-     -- itself.
      update public.businesses
        set subscription_status = 'active',
            subscription_period_end = now() + interval '30 days',
            payment_reference = p_reference,
-           discount_percent = case when coalesce(v_was_active, false) then discount_percent else 0 end,
-           -- Clears out the manual-payment review flag this account may be
-           -- sitting in (see submit_manual_payment() near the top of this
-           -- file) — a no-op if it was never set, e.g. for the automatic
-           -- PayPal webhook path that also calls this function.
-           manual_payment_status = null,
-           manual_payment_submitted_at = null
+           reward_credits = 0,
+           discount_percent = case when coalesce(v_was_active, false) then discount_percent else 0 end
        where id = p_business_id;
 
      if not coalesce(v_was_active, false) then
@@ -1245,35 +1018,11 @@
    end;
    $$;
 
-   -- Companion to activate_subscription() above, for the OTHER outcome of
-   -- reviewing a manual payment: the reference didn't check out. Sets
-   -- manual_payment_status = 'rejected' (which flips the Upgrade screen
-   -- back to a resubmit form with an explanatory message — see
-   -- account?.manualPaymentStatus in the app code). Like
-   -- activate_subscription() above, this only changes data — the admin
-   -- dashboard sends the customer's "we couldn't verify that" email via
-   -- Gmail right after calling this.
-   drop function if exists public.reject_manual_payment(uuid) cascade;
-   create or replace function public.reject_manual_payment(p_business_id uuid)
-   returns void
-   language plpgsql
-   security definer
-   set search_path = public
-   as $$
-   begin
-     update public.businesses
-       set manual_payment_status = 'rejected'
-       where id = p_business_id;
-   end;
-   $$;
-
    -- Deliberately NOT granted to `authenticated` or `anon` — only your
-   -- service-role key (used by api/paypal-webhook.js AND
-   -- api/admin-manual-payments.js, the admin dashboard's backend) can call
-   -- either of these two functions. A logged-in customer's browser key
-   -- can't call them at all, which is exactly what stops anyone from
-   -- activating (or maliciously rejecting someone else's) account by
-   -- guessing a function name.
+   -- service-role key (which only api/paypal-webhook.js ever holds) can
+   -- call this. A logged-in customer's browser key can't call it at all,
+   -- which is exactly what stops anyone from activating their own account
+   -- for free by guessing this function's name.
 
    ---- END: paste into Supabase SQL Editor ----
 ============================================================================= */
@@ -1496,30 +1245,24 @@ const SUBSCRIPTION_PERIOD_DAYS = 30;
 //    gets on their very first payment (first month only), if they redeemed
 //    someone else's code before paying. It's consumed after that first
 //    payment (see markSubscriptionActive) — it never applies to renewals.
-//  - REFERRAL_REWARD_PERCENT: what the CODE OWNER earns for EACH referred
-//    sign-up that is CURRENTLY an active, paying subscriber — a RECURRING
-//    benefit, not a one-time bump. It keeps applying to every renewal for
-//    as long as that specific referred account stays subscribed, and is
-//    automatically removed the moment that referred account unsubscribes
-//    or deletes its account (see handle_referral_deactivation() and
-//    handle_referral_deletion() in the SQL setup block at the top of this
-//    file). The referrer's total credit is always
-//    active_referral_count * REFERRAL_REWARD_PERCENT, capped below.
-// Both numbers are enforced server-side — REFERRAL_DISCOUNT_PERCENT in the
-// redeem_referral() SQL function, REFERRAL_REWARD_PERCENT in
-// finalize_referral_redemption()/finalize_referral_redemption_for() and the
-// two deactivation triggers — at the top of this file. These constants are
-// just what the UI displays, so keep them in sync if you ever change the
-// SQL.
+//  - REFERRAL_REWARD_PERCENT: what the CODE OWNER earns, every time their
+//    code is redeemed by someone new. This is a CURRENT-BILLING-MONTH-ONLY
+//    credit: it accumulates as new referrals come in during the owner's
+//    current billing cycle, then resets back to 0% the moment a new billing
+//    cycle starts (see markSubscriptionActive, which zeroes reward_credits
+//    on every renewal) — it does NOT roll over or stack across months.
+// Both numbers are enforced server-side in the redeem_referral() SQL
+// function at the top of this file — these constants are just what the UI
+// displays, so keep them in sync if you ever change the SQL.
 const REFERRAL_DISCOUNT_PERCENT = 25;
 const REFERRAL_REWARD_PERCENT = 3;
 // Safety cap on how much of the price reward credits can ever discount.
-// Set to 50 so a subscriber's bill is never more than half off, no matter
-// how many currently-active referrals they have. Enforced on both sides:
-// the underlying reward_credits column in Supabase is itself capped at 50
-// by every SQL function that writes it (least(active_referral_count * 3,
-// 50)), and every screen that reads it (UpgradeView, SettingsView) clamps
-// to this same constant again before showing or charging anything, so the
+// Set to 50 so a subscriber's renewal is never more than half off, no
+// matter how many referrals they rack up in one billing cycle. This is a
+// display/UI cap — the underlying reward_credits column in Supabase keeps
+// accumulating past 50 with no ceiling (see redeem_referral() in the SQL
+// setup block), but every screen that reads it (UpgradeView, SettingsView)
+// clamps to this constant before showing or charging anything, so the
 // subscriber is never actually charged below 50% of the full price.
 const MAX_REWARD_CREDIT_PERCENT = 50;
 
@@ -1683,7 +1426,7 @@ const saleOnlineAmount = (sale) =>
     ? sale.payments.filter((p) => p.method === "online").reduce((s, p) => s + p.amount, 0)
     : sale.paymentMethod === "online" ? sale.total : 0;
 
-const WASTE_REASONS = ["Spoilage", "Breakage", "Staff meal", "Wrong order", "Other"];
+const WASTE_REASONS = ["Spoilage", "Breakage", "Staff meal", "Other"];
 
 function seedCatalog() {
   const ing = (name, unit, stock, low, cost) => ({ id: uid("ing"), name, unit, stock, low, cost });
@@ -1850,7 +1593,6 @@ export default function CafePOS() {
   const [historyRangeEnd, setHistoryRangeEnd] = useState(todayKey());
   const [voidModal, setVoidModal] = useState(null); // sale being voided
   const [restoreModal, setRestoreModal] = useState(null); // sale being restored (needs manager approval)
-  const [wasteSaleModal, setWasteSaleModal] = useState(null); // sale/items being logged to waste (wrongly-prepped order)
   const [detailSale, setDetailSale] = useState(null); // sale being viewed in detail
   const [restockId, setRestockId] = useState(null);
   const [restockVal, setRestockVal] = useState("");
@@ -1929,15 +1671,6 @@ export default function CafePOS() {
   // time, restarted on every further change, so ten changes in five
   // seconds becomes one network write instead of ten.
   const cloudSyncTimerRef = useRef(null);
-  // NEW — handle for the silent auto-retry loop: whenever a push to the
-  // cloud fails, this fires performCloudSync() again after a short pause,
-  // and keeps doing so until a push finally succeeds. Cleared the moment a
-  // push succeeds, a new change arrives, or the owner logs out.
-  const cloudRetryTimerRef = useRef(null);
-  // NEW — always holds the most recent snapshot of café data that needs to
-  // go to the cloud. Read by performCloudSync() so a retry always sends the
-  // latest data, never a stale copy from when the failure first happened.
-  const cloudSyncPayloadRef = useRef(null);
 
   // Reads the signed-in owner's row from `businesses` and reshapes it for
   // the UI. Returns null if the row doesn't exist yet (e.g. the insert after
@@ -1963,14 +1696,6 @@ export default function CafePOS() {
       subscriptionPeriodEnd: data.subscription_period_end || null,
       subscriptionStartDate: data.subscription_start_date || null,
       paymentReference: data.payment_reference || "",
-      // Set by submit_manual_payment() the moment a manual GCash/bank/
-      // PayPal.me reference is submitted, and cleared again by
-      // activate_subscription() once you've verified it (or set to
-      // 'rejected' by hand if it didn't check out) — see the SQL near the
-      // top of this file. Lets the Upgrade screen show "we're checking
-      // this" instead of silently re-showing the same form.
-      manualPaymentStatus: data.manual_payment_status || null,
-      manualPaymentSubmittedAt: data.manual_payment_submitted_at || null,
       // Set once at sign-up (see SignUpView) and never changed afterward —
       // this is the account's single, permanent billing/display currency.
       // Falls back to PHP only for pre-existing accounts created before
@@ -2358,41 +2083,6 @@ export default function CafePOS() {
     })();
   }, [authUser?.id, fetchPosData, pushPosData]);
 
-  const notify = useCallback((msg, type = "ok") => {
-    setToast({ msg, type });
-    setTimeout(() => setToast(null), 2600);
-  }, []);
-
-  const thermalPrinter = useThermalPrinter(notify);
-
-  // NEW — does one actual push attempt to Supabase using whatever's
-  // currently sitting in cloudSyncPayloadRef. On success, marks the badge
-  // "synced" and cancels any pending retry. On failure, marks the badge
-  // "error" and quietly schedules another attempt 15–20 seconds later
-  // (randomized so many devices retrying at once don't all hit the server
-  // in the same instant) — no toast, no interruption, it just keeps trying
-  // in the background until it succeeds. Also used directly by the "Retry
-  // now" tap on the red sync badge, and by the debounced effect below.
-  const performCloudSync = useCallback(() => {
-    const userId = authUserIdRef.current;
-    if (!userId || !cloudSyncPayloadRef.current) return;
-    if (cloudRetryTimerRef.current) {
-      clearTimeout(cloudRetryTimerRef.current);
-      cloudRetryTimerRef.current = null;
-    }
-    setSyncStatus("syncing");
-    pushPosData(userId, cloudSyncPayloadRef.current).then((ok) => {
-      if (ok) {
-        setSyncStatus("synced");
-        setLastSyncedAt(Date.now());
-      } else {
-        setSyncStatus("error");
-        const jitterMs = 15000 + Math.random() * 5000; // 15–20 seconds
-        cloudRetryTimerRef.current = setTimeout(performCloudSync, jitterMs);
-      }
-    });
-  }, [pushPosData]);
-
   // Cross-device cloud sync, the other half: whenever any piece of café
   // data changes — from ANY of the actions throughout this file (a sale,
   // an edited product, a new employee, a closed shift, ...) — mirror the
@@ -2403,91 +2093,34 @@ export default function CafePOS() {
   // screen reads/writes to instantly; this effect is purely the
   // "eventually mirror it to the cloud too" side of that, so a second
   // device logging in later sees it (via the load effect above).
-  //
-  // NEW: the actual push now goes through performCloudSync() above, which
-  // silently keeps retrying every 15–20s if it fails, instead of giving up
-  // after one attempt.
   useEffect(() => {
     const userId = authUser?.id || null;
     if (!userId || !initialLoadDoneRef.current) return;
 
-    // NEW — keep the latest snapshot ready for performCloudSync() to read,
-    // whether it's called from this debounce, a manual retry tap, or the
-    // silent retry loop.
-    cloudSyncPayloadRef.current = {
-      catalog, sales, parkedOrders, currencyCode, employees,
-      currentEmployeeId, shifts, wasteLogs, orderCounter: nextOrderNo,
-    };
-
     if (cloudSyncTimerRef.current) clearTimeout(cloudSyncTimerRef.current);
-    // NEW — a fresh change supersedes any retry that was already scheduled
-    // for older data; the debounce below will kick off a sync with the
-    // latest snapshot instead.
-    if (cloudRetryTimerRef.current) {
-      clearTimeout(cloudRetryTimerRef.current);
-      cloudRetryTimerRef.current = null;
-    }
-    cloudSyncTimerRef.current = setTimeout(performCloudSync, 1200);
+    cloudSyncTimerRef.current = setTimeout(() => {
+      setSyncStatus("syncing");
+      pushPosData(userId, {
+        catalog, sales, parkedOrders, currencyCode, employees,
+        currentEmployeeId, shifts, wasteLogs, orderCounter: nextOrderNo,
+      }).then((ok) => {
+        if (ok) {
+          setSyncStatus("synced");
+          setLastSyncedAt(Date.now());
+        } else {
+          setSyncStatus("error");
+        }
+      });
+    }, 1200);
 
     return () => {
       if (cloudSyncTimerRef.current) clearTimeout(cloudSyncTimerRef.current);
     };
   }, [
-    authUser?.id, performCloudSync,
+    authUser?.id, pushPosData,
     catalog, sales, parkedOrders, currencyCode, employees,
     currentEmployeeId, shifts, wasteLogs, nextOrderNo,
   ]);
-
-  // NEW — stop the silent retry loop if the owner logs out mid-retry, so it
-  // doesn't keep trying to push a signed-out account's data in the background.
-  useEffect(() => {
-    if (!authUser?.id && cloudRetryTimerRef.current) {
-      clearTimeout(cloudRetryTimerRef.current);
-      cloudRetryTimerRef.current = null;
-    }
-  }, [authUser?.id]);
-
-  // NEW — manual "Refresh" button: unlike the sync above (which only ever
-  // sends THIS device's changes up), this pulls the latest data down from
-  // the cloud and applies it here. This is what a cashier taps after using
-  // the account on a different phone/tablet/computer and wanting to see
-  // those changes on this device right away, instead of waiting for their
-  // next natural reload.
-  const refreshFromCloud = useCallback(async () => {
-    const userId = authUserIdRef.current;
-    if (!userId) return;
-    setSyncStatus("syncing");
-    const cloud = await fetchPosData(userId);
-    const cloudBlob = cloud?.pos_data || null;
-    if (cloudBlob && typeof cloudBlob === "object") {
-      if (cloudBlob.catalog) setCatalog(cloudBlob.catalog);
-      if (cloudBlob.sales) setSales(purgeOldSales(cloudBlob.sales));
-      if (cloudBlob.parkedOrders) setParkedOrders(cloudBlob.parkedOrders);
-      if (cloudBlob.currencyCode) setCurrencyCode(cloudBlob.currencyCode);
-      if (cloudBlob.employees) setEmployees(cloudBlob.employees);
-      if (cloudBlob.currentEmployeeId) setCurrentEmployeeId(cloudBlob.currentEmployeeId);
-      if (cloudBlob.shifts) setShifts(cloudBlob.shifts);
-      if (cloudBlob.wasteLogs) setWasteLogs(cloudBlob.wasteLogs);
-      if (cloudBlob.orderCounter) setNextOrderNo(cloudBlob.orderCounter);
-      await Promise.all([
-        cloudBlob.catalog && safeSet(scopedKey(CATALOG_KEY, userId), cloudBlob.catalog),
-        cloudBlob.sales && safeSet(scopedKey(SALES_KEY, userId), cloudBlob.sales),
-        cloudBlob.parkedOrders && safeSet(scopedKey(PARKED_ORDERS_KEY, userId), cloudBlob.parkedOrders),
-        cloudBlob.currencyCode && safeSet(scopedKey(CURRENCY_KEY, userId), cloudBlob.currencyCode),
-        cloudBlob.employees && safeSet(scopedKey(EMPLOYEES_KEY, userId), cloudBlob.employees),
-        cloudBlob.currentEmployeeId && safeSet(scopedKey(CURRENT_EMPLOYEE_KEY, userId), cloudBlob.currentEmployeeId),
-        cloudBlob.shifts && safeSet(scopedKey(SHIFTS_KEY, userId), cloudBlob.shifts),
-        cloudBlob.wasteLogs && safeSet(scopedKey(WASTE_KEY, userId), cloudBlob.wasteLogs),
-        cloudBlob.orderCounter && safeSet(scopedKey(ORDER_COUNTER_KEY, userId), cloudBlob.orderCounter),
-      ]);
-      setSyncStatus("synced");
-      setLastSyncedAt(Date.now());
-      notify("Synced with your other devices.");
-    } else {
-      setSyncStatus("error");
-      notify("Couldn't refresh — check your connection and try again.", "err");
-    }
-  }, [fetchPosData, notify]);
 
   const changeCurrency = useCallback(async (code) => {
     setCurrencyCode(code);
@@ -2496,6 +2129,11 @@ export default function CafePOS() {
   }, []);
 
   CURRENT_SYMBOL = (CURRENCIES.find((c) => c.code === currencyCode) || CURRENCIES[0]).symbol;
+
+  const notify = useCallback((msg, type = "ok") => {
+    setToast({ msg, type });
+    setTimeout(() => setToast(null), 2600);
+  }, []);
 
   // Once a new version has taken over in the background (see useAppUpdate
   // above), don't reload immediately — wait until the register is actually
@@ -2811,59 +2449,108 @@ export default function CafePOS() {
     }
   }, [authUser, notify]);
 
-  // Called from the Upgrade screen's manual-payment fallback (GCash/bank
-  // transfer for PH, PayPal.me for everyone else) once the owner has typed
-  // in a payment reference.
-  //
-  // SECURITY FIX: this used to flip subscription_status to "active" itself,
-  // directly from the browser, the instant ANY text was submitted here —
-  // a "self-reported confirmation" with nothing on the server checking that
-  // a payment actually happened. That meant anyone could grant themselves a
-  // free subscription forever just by typing garbage into this box. It now
-  // does the opposite: it can ONLY ever mark the reference "pending" (via
-  // submit_manual_payment() — see the SQL setup block at the top of this
-  // file, which is the real enforcement here, same as redeem_referral() is
-  // for referral codes). That RPC only ever touches payment_reference and
-  // manual_payment_status on the CALLER's own row — it has no way to set
-  // subscription_status itself.
-  //
-  // Actually activating the account happens later, by you: the SQL trigger
-  // emails you the moment this fires, you check the reference against your
-  // GCash/bank/PayPal dashboard, then either:
-  //   - it's real: run this in the Supabase SQL Editor —
-  //       select public.activate_subscription('<account id>', '<reference>');
-  //     (activate_subscription() is the same function the PayPal webhook
-  //     already uses for the fully-automatic path — see the "PAYPAL
-  //     AUTOMATIC ACTIVATION SETUP" block further down this file. It's
-  //     deliberately NOT granted to `authenticated`, so a customer's
-  //     browser key can never call it — only the SQL Editor or your
-  //     service-role key can.)
-  //   - it's fake/unverifiable: run —
-  //       update public.businesses set manual_payment_status = 'rejected' where id = '<account id>';
-  //     so Settings shows them a "we couldn't verify that" state instead of
-  //     leaving them wondering. They can just submit a new reference to try
-  //     again, which puts them back in "pending".
-  const submitManualPayment = useCallback(async (referenceNote) => {
+  // Called from the Upgrade screen once the owner has paid via PayMongo (or
+  // manually — see MANUAL_PAYMENT_NOTE). There's no PayMongo webhook wired
+  // up here (that needs a small server function — see supabase-schema.sql's
+  // notes), so this is a self-reported confirmation: it flips
+  // subscription_status to "active", starts a new SUBSCRIPTION_PERIOD_DAYS
+  // period, and stores whatever reference the owner typed in, for you to
+  // reconcile against PayMongo's dashboard.
+  const markSubscriptionActive = useCallback(async (referenceNote) => {
     if (!authUser) return false;
-    const clean = (referenceNote || "").trim();
-    if (!clean) return false;
+    // First payment ever (was still on "trial") vs. a renewal of an
+    // already-active account. Only a first payment can be discounted by the
+    // one-time referral signup discount — and once used, it's gone for
+    // good, so it doesn't silently reapply to every future renewal.
+    const isFirstPayment = accountRef.current?.subscriptionStatus !== "active";
+    const periodEnd = new Date(Date.now() + SUBSCRIPTION_PERIOD_DAYS * MS_PER_DAY).toISOString();
 
-    const { error } = await supabase.rpc("submit_manual_payment", { p_reference: clean });
-    if (error) {
-      notify("Couldn't submit that reference — " + error.message, "err");
-      return false;
+    // On a first payment, actually "spend" any referral code that was
+    // applied-but-not-yet-paid (pending_referral_code) BEFORE the update
+    // below flips subscription_status to "active" — this is the ONLY
+    // moment a code is ever marked used, for both this account and the
+    // referrer, and it's why a code clicked "Apply" and then abandoned
+    // never blocks a later, real attempt. Awaited (unlike before) and done
+    // FIRST specifically so referred_by is already committed on this row
+    // by the time the subscription-change email trigger fires from the
+    // update further down — otherwise the "New Paid Subscription" email
+    // would always show "Referral Code Used: None", even when one was
+    // used, because the two writes used to race. See
+    // finalize_referral_redemption() in the SQL setup block at the top of
+    // this file, which is also the real enforcement: it's a no-op if this
+    // account never applied a code, and a safe no-op if this exact
+    // referral was somehow already finalized before (so this can never
+    // double-credit a referrer or double-count a redemption, even if this
+    // function ever runs twice for the same first payment). A failure here
+    // is logged but never blocks the subscriber's own upgrade below.
+    if (isFirstPayment) {
+      try {
+        const { error: rewardErr } = await supabase.rpc("finalize_referral_redemption");
+        if (rewardErr) console.error("finalize_referral_redemption failed:", rewardErr);
+      } catch (rewardErr) {
+        console.error("finalize_referral_redemption failed:", rewardErr);
+      }
     }
 
+    // Snapshot the pricing that's about to be charged, in the subscriber's
+    // own currency, BEFORE discount_percent/reward_credits are reset below
+    // — this is what gets emailed to the owner (see notify_on_subscription_change
+    // in the SQL setup block) and is intentionally the exact numbers the
+    // subscriber was shown on the Upgrade screen, not a re-derived guess:
+    // first payment uses their one-time referral discount (discountPercent),
+    // a renewal uses whatever reward credit they'd built up (rewardCredits,
+    // capped the same way UpgradeView caps it for display/charging).
+    const originalAmount = lockedSubscriptionPrice(currencyCode);
+    const discountPercentApplied = isFirstPayment
+      ? (accountRef.current?.discountPercent || 0)
+      : Math.min(accountRef.current?.rewardCredits || 0, MAX_REWARD_CREDIT_PERCENT);
+    const finalAmount = originalAmount - originalAmount * (discountPercentApplied / 100);
+
+    // Every time a billing cycle starts (first payment OR a renewal), the
+    // 3% referral reward credit resets back to 0% for the new month — it
+    // does not accumulate or roll over. Fresh referrals made DURING the new
+    // cycle build the credit back up toward the *next* bill.
+    const updates = {
+      subscription_status: "active",
+      subscription_period_end: periodEnd,
+      payment_reference: referenceNote || null,
+      reward_credits: 0,
+      last_payment_currency: currencyCode,
+      last_payment_original_amount: originalAmount,
+      last_payment_discount_percent: discountPercentApplied,
+      last_payment_final_amount: finalAmount,
+    };
+    if (isFirstPayment) {
+      updates.discount_percent = 0;
+      // Set once, the first time an account ever goes active — and reset
+      // again if they unsubscribe and later resubscribe, since that's
+      // treated as a fresh "first" subscription (see unsubscribeAccount /
+      // isFirstPayment above). Kept separate from subscription_period_end
+      // (which moves every renewal) so "Subscription Start Date" in the
+      // New Paid Subscription email always reflects this specific
+      // subscription, not the most recent renewal.
+      updates.subscription_start_date = new Date().toISOString();
+    }
+    const { error } = await supabase.from("businesses").update(updates).eq("id", authUser.id);
+    if (error) {
+      notify("Couldn't confirm the upgrade — " + error.message, "err");
+      return false;
+    }
     const next = {
       ...(accountRef.current || {}),
-      paymentReference: clean,
-      manualPaymentStatus: "pending",
-      manualPaymentSubmittedAt: new Date().toISOString(),
+      subscriptionStatus: "active",
+      subscriptionPeriodEnd: periodEnd,
+      paymentReference: referenceNote || "",
+      discountPercent: isFirstPayment ? 0 : (accountRef.current?.discountPercent || 0),
+      rewardCredits: 0,
+      subscriptionStartDate: isFirstPayment ? updates.subscription_start_date : accountRef.current?.subscriptionStartDate,
     };
     accountRef.current = next;
     setAccount(next);
+
+    notify(isFirstPayment ? "You're upgraded — thanks for subscribing!" : "Renewed — thanks for staying with us! Your reward credit has reset to 0% for the new billing cycle.");
     return true;
-  }, [authUser, notify]);
+  }, [authUser, notify, currencyCode]);
 
   // Applies a referral/discount code from the Subscribe popup, for an owner
   // who's already signed in, before their first payment (unlike the old
@@ -3965,93 +3652,6 @@ export default function CafePOS() {
     applySaleItemChanges(id, { restoreIndices: sale.items.map((_, i) => i), approvedById, approvedByName });
   };
 
-  // ---------- Log to waste (sale items that were cooked/prepped in error) ----------
-  // Same bookkeeping as a void — the item is pulled out of revenue/reports the
-  // same way (see itemIsVoided/recomputeSaleTotals above) — but for the case
-  // where the ingredients can't go back on the shelf because they were already
-  // cooked into the wrong order. So instead of returning stock (what a void
-  // does), each item's recipe is recorded as a waste entry (same shape as
-  // logWaste/logProductWaste, so it shows up in the Inventory waste log) and
-  // the ingredient stock itself is left untouched. Items are tagged
-  // `wasteLogged: true` so History/receipts can label this "Logged to waste"
-  // instead of "Voided", even though under the hood it's excluded from
-  // revenue exactly like a void. Deliberately no restore path here — once
-  // something's logged as waste there's no stock to give back.
-  const logSaleItemsToWaste = (id, { indices = [], reason, note, approvedById, approvedByName }) => {
-    const sale = sales.find((s) => s.id === id);
-    if (!sale) return;
-    const targetIndices = indices.filter((idx) => !itemIsVoided(sale, sale.items[idx]));
-    if (targetIndices.length === 0) { setWasteSaleModal(null); return; }
-
-    const now = Date.now();
-    const byId = currentEmployee?.id || null;
-    const byName = currentEmployee?.name || "Unassigned";
-    const batchId = uid("wbatch");
-    const trimmedNote = (note || "").trim();
-    const wasteEntries = [];
-
-    const items = sale.items.map((it, idx) => {
-      if (!targetIndices.includes(idx)) return it;
-      (it.recipe || []).forEach((r) => {
-        const ing = ingredientMap[r.ingredientId];
-        const amt = +(r.amount * it.qty).toFixed(4);
-        wasteEntries.push({
-          id: uid("waste"),
-          timestamp: now,
-          batchId,
-          ingredientId: r.ingredientId,
-          ingredientName: ing ? ing.name : "Deleted ingredient",
-          unit: ing ? ing.unit : "",
-          amount: amt,
-          reason: reason || WASTE_REASONS[0],
-          note: trimmedNote,
-          cost: ing ? +(ing.cost * amt).toFixed(2) : 0,
-          loggedById: byId,
-          loggedByName: byName,
-          productId: it.productId || null,
-          productName: it.name,
-          productQty: it.qty,
-          saleId: sale.id,
-          orderNo: sale.orderNo,
-        });
-      });
-      return {
-        ...it,
-        voided: true,
-        wasteLogged: true,
-        voidReason: reason,
-        voidNote: trimmedNote,
-        voidedAt: now,
-        voidedById: byId,
-        voidedByName: byName,
-      };
-    });
-
-    const updated = {
-      ...recomputeSaleTotals({ ...sale, items }),
-      wasteLogged: true,
-      voidReason: reason,
-      voidNote: trimmedNote,
-      voidedAt: now,
-      voidedById: byId,
-      voidedByName: byName,
-      approvedById: approvedById || null,
-      approvedByName: approvedByName || null,
-    };
-
-    persistSales(sales.map((s) => (s.id === id ? updated : s)));
-    if (wasteEntries.length) persistWaste([...wasteLogs, ...wasteEntries]);
-    setWasteSaleModal(null);
-    notify(updated.voided ? "Order logged to waste — ingredients recorded as waste." : "Item(s) logged to waste — order total updated.");
-  };
-
-  // Quick full-order action for the "Log to waste" button in history.
-  const wasteWholeSale = (id, reason, note, approvedById, approvedByName) => {
-    const sale = sales.find((s) => s.id === id);
-    if (!sale) return;
-    logSaleItemsToWaste(id, { indices: sale.items.map((_, i) => i), reason, note, approvedById, approvedByName });
-  };
-
   // ---------- Kitchen board ----------
   // Toggling a line item is per-order-per-product (checkout already collapses
   // the cart to one line per product, so productId is a safe key within a
@@ -4152,14 +3752,7 @@ export default function CafePOS() {
       bestMap[i.name].qty += i.qty;
       bestMap[i.name].revenue += i.price * i.qty;
     }));
-    // Full product list (every distinct item sold this period, not just the
-    // top performers) — the downloadable report needs a complete sales
-    // summary, so this stays unsliced. `best` below is the same data capped
-    // to 6 rows, kept only for the on-screen "Best sellers" chart.
-    const allSold = Object.values(bestMap)
-      .map((b) => ({ ...b, price: b.qty ? b.revenue / b.qty : 0 }))
-      .sort((a, b) => b.revenue - a.revenue);
-    const best = allSold.slice(0, 6);
+    const best = Object.values(bestMap).sort((a, b) => b.qty - a.qty).slice(0, 6);
     const empMap = {};
     filteredSales.forEach((s) => {
       const key = s.employeeName || "Unassigned";
@@ -4180,64 +3773,11 @@ export default function CafePOS() {
       reason: r,
       cost: filteredWaste.filter((w) => w.reason === r).reduce((s, w) => s + w.cost, 0),
     })).filter((r) => r.cost > 0);
-
-    // Itemized voided products — true voids only (wasteLogged items are
-    // pulled out below into wasteItems instead, since a voided item's stock
-    // goes back on the shelf and isn't a real cost, while a wasted item's
-    // isn't). Scanned across both still-active orders that had some items
-    // voided (filteredSales) and orders voided in full (filteredVoidedSales),
-    // since a partial void never shows up in filteredVoidedSales.
-    const voidedItemsMap = {};
-    [...filteredSales, ...filteredVoidedSales].forEach((s) => {
-      s.items.forEach((it) => {
-        if (itemIsVoided(s, it) && !it.wasteLogged) {
-          voidedItemsMap[it.name] = voidedItemsMap[it.name] || { name: it.name, qty: 0, total: 0 };
-          voidedItemsMap[it.name].qty += it.qty;
-          voidedItemsMap[it.name].total += it.price * it.qty;
-        }
-      });
-    });
-    const voidedItems = Object.values(voidedItemsMap)
-      .map((v) => ({ ...v, price: v.qty ? v.total / v.qty : 0 }))
-      .sort((a, b) => b.total - a.total);
-
-    // Itemized logged waste — the only section that represents an actual
-    // financial loss (ingredients are gone, nothing goes back to stock).
-    // Waste entries are recorded one row per ingredient, so first collapse
-    // each waste event (shared batchId) back into a single line: a
-    // product-tied event (logged from a sale or "log waste" on a finished
-    // product) becomes one row per product, everything else stays a
-    // per-ingredient row.
-    const wasteBatches = {};
-    filteredWaste.forEach((w) => {
-      const key = w.batchId || w.id;
-      if (!wasteBatches[key]) {
-        wasteBatches[key] = {
-          name: w.productName || w.ingredientName,
-          qty: w.productName ? w.productQty : 0,
-          unit: w.productName ? "" : w.unit,
-          cost: 0,
-        };
-      }
-      if (!w.productName) wasteBatches[key].qty += w.amount;
-      wasteBatches[key].cost += w.cost;
-    });
-    const wasteItemsMap = {};
-    Object.values(wasteBatches).forEach((b) => {
-      const key = `${b.name}|${b.unit}`;
-      wasteItemsMap[key] = wasteItemsMap[key] || { name: b.name, unit: b.unit, qty: 0, total: 0 };
-      wasteItemsMap[key].qty += b.qty;
-      wasteItemsMap[key].total += b.cost;
-    });
-    const wasteItems = Object.values(wasteItemsMap)
-      .map((w) => ({ ...w, price: w.qty ? w.total / w.qty : 0 }))
-      .sort((a, b) => b.total - a.total);
-
     return {
-      revenue, cost, profit: revenue - cost, orders: filteredSales.length, itemsSold, best, allSold,
+      revenue, cost, profit: revenue - cost, orders: filteredSales.length, itemsSold, best,
       discountsGiven, cashRevenue, onlineRevenue, byEmployee,
-      voidedOrders: filteredVoidedSales.length, voidedRevenue, voidedCost, voidedProfit, voidedItems,
-      wasteCost, wasteEntries: filteredWaste.length, wasteByReason, wasteItems,
+      voidedOrders: filteredVoidedSales.length, voidedRevenue, voidedCost, voidedProfit,
+      wasteCost, wasteEntries: filteredWaste.length, wasteByReason,
     };
   }, [filteredSales, filteredVoidedSales, filteredWaste]);
 
@@ -4320,16 +3860,7 @@ export default function CafePOS() {
 
   const historyStats = useMemo(() => {
     const active = historySales.filter((s) => !s.voided);
-    // Waste is split out from "voided" here because the two mean different
-    // things for the books: a void returns its ingredients to stock (no real
-    // loss, just a correction), while waste means the ingredients are gone —
-    // an actual cost. So a sale that was fully logged to waste isn't counted
-    // in the Voided cards below; its items are counted in the waste cards
-    // instead. Waste is tallied per item (not per order) since that's what
-    // "number of items / total cost" actually needs, and it works correctly
-    // even for orders that mix a void item with a wasted item.
-    const voided = historySales.filter((s) => s.voided && !s.wasteLogged);
-    const wastedItems = historySales.flatMap((s) => s.items.filter((it) => it.wasteLogged));
+    const voided = historySales.filter((s) => s.voided);
     return {
       activeCount: active.length,
       activeRevenue: active.reduce((s, x) => s + x.total, 0),
@@ -4337,8 +3868,6 @@ export default function CafePOS() {
       // Fully-voided sales recompute to $0 (nothing active left) — show what
       // was originally charged instead, for an accurate "voided amount" figure.
       voidedRevenue: voided.reduce((s, x) => s + (x.originalTotal ?? x.total), 0),
-      wastedItemCount: wastedItems.reduce((s, it) => s + it.qty, 0),
-      wastedCost: +wastedItems.reduce((s, it) => s + (it.cost || 0) * it.qty, 0).toFixed(2),
     };
   }, [historySales]);
 
@@ -4470,7 +3999,7 @@ export default function CafePOS() {
           account={account}
           trialInfo={trialInfo}
           currencyCode={currencyCode}
-          onConfirm={submitManualPayment}
+          onConfirm={markSubscriptionActive}
           onApplyCode={applyReferralCode}
           onClose={null}
           onLogOut={logOut}
@@ -4497,8 +4026,6 @@ export default function CafePOS() {
         openEmployeeModal={() => setEmployeeModal(true)}
         syncStatus={syncStatus}
         lastSyncedAt={lastSyncedAt}
-        onRetrySync={performCloudSync}
-        onRefresh={refreshFromCloud}
       />
       <Nav view={view} setView={setView} lowCount={lowStock.length} shiftOpen={!!activeShift} kitchenCount={kitchenPreparing.length} tabsCount={parkedOrders.length} />
 
@@ -4648,7 +4175,6 @@ export default function CafePOS() {
             stats={historyStats}
             openVoid={(sale) => setVoidModal(sale)}
             openRestore={(sale) => setRestoreModal(sale)}
-            openWaste={(sale) => setWasteSaleModal(sale)}
             detailSale={detailSale}
             setDetailSale={setDetailSale}
           />
@@ -4685,7 +4211,6 @@ export default function CafePOS() {
             trialInfo={trialInfo}
             currencyCode={currencyCode}
             openUpgrade={() => setShowUpgrade(true)}
-            thermalPrinter={thermalPrinter}
           />
         )}
       </main>
@@ -4695,7 +4220,7 @@ export default function CafePOS() {
           account={account}
           trialInfo={trialInfo}
           currencyCode={currencyCode}
-          onConfirm={submitManualPayment}
+          onConfirm={markSubscriptionActive}
           onApplyCode={applyReferralCode}
           onClose={trialInfo.expired && !trialInfo.isSubscribed ? null : () => setShowUpgrade(false)}
           onRefreshAccount={refreshAccountStatus}
@@ -4770,8 +4295,8 @@ export default function CafePOS() {
           onConfirm={confirmHandoff}
         />
       )}
-      {receipt && <ReceiptModal sale={receipt} onClose={() => setReceipt(null)} thermalPrinter={thermalPrinter} notify={notify} />}
-      {detailSale && <ReceiptModal sale={detailSale} onClose={() => setDetailSale(null)} closeLabel="Close" thermalPrinter={thermalPrinter} notify={notify} />}
+      {receipt && <ReceiptModal sale={receipt} onClose={() => setReceipt(null)} />}
+      {detailSale && <ReceiptModal sale={detailSale} onClose={() => setDetailSale(null)} closeLabel="Close" />}
       {parkModalOpen && (
         <ParkOrderModal
           nextOrderNo={nextOrderNo}
@@ -4805,16 +4330,6 @@ export default function CafePOS() {
           onConfirm={(approvedById, approvedByName) => {
             restoreSale(restoreModal.id, approvedById, approvedByName);
             setRestoreModal(null);
-          }}
-        />
-      )}
-      {wasteSaleModal && (
-        <WasteSaleModal
-          sale={wasteSaleModal}
-          approverOptions={approverOptions}
-          onClose={() => setWasteSaleModal(null)}
-          onConfirm={(indices, reason, note, approvedById, approvedByName) => {
-            logSaleItemsToWaste(wasteSaleModal.id, { indices, reason, note, approvedById, approvedByName });
           }}
         />
       )}
@@ -5277,7 +4792,7 @@ function UpdateBanner({ onRefreshNow }) {
 // dot + one word, not a banner or popup. "idle" (nothing pushed yet this
 // session, e.g. right after login) renders nothing, since there's nothing
 // meaningful to report yet.
-function SyncStatusBadge({ status, lastSyncedAt, onRetry }) {
+function SyncStatusBadge({ status, lastSyncedAt }) {
   if (!status || status === "idle") return null;
 
   const timeAgoLabel = (ts) => {
@@ -5294,36 +4809,19 @@ function SyncStatusBadge({ status, lastSyncedAt, onRetry }) {
   const config = {
     syncing: { color: "var(--ink-soft)", dot: "#B7B0A6", label: "Syncing…" },
     synced: { color: "var(--ink-soft)", dot: "#4C9A6A", label: lastSyncedAt ? `Synced ${timeAgoLabel(lastSyncedAt)}` : "Synced" },
-    // NEW — shorter label since "Retry now" is appended in the button below.
-    error: { color: "var(--alert)", dot: "var(--alert)", label: "Not synced" },
+    error: { color: "var(--alert)", dot: "var(--alert)", label: "Not synced — check connection" },
   }[status];
   if (!config) return null;
-
-  // NEW — the app is already quietly retrying this in the background every
-  // 15–20 seconds on its own (see performCloudSync in the main component).
-  // This turns the red badge into a real button so a cashier can force an
-  // immediate retry instead of waiting for the next automatic attempt.
-  // Shown on all screen sizes (not just sm+) since a failed sync is worth
-  // surfacing on a phone too, not just hidden on mobile.
-  if (status === "error") {
-    return (
-      <button
-        onClick={onRetry}
-        className="flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-full border font-medium"
-        style={{ borderColor: "var(--alert)", color: "var(--alert)", background: "#F3E3DC" }}
-        title="Your last change couldn't be saved to the cloud. We're quietly retrying every 15–20 seconds in the background — tap to retry right now instead."
-      >
-        <span style={{ width: 6, height: 6, borderRadius: "50%", background: "var(--alert)", flexShrink: 0 }} />
-        {config.label} · Retry now
-      </button>
-    );
-  }
 
   return (
     <span
       className="hidden sm:flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-full border"
       style={{ borderColor: "var(--line)", color: config.color, background: "var(--surface)" }}
-      title="Your data is backed up to the cloud and will show up on any device you log into."
+      title={
+        status === "error"
+          ? "Your last change couldn't be saved to the cloud. It's safe on this device, but won't show up on other devices until this succeeds — check your internet connection."
+          : "Your data is backed up to the cloud and will show up on any device you log into."
+      }
     >
       <span
         style={{
@@ -5336,7 +4834,7 @@ function SyncStatusBadge({ status, lastSyncedAt, onRetry }) {
   );
 }
 
-function Header({ businessName, low, confirmReset, setConfirmReset, resetAll, currencyCode, changeCurrency, employees, currentEmployee, selectEmployee, openEmployeeModal, syncStatus, lastSyncedAt, onRetrySync, onRefresh }) {
+function Header({ businessName, low, confirmReset, setConfirmReset, resetAll, currencyCode, changeCurrency, employees, currentEmployee, selectEmployee, openEmployeeModal, syncStatus, lastSyncedAt }) {
   return (
     <header className="max-w-6xl mx-auto px-4 sm:px-6 pt-6 pb-3 flex items-start justify-between no-print">
       <div>
@@ -5379,20 +4877,7 @@ function Header({ businessName, low, confirmReset, setConfirmReset, resetAll, cu
           {(CURRENCIES.find((c) => c.code === currencyCode) || CURRENCIES[0]).code}{" "}
           {(CURRENCIES.find((c) => c.code === currencyCode) || CURRENCIES[0]).symbol}
         </span>
-        {syncStatus !== undefined && (
-          <SyncStatusBadge status={syncStatus} lastSyncedAt={lastSyncedAt} onRetry={onRetrySync} />
-        )}
-        {onRefresh && (
-          <button
-            onClick={onRefresh}
-            disabled={syncStatus === "syncing"}
-            className="flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-full border disabled:opacity-50"
-            style={{ borderColor: "var(--line)", color: "var(--ink-soft)" }}
-            title="Pull the latest data from your account — use this if you made changes on another device"
-          >
-            <RefreshCw size={12} className={syncStatus === "syncing" ? "animate-spin" : ""} /> Refresh
-          </button>
-        )}
+        {syncStatus !== undefined && <SyncStatusBadge status={syncStatus} lastSyncedAt={lastSyncedAt} />}
         <button
           onClick={() => (confirmReset ? resetAll() : setConfirmReset(true))}
           onBlur={() => setConfirmReset(false)}
@@ -6490,213 +5975,6 @@ function buildReceiptHTML(sale) {
   return html;
 }
 
-// =============================================================================
-// BLUETOOTH THERMAL PRINTER (ESC/POS) — optional, alongside browser print
-// =============================================================================
-// Most cheap 58mm/80mm "Bluetooth thermal receipt printer" hardware (the
-// generic kind sold for small shops, not a big brand like Epson/Star) uses
-// this exact GATT service/characteristic pair over Bluetooth LE — it's the
-// de facto standard these clone boards ship with, not an official spec. If
-// a given printer uses different UUIDs it just won't show up in the device
-// picker (requestDevice filters on this service), and the app quietly falls
-// back to the existing browser print dialog — nothing breaks.
-const THERMAL_PRINTER_SERVICE_UUID = "000018f0-0000-1000-8000-00805f9b34fb";
-const THERMAL_PRINTER_CHAR_UUID = "00002af1-0000-1000-8000-00805f9b34fb";
-const THERMAL_WIDTH_KEY = "cafe_pos_printer_width_v1"; // device-local, not account data — every device wired to its own printer picks its own paper width
-
-// Cheap ESC/POS boards print single-byte text, not UTF-8 — anything outside
-// printable ASCII usually comes out as garbage or a blank box. Swap the
-// specific symbols this app actually produces (currency signs, curly
-// punctuation, the × in "2 × Latte") for an ASCII-safe stand-in, then drop
-// anything else that slips through.
-function sanitizeForPrinter(s) {
-  return String(s ?? "")
-    .replace(/₱/g, "P")
-    .replace(/€/g, "EUR")
-    .replace(/£/g, "GBP")
-    .replace(/¥/g, "JPY")
-    .replace(/₹/g, "INR")
-    .replace(/฿/g, "THB")
-    .replace(/₫/g, "VND")
-    .replace(/[""]/g, '"')
-    .replace(/['']/g, "'")
-    .replace(/[–—]/g, "-")
-    .replace(/×/g, "x")
-    .replace(/…/g, "...")
-    .replace(/☕/g, "")
-    .replace(/[^\x00-\x7E]/g, "?");
-}
-
-// Lays "left" and "right" out on one line with right-aligned amounts, like a
-// receipt column — e.g. "2 x Latte             P240.00". Falls back to two
-// lines when the item name alone is too long for the paper width, so the
-// amount never gets crushed or wrapped mid-number.
-function printerRow(left, right, width) {
-  const l = sanitizeForPrinter(left);
-  const r = sanitizeForPrinter(right);
-  if (l.length + r.length + 1 > width) {
-    return `${l}\n${r.padStart(width, " ")}`;
-  }
-  return l + " ".repeat(width - l.length - r.length) + r;
-}
-
-function printerCenter(s, width) {
-  const t = sanitizeForPrinter(s);
-  if (t.length >= width) return t.slice(0, width);
-  return " ".repeat(Math.floor((width - t.length) / 2)) + t;
-}
-
-// Builds the raw ESC/POS byte stream for one sale receipt. `width` is
-// characters-per-line (32 for common 58mm paper, 48 for 80mm).
-function buildEscPosReceipt(sale, width = 32) {
-  const bytes = [];
-  const cmd = (...vals) => vals.forEach((v) => bytes.push(v));
-  const raw = (str) => {
-    const s = sanitizeForPrinter(str);
-    for (let i = 0; i < s.length; i++) bytes.push(s.charCodeAt(i) & 0xff);
-  };
-  const line = (str = "") => { raw(str); cmd(0x0a); };
-  const divider = () => line("-".repeat(width));
-  const bold = (on) => cmd(0x1b, 0x45, on ? 0x01 : 0x00);
-  const align = (a) => cmd(0x1b, 0x61, a === "center" ? 0x01 : a === "right" ? 0x02 : 0x00);
-
-  cmd(0x1b, 0x40); // initialize printer
-  align("center");
-  bold(true);
-  line("The Counter");
-  bold(false);
-  line(`Order #${sale.orderNo}`);
-  line(new Date(sale.timestamp).toLocaleString());
-  if (sale.employeeName) line(`Served by ${sale.employeeName}`);
-  if (sale.tabLabel) line(`Tab: ${sale.tabLabel}`);
-  align("left");
-  divider();
-
-  if (sale.voided) {
-    bold(true);
-    line(sale.wasteLogged ? "LOGGED TO WASTE — not counted in reports" : "VOIDED — not counted in reports");
-    bold(false);
-    if (sale.voidReason) line(`Reason: ${sale.voidReason}`);
-    if (sale.approvedByName) line(`Approved by ${sale.approvedByName}`);
-    divider();
-  } else if (sale.restoredAt) {
-    bold(true);
-    line("RESTORED");
-    bold(false);
-    divider();
-  }
-
-  sale.items.forEach((i) => {
-    line(printerRow(`${i.qty} x ${i.name}`, money(i.price * i.qty), width));
-  });
-  divider();
-
-  line(printerRow("Subtotal", money(sale.subtotal ?? sale.total), width));
-  if (sale.discountAmount > 0) {
-    line(printerRow(`Discount${sale.discountType === "percent" ? ` (${sale.discountValue}%)` : ""}`, `-${money(sale.discountAmount)}`, width));
-  }
-  bold(true);
-  line(printerRow("TOTAL", money(sale.total), width));
-  bold(false);
-  divider();
-
-  line(printerRow("Payment", (sale.paymentMethod || "cash").toUpperCase(), width));
-  if (sale.paymentMethod === "cash") {
-    line(printerRow("Cash received", money(sale.amountTendered), width));
-    line(printerRow("Change", money(sale.change), width));
-  } else if (sale.paymentMethod === "split" && sale.payments) {
-    sale.payments.forEach((p) => line(printerRow(p.method, money(p.amount), width)));
-  }
-
-  line();
-  align("center");
-  line("Thanks for stopping by");
-  line();
-  line();
-  line();
-  cmd(0x1d, 0x56, 0x42, 0x00); // partial cut (most clone boards support this; ignored harmlessly if not)
-  return new Uint8Array(bytes);
-}
-
-// Connects to, remembers, and writes to a paired Bluetooth thermal printer.
-// Entirely optional: `supported` is false on any browser without Web
-// Bluetooth (all of iOS/iPadOS Safari, and Safari in general), and every
-// caller falls back to the existing browser print dialog when there's no
-// active connection — this hook only ever adds a faster path, never removes
-// the old one.
-function useThermalPrinter(notify) {
-  const [supported] = useState(() => typeof navigator !== "undefined" && !!navigator.bluetooth);
-  const [connected, setConnected] = useState(false);
-  const [connecting, setConnecting] = useState(false);
-  const [printerName, setPrinterName] = useState(null);
-  const [paperWidth, setPaperWidth] = useState(() => {
-    try { return window.localStorage.getItem(THERMAL_WIDTH_KEY) || "32"; } catch { return "32"; }
-  });
-  const deviceRef = useRef(null);
-  const charRef = useRef(null);
-
-  const handleDisconnected = useCallback(() => {
-    setConnected(false);
-    setPrinterName(null);
-    charRef.current = null;
-  }, []);
-
-  const connect = useCallback(async () => {
-    if (!supported || connecting) return;
-    setConnecting(true);
-    try {
-      const device = await navigator.bluetooth.requestDevice({
-        filters: [{ services: [THERMAL_PRINTER_SERVICE_UUID] }],
-      });
-      device.addEventListener("gattserverdisconnected", handleDisconnected);
-      const server = await device.gatt.connect();
-      const service = await server.getPrimaryService(THERMAL_PRINTER_SERVICE_UUID);
-      const characteristic = await service.getCharacteristic(THERMAL_PRINTER_CHAR_UUID);
-      deviceRef.current = device;
-      charRef.current = characteristic;
-      setPrinterName(device.name || "Thermal printer");
-      setConnected(true);
-      notify?.(`Connected to ${device.name || "printer"}.`);
-    } catch (e) {
-      if (e?.name !== "NotFoundError") { // user closed the device picker — not a real error
-        notify?.(`Couldn't connect: ${e?.message || "printer not found"}`, "error");
-      }
-    } finally {
-      setConnecting(false);
-    }
-  }, [supported, connecting, handleDisconnected, notify]);
-
-  const disconnect = useCallback(() => {
-    try { deviceRef.current?.gatt?.disconnect(); } catch {}
-    handleDisconnected();
-  }, [handleDisconnected]);
-
-  const setWidth = useCallback((w) => {
-    setPaperWidth(w);
-    try { window.localStorage.setItem(THERMAL_WIDTH_KEY, w); } catch {}
-  }, []);
-
-  // Bluetooth LE writes are capped at a small packet size (varies by
-  // device/OS, often as low as ~20 bytes), so a whole receipt has to go out
-  // in chunks, awaited one at a time — sending it all in one call silently
-  // truncates on many printers.
-  const print = useCallback(async (sale) => {
-    if (!charRef.current) throw new Error("No printer connected");
-    const bytes = buildEscPosReceipt(sale, Number(paperWidth) || 32);
-    const CHUNK = 100;
-    for (let i = 0; i < bytes.length; i += CHUNK) {
-      const slice = bytes.slice(i, i + CHUNK);
-      if (charRef.current.writeValueWithoutResponse) {
-        await charRef.current.writeValueWithoutResponse(slice);
-      } else {
-        await charRef.current.writeValue(slice);
-      }
-    }
-  }, [paperWidth]);
-
-  return { supported, connected, connecting, printerName, paperWidth, setWidth, connect, disconnect, print };
-}
-
 // Sends a receipt to the browser's print dialog via a real popup window
 // (window.open). This works well on desktop and Android, but on iPad —
 // especially when the app is installed as a standalone PWA — window.open
@@ -6829,9 +6107,7 @@ function ReceiptModal({ sale, onClose, closeLabel = "New order" }) {
         </div>
         {sale.voided && (
           <div className="rounded-lg px-3 py-2 mb-3 text-xs" style={{ background: "#F3E3DC", color: "var(--alert)" }}>
-            <div className="flex items-center gap-1.5 font-medium">
-              {sale.wasteLogged ? <><Trash2 size={12} /> Logged to waste — not counted in reports</> : <><Ban size={12} /> Voided — not counted in reports</>}
-            </div>
+            <div className="flex items-center gap-1.5 font-medium"><Ban size={12} /> Voided — not counted in reports</div>
             <div className="mt-1" style={{ color: "var(--ink-soft)" }}>
               Reason: {sale.voidReason}{sale.voidedAt ? ` · ${new Date(sale.voidedAt).toLocaleString()}` : ""}
               {sale.voidedByName ? ` · by ${sale.voidedByName}` : ""}
@@ -6840,9 +6116,6 @@ function ReceiptModal({ sale, onClose, closeLabel = "New order" }) {
               <div className="mt-0.5" style={{ color: "var(--ink-soft)" }}>Approved by {sale.approvedByName}</div>
             )}
             {sale.voidNote && <div className="mt-0.5" style={{ color: "var(--ink-soft)" }}>Note: {sale.voidNote}</div>}
-            {sale.wasteLogged && (
-              <div className="mt-0.5" style={{ color: "var(--ink-soft)" }}>Ingredients recorded in the Inventory waste log, not returned to stock.</div>
-            )}
           </div>
         )}
         {!sale.voided && sale.restoredAt && (
@@ -7088,107 +6361,6 @@ function VoidSaleModal({ sale, approverOptions, onClose, onConfirm }) {
   );
 }
 
-// For orders that were prepped/cooked wrong and can't be un-cooked — the
-// ingredients can't go back to stock like a normal void, so this logs them as
-// waste instead. Structurally the same as VoidSaleModal (pick items, pick a
-// reason, manager approves), but there's no restore side to it and the reason
-// list is the same one used by Inventory's waste log (WASTE_REASONS), which
-// includes "Wrong order" for exactly this scenario.
-function WasteSaleModal({ sale, approverOptions, onClose, onConfirm }) {
-  const [reason, setReason] = useState("Wrong order");
-  const [note, setNote] = useState("");
-  const [approverId, setApproverId] = useState(approverOptions[0]?.id || "");
-  const [pin, setPin] = useState("");
-  const [checked, setChecked] = useState(() => sale.items.map((it) => !itemIsVoided(sale, it)));
-  const toggle = (idx) => setChecked((c) => c.map((v, i) => (i === idx ? !v : v)));
-
-  const indices = checked.reduce((acc, v, i) => (v && !itemIsVoided(sale, sale.items[i]) ? [...acc, i] : acc), []);
-  const needsNote = reason === "Other" && indices.length > 0;
-  const approver = approverOptions.find((e) => e.id === approverId) || null;
-  const pinOk = !!approver && !!approver.pin && pin === approver.pin;
-  const multiItem = sale.items.length > 1;
-  const allSelected = indices.length === sale.items.filter((it) => !itemIsVoided(sale, it)).length;
-
-  const submit = () => {
-    if (needsNote && !note.trim()) return;
-    if (indices.length === 0 || !pinOk) return;
-    onConfirm(indices, reason, note.trim(), approver?.id || null, approver?.name || null);
-  };
-
-  return (
-    <ModalWrap onClose={onClose}>
-      <div className="p-5">
-        <h3 className="display-font text-lg mb-1" style={{ fontWeight: 600 }}>Log to waste</h3>
-        <p className="text-xs mb-4" style={{ color: "var(--ink-soft)" }}>
-          Order #{sale.orderNo} · {money(sale.originalTotal ?? sale.total)} · {new Date(sale.timestamp).toLocaleString()}
-        </p>
-
-        {multiItem && (
-          <div className="rounded-lg border mb-4 overflow-hidden" style={{ borderColor: "var(--line)" }}>
-            {sale.items.map((it, idx) => {
-              const already = itemIsVoided(sale, it);
-              return (
-                <label
-                  key={idx}
-                  className="flex items-center gap-2.5 px-3 py-2 text-sm"
-                  style={{
-                    borderBottom: idx < sale.items.length - 1 ? "1px solid var(--line)" : "none",
-                    background: checked[idx] && !already ? "#FBF1EC" : "transparent",
-                    opacity: already ? 0.5 : 1,
-                    cursor: already ? "not-allowed" : "pointer",
-                  }}
-                >
-                  <input type="checkbox" checked={checked[idx]} disabled={already} onChange={() => toggle(idx)} />
-                  <span className="flex-1">{it.qty} × {it.name}{already ? " (already voided)" : ""}</span>
-                  <span className="mono-font text-xs" style={{ color: "var(--ink-soft)" }}>{money(it.price * it.qty)}</span>
-                </label>
-              );
-            })}
-          </div>
-        )}
-
-        <div className="rounded-lg px-3 py-2 mb-4 text-xs" style={{ background: "var(--bg)", color: "var(--ink-soft)" }}>
-          {multiItem && !allSelected
-            ? "Checked items will be logged to waste and removed from this order's total. Their ingredients are recorded in the Inventory waste log, not returned to stock."
-            : "This sale will stay in Sales History marked as logged to waste, its amount will no longer be counted in Reports, and its ingredients will be recorded in the Inventory waste log instead of being returned to stock."}
-        </div>
-
-        <ApproverPinField approverOptions={approverOptions} approverId={approverId} setApproverId={setApproverId} pin={pin} setPin={setPin} />
-
-        <div className="space-y-3 mt-3">
-          <Field label="Reason">
-            <select value={reason} onChange={(e) => setReason(e.target.value)} className="w-full border rounded-lg px-3 py-2 text-sm" style={{ borderColor: "var(--line)" }}>
-              {WASTE_REASONS.map((r) => <option key={r} value={r}>{r}</option>)}
-            </select>
-          </Field>
-          <Field label={needsNote ? "Note (required)" : "Note (optional)"}>
-            <textarea
-              value={note}
-              onChange={(e) => setNote(e.target.value)}
-              rows={3}
-              placeholder="Add any details — e.g. which order it was meant for…"
-              className="w-full border rounded-lg px-3 py-2 text-sm resize-none"
-              style={{ borderColor: "var(--line)" }}
-            />
-          </Field>
-        </div>
-
-        <div className="flex gap-2 mt-5">
-          <button onClick={onClose} className="flex-1 py-2 rounded-lg text-sm border" style={{ borderColor: "var(--line)" }}>Cancel</button>
-          <button
-            onClick={submit}
-            disabled={indices.length === 0 || (needsNote && !note.trim()) || !pinOk}
-            className="flex-1 py-2 rounded-lg text-sm font-medium disabled:opacity-50"
-            style={{ background: "var(--alert)", color: "#fff" }}
-          >
-            <span className="flex items-center justify-center gap-1.5"><Trash2 size={14} /> Log to waste</span>
-          </button>
-        </div>
-      </div>
-    </ModalWrap>
-  );
-}
-
 // Voided orders can only be brought back into Reports with a manager's
 // sign-off — this is a lightweight approval gate for the quick "Restore"
 // action on a fully-voided order (as opposed to the per-item management
@@ -7280,7 +6452,7 @@ function DateFilterBar({ mode, setMode, day, setDay, rangeStart, setRangeStart, 
 function SalesHistoryView({
   historyMode, setHistoryMode, historyDay, setHistoryDay,
   historyRangeStart, setHistoryRangeStart, historyRangeEnd, setHistoryRangeEnd,
-  sales, stats, openVoid, openRestore, openWaste, detailSale, setDetailSale,
+  sales, stats, openVoid, openRestore, detailSale, setDetailSale,
 }) {
   return (
     <div>
@@ -7292,11 +6464,11 @@ function SalesHistoryView({
         rangeEnd={historyRangeEnd} setRangeEnd={setHistoryRangeEnd}
       />
 
-      <div className="grid grid-cols-4 gap-3 mb-6">
-        <Stat label="Active sales" value={stats.activeCount} small />
-        <Stat label="Active revenue" value={money(stats.activeRevenue)} accent small />
-        <Stat label="Voided sales" value={stats.voidedCount} small />
-        <Stat label="Total waste amount" value={money(stats.wastedCost)} alert small />
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-6">
+        <Stat label="Active sales" value={stats.activeCount} />
+        <Stat label="Active revenue" value={money(stats.activeRevenue)} accent />
+        <Stat label="Voided sales" value={stats.voidedCount} />
+        <Stat label="Voided amount" value={money(stats.voidedRevenue)} />
       </div>
 
       {sales.length === 0 ? (
@@ -7323,7 +6495,7 @@ function SalesHistoryView({
                     )}
                     {s.voided ? (
                       <span className="text-[10px] px-1.5 py-0.5 rounded-full flex items-center gap-1" style={{ background: "#F3E3DC", color: "var(--alert)" }}>
-                        {s.wasteLogged ? <><Trash2 size={10} /> Logged to waste</> : <><Ban size={10} /> Voided</>}
+                        <Ban size={10} /> Voided
                       </span>
                     ) : (
                       <span className="text-[10px] px-1.5 py-0.5 rounded-full" style={{ background: "#EAF0E2", color: "var(--primary-dark)" }}>
@@ -7363,22 +6535,15 @@ function SalesHistoryView({
                   <div className={`mono-font font-semibold text-sm ${s.voided ? "line-through" : ""}`} style={{ color: s.voided ? "var(--ink-soft)" : "var(--ink)" }}>
                     {money(s.total)}
                   </div>
-                  <div className="mt-1.5 flex flex-col items-end gap-1">
+                  <div className="mt-1.5">
                     {s.voided ? (
-                      !s.wasteLogged && (
-                        <button onClick={() => openRestore(s)} className="flex items-center gap-1 text-xs px-2 py-1 rounded-lg border" style={{ borderColor: "var(--line)", color: "var(--primary-dark)" }}>
-                          <Undo2 size={12} /> Restore
-                        </button>
-                      )
+                      <button onClick={() => openRestore(s)} className="flex items-center gap-1 text-xs px-2 py-1 rounded-lg border" style={{ borderColor: "var(--line)", color: "var(--primary-dark)" }}>
+                        <Undo2 size={12} /> Restore
+                      </button>
                     ) : (
-                      <>
-                        <button onClick={() => openVoid(s)} className="flex items-center gap-1 text-xs px-2 py-1 rounded-lg border" style={{ borderColor: "var(--line)", color: "var(--alert)" }}>
-                          <Ban size={12} /> Void
-                        </button>
-                        <button onClick={() => openWaste(s)} className="flex items-center gap-1 text-xs px-2 py-1 rounded-lg border" style={{ borderColor: "var(--line)", color: "var(--alert)" }}>
-                          <Trash2 size={12} /> Log to waste
-                        </button>
-                      </>
+                      <button onClick={() => openVoid(s)} className="flex items-center gap-1 text-xs px-2 py-1 rounded-lg border" style={{ borderColor: "var(--line)", color: "var(--alert)" }}>
+                        <Ban size={12} /> Void
+                      </button>
                     )}
                   </div>
                 </div>
@@ -9377,7 +8542,6 @@ function PrintableReport({ periodLabel, stats, lowStock, sales }) {
             ["Cash sales", money(stats.cashRevenue)],
             ["Online sales", money(stats.onlineRevenue)],
             ["Discounts given", money(stats.discountsGiven)],
-            ["Logged waste cost (financial loss)", money(stats.wasteCost)],
           ].map(([label, val]) => (
             <tr key={label} style={{ borderBottom: "1px solid #E4DCC8" }}>
               <td style={{ padding: "4px 6px 4px 0", color: "#7A6D5C" }}>{label}</td>
@@ -9387,115 +8551,68 @@ function PrintableReport({ periodLabel, stats, lowStock, sales }) {
         </tbody>
       </table>
 
-      {/* Every distinct product sold this period, with unit price, quantity, and
-          line total, so the sales summary is a complete record rather than a
-          top-N snapshot. */}
-      {stats.allSold.length > 0 && (
-        <>
-          <h2 style={{ fontSize: 14, fontWeight: 600, marginTop: 12, marginBottom: 6 }}>Sales summary — all products sold ({stats.itemsSold} items)</h2>
-          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, marginBottom: 16 }}>
-            <thead>
-              <tr style={{ borderBottom: "1px solid #2B2420" }}>
-                <th style={{ textAlign: "left", padding: "4px 6px 4px 0" }}>Item</th>
-                <th style={{ textAlign: "right", padding: "4px 6px" }}>Unit price</th>
-                <th style={{ textAlign: "right", padding: "4px 6px" }}>Qty sold</th>
-                <th style={{ textAlign: "right", padding: "4px 0" }}>Total</th>
-              </tr>
-            </thead>
-            <tbody>
-              {stats.allSold.map((b) => (
-                <tr key={b.name} style={{ borderBottom: "1px solid #E4DCC8" }}>
-                  <td style={{ padding: "4px 6px 4px 0" }}>{b.name}</td>
-                  <td style={{ textAlign: "right", padding: "4px 6px" }}>{money(b.price)}</td>
-                  <td style={{ textAlign: "right", padding: "4px 6px" }}>{b.qty}</td>
-                  <td style={{ textAlign: "right", padding: "4px 0" }}>{money(b.revenue)}</td>
-                </tr>
-              ))}
-            </tbody>
-            <tfoot>
-              <tr style={{ borderTop: "1px solid #2B2420" }}>
-                <td colSpan={3} style={{ padding: "4px 6px 4px 0", fontWeight: 600 }}>Total</td>
-                <td style={{ textAlign: "right", padding: "4px 0", fontWeight: 600 }}>{money(stats.revenue)}</td>
-              </tr>
-            </tfoot>
-          </table>
-        </>
-      )}
-
       {stats.voidedOrders > 0 && (
         <>
-          {/* Voided items are automatically returned to inventory by the POS, so
-              this is informational only — it is NOT counted as a financial loss
-              anywhere in this report. Logged waste (below) is the only section
-              that represents an actual cost. */}
-          <h2 style={{ fontSize: 14, fontWeight: 600, marginTop: 12, marginBottom: 6 }}>Voided — items returned to inventory, not a financial loss</h2>
-          <p style={{ fontSize: 11, color: "#7A6D5C", marginBottom: 6 }}>
-            {stats.voidedOrders} voided order{stats.voidedOrders === 1 ? "" : "s"} this period. Ingredients for every voided item go back into stock, so none of this is included in the revenue, cost, or profit above.
-          </p>
+          <h2 style={{ fontSize: 14, fontWeight: 600, marginTop: 12, marginBottom: 6 }}>Voided (excluded above)</h2>
           <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, marginBottom: 16 }}>
-            <thead>
-              <tr style={{ borderBottom: "1px solid #2B2420" }}>
-                <th style={{ textAlign: "left", padding: "4px 6px 4px 0" }}>Item</th>
-                <th style={{ textAlign: "right", padding: "4px 6px" }}>Unit price</th>
-                <th style={{ textAlign: "right", padding: "4px 6px" }}>Qty voided</th>
-                <th style={{ textAlign: "right", padding: "4px 0" }}>Total</th>
-              </tr>
-            </thead>
             <tbody>
-              {stats.voidedItems.map((v) => (
-                <tr key={v.name} style={{ borderBottom: "1px solid #E4DCC8" }}>
-                  <td style={{ padding: "4px 6px 4px 0" }}>{v.name}</td>
-                  <td style={{ textAlign: "right", padding: "4px 6px" }}>{money(v.price)}</td>
-                  <td style={{ textAlign: "right", padding: "4px 6px" }}>{v.qty}</td>
-                  <td style={{ textAlign: "right", padding: "4px 0" }}>{money(v.total)}</td>
+              {[
+                ["Voided orders", stats.voidedOrders],
+                ["Revenue lost", money(stats.voidedRevenue)],
+                ["Cost avoided", money(stats.voidedCost)],
+                ["Profit forgone", money(stats.voidedProfit)],
+              ].map(([label, val]) => (
+                <tr key={label} style={{ borderBottom: "1px solid #E4DCC8" }}>
+                  <td style={{ padding: "4px 6px 4px 0", color: "#7A6D5C" }}>{label}</td>
+                  <td style={{ padding: "4px 0", textAlign: "right", fontWeight: 600 }}>{val}</td>
                 </tr>
               ))}
             </tbody>
-            <tfoot>
-              <tr style={{ borderTop: "1px solid #2B2420" }}>
-                <td colSpan={3} style={{ padding: "4px 6px 4px 0", fontWeight: 600 }}>Total (not a loss)</td>
-                <td style={{ textAlign: "right", padding: "4px 0", fontWeight: 600 }}>{money(stats.voidedRevenue)}</td>
-              </tr>
-            </tfoot>
           </table>
         </>
       )}
 
       {stats.wasteEntries > 0 && (
         <>
-          {/* The only section in this report that represents a real financial
-              loss — ingredients logged as waste are gone and are not returned
-              to stock the way a void's are. */}
-          <h2 style={{ fontSize: 14, fontWeight: 600, marginTop: 12, marginBottom: 6 }}>Logged waste — financial loss</h2>
-          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, marginBottom: 8 }}>
-            <thead>
-              <tr style={{ borderBottom: "1px solid #2B2420" }}>
-                <th style={{ textAlign: "left", padding: "4px 6px 4px 0" }}>Item</th>
-                <th style={{ textAlign: "right", padding: "4px 6px" }}>Unit cost</th>
-                <th style={{ textAlign: "right", padding: "4px 6px" }}>Qty</th>
-                <th style={{ textAlign: "right", padding: "4px 0" }}>Total cost</th>
-              </tr>
-            </thead>
+          <h2 style={{ fontSize: 14, fontWeight: 600, marginTop: 12, marginBottom: 6 }}>Waste / spoilage</h2>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, marginBottom: 16 }}>
             <tbody>
-              {stats.wasteItems.map((w) => (
-                <tr key={`${w.name}-${w.unit}`} style={{ borderBottom: "1px solid #E4DCC8" }}>
-                  <td style={{ padding: "4px 6px 4px 0" }}>{w.name}</td>
-                  <td style={{ textAlign: "right", padding: "4px 6px" }}>{money(w.price)}</td>
-                  <td style={{ textAlign: "right", padding: "4px 6px" }}>{w.qty}{w.unit}</td>
-                  <td style={{ textAlign: "right", padding: "4px 0" }}>{money(w.total)}</td>
+              {[
+                ["Entries", stats.wasteEntries],
+                ["Total cost", money(stats.wasteCost)],
+                ...stats.wasteByReason.map((r) => [r.reason, money(r.cost)]),
+              ].map(([label, val]) => (
+                <tr key={label} style={{ borderBottom: "1px solid #E4DCC8" }}>
+                  <td style={{ padding: "4px 6px 4px 0", color: "#7A6D5C" }}>{label}</td>
+                  <td style={{ padding: "4px 0", textAlign: "right", fontWeight: 600 }}>{val}</td>
                 </tr>
               ))}
             </tbody>
-            <tfoot>
-              <tr style={{ borderTop: "1px solid #2B2420" }}>
-                <td colSpan={3} style={{ padding: "4px 6px 4px 0", fontWeight: 600 }}>Total loss</td>
-                <td style={{ textAlign: "right", padding: "4px 0", fontWeight: 600 }}>{money(stats.wasteCost)}</td>
-              </tr>
-            </tfoot>
           </table>
-          <p style={{ fontSize: 11, color: "#7A6D5C", marginBottom: 16 }}>
-            By reason: {stats.wasteByReason.map((r) => `${r.reason} ${money(r.cost)}`).join("  ·  ")}
-          </p>
+        </>
+      )}
+
+      {stats.best.length > 0 && (
+        <>
+          <h2 style={{ fontSize: 14, fontWeight: 600, marginTop: 12, marginBottom: 6 }}>Best sellers</h2>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, marginBottom: 16 }}>
+            <thead>
+              <tr style={{ borderBottom: "1px solid #2B2420" }}>
+                <th style={{ textAlign: "left", padding: "4px 6px 4px 0" }}>Item</th>
+                <th style={{ textAlign: "right", padding: "4px 6px" }}>Qty sold</th>
+                <th style={{ textAlign: "right", padding: "4px 0" }}>Revenue</th>
+              </tr>
+            </thead>
+            <tbody>
+              {stats.best.map((b) => (
+                <tr key={b.name} style={{ borderBottom: "1px solid #E4DCC8" }}>
+                  <td style={{ padding: "4px 6px 4px 0" }}>{b.name}</td>
+                  <td style={{ textAlign: "right", padding: "4px 6px" }}>{b.qty}</td>
+                  <td style={{ textAlign: "right", padding: "4px 0" }}>{money(b.revenue)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </>
       )}
 
@@ -9585,11 +8702,11 @@ function PrintableReport({ periodLabel, stats, lowStock, sales }) {
   );
 }
 
-function Stat({ label, value, accent, alert, small }) {
+function Stat({ label, value, accent, small }) {
   return (
     <div className={`rounded-xl border ${small ? "p-2.5" : "p-3.5"}`} style={{ borderColor: "var(--line)", background: "var(--surface)" }}>
       <div className="text-xs mb-1" style={{ color: "var(--ink-soft)" }}>{label}</div>
-      <div className={`mono-font font-semibold ${small ? "text-sm" : "text-lg"}`} style={{ color: alert ? "var(--alert)" : accent ? "var(--accent)" : "var(--ink)" }}>{value}</div>
+      <div className={`mono-font font-semibold ${small ? "text-sm" : "text-lg"}`} style={{ color: accent ? "var(--accent)" : "var(--ink)" }}>{value}</div>
     </div>
   );
 }
@@ -10323,18 +9440,26 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
     const popup = openPaymentPopup("about:blank");
     setPaymongoState({ status: "loading", url: "", error: "" });
     try {
+      // SECURITY FIX: create-paymongo-link.js no longer accepts amountPhp
+      // or businessId from the browser — it verifies who's logged in from
+      // this token, then looks up their real discount and calculates the
+      // price itself. So the only thing we send now is the description;
+      // the server derives the account and the amount on its own.
+      const { data: sessionData } = await supabase.auth.getSession();
+      const accessToken = sessionData?.session?.access_token;
+      if (!accessToken) {
+        throw new Error("Your session has expired — please log in again and retry.");
+      }
       const resp = await fetch(PAYMONGO_CREATE_LINK_ENDPOINT, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${accessToken}`,
+        },
         body: JSON.stringify({
-          amountPhp: phpFinalPrice,
           description: `OpSteward QuickServe POS — ${hasSubscribedBefore ? "renewal" : "subscription"}${
             account?.businessName ? ` for ${account.businessName}` : ""
           }`,
-          // Lets api/paymongo-webhook.js know whose account to activate
-          // once this link gets paid — see that file's setup comment for
-          // the full automatic-activation flow this enables.
-          businessId: account?.id,
         }),
       });
       let data = null;
@@ -10413,22 +9538,28 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
     // it doesn't support, no matter how the request is built, so USD (the
     // one currency every PayPal account can send/receive) is the only way
     // to still get a real, live, auto-activating checkout link.
-    const orderAmount = paypalNeedsUsd ? usdFinalPrice : finalPrice;
-    const orderCurrency = paypalNeedsUsd ? "USD" : currencyCode;
+    // SECURITY FIX: create-paypal-order.js no longer accepts amount,
+    // currency, or businessId from the browser — it verifies who's logged
+    // in from this token, then looks up their real discount and currency
+    // and calculates the price itself. paypalNeedsUsd/orderAmount/
+    // orderCurrency are no longer sent — the server decides all of that
+    // from the account's own currency_code, same logic mirrored server-side.
     try {
+      const { data: sessionData } = await supabase.auth.getSession();
+      const accessToken = sessionData?.session?.access_token;
+      if (!accessToken) {
+        throw new Error("Your session has expired — please log in again and retry.");
+      }
       const resp = await fetch(PAYPAL_CREATE_ORDER_ENDPOINT, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${accessToken}`,
+        },
         body: JSON.stringify({
-          amount: orderAmount,
-          currency: orderCurrency,
           description: `OpSteward QuickServe POS — ${hasSubscribedBefore ? "renewal" : "subscription"}${
             account?.businessName ? ` for ${account.businessName}` : ""
           }`,
-          // Lets api/paypal-webhook.js know whose account to activate once
-          // this order is paid — see activate_subscription() in the SQL
-          // setup block near the top of this file.
-          businessId: account?.id,
         }),
       });
       let data = null;
@@ -10449,8 +9580,8 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
         notify?.(
           `This month's bill (${fmt(fullPrice)}) was fully covered by your ` +
             `${discountPercent}% ${hasSubscribedBefore ? "reward credit" : "referral discount"} — nothing to ` +
-            `pay, and your subscription is active for the next ${SUBSCRIPTION_PERIOD_DAYS} days. Your reward ` +
-            `credit keeps applying to future bills for as long as your referred users stay active subscribers.`
+            `pay, and your subscription is active for the next ${SUBSCRIPTION_PERIOD_DAYS} days. Reward credit ` +
+            `resets to 0% next cycle, so next month's bill will be ${fmt(fullPrice)} unless new referrals come in.`
         );
         if (typeof onClose === "function") onClose();
         return;
@@ -10594,14 +9725,9 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
   const manualPayPalLink = buildPayPalLink(usdFinalPrice, "USD");
 
   // Submits the self-reported reference for the manual-payment fallback
-  // (PH: GCash/bank transfer; international: PayPal.me) via
-  // onConfirm/submitManualPayment. This does NOT activate the account —
-  // it only queues the reference for the owner (that's you) to verify by
-  // hand against your GCash/bank/PayPal dashboard before running
-  // activate_subscription() in the SQL Editor. Deliberately does not close
-  // the modal or claim the subscription is active, since it isn't yet —
-  // the pending-review banner below (see account?.manualPaymentStatus)
-  // is what tells the subscriber what happens next.
+  // (PH: GCash/bank transfer; international: PayPal.me) and activates the
+  // account via onConfirm/markSubscriptionActive — mirrors the ₱0/$0
+  // free-activation notify() messaging used elsewhere in this file.
   const submitManualPayment = async () => {
     if (manualBusy || !manualRef.trim()) return;
     setManualError("");
@@ -10609,16 +9735,17 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
     try {
       const ok = await onConfirm?.(manualRef.trim());
       if (ok === false) {
-        setManualError("Couldn't submit that reference. Please try again.");
+        setManualError("Couldn't confirm the upgrade. Please try again.");
       } else {
         setManualRef("");
         notify?.(
-          "Thanks — we've received your payment reference. We'll verify it and your account will unlock automatically once that's confirmed."
+          `Thanks! We've noted your payment reference and activated your subscription for the next ${SUBSCRIPTION_PERIOD_DAYS} days.`
         );
+        if (typeof onClose === "function") onClose();
       }
     } catch (err) {
       console.error("submitManualPayment failed:", err);
-      setManualError("Something went wrong submitting that. Please try again.");
+      setManualError("Something went wrong confirming that. Please try again.");
     } finally {
       setManualBusy(false);
     }
@@ -10750,7 +9877,7 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
       {hasSubscribedBefore && rewardCreditPercent > 0 && (
         <div className="rounded-lg px-3 py-2 mb-4 text-xs" style={{ background: "#EAF0E2", color: "var(--primary-dark)" }}>
           {rewardCreditPercent >= MAX_REWARD_CREDIT_PERCENT
-            ? `You've hit the maximum reward credit of ${MAX_REWARD_CREDIT_PERCENT}% off — it's already reflected in the price above. Additional referrals won't lower your bill any further while you're at the cap, and this credit keeps applying every month for as long as your referred users stay active subscribers.`
+            ? `You've hit the maximum reward credit of ${MAX_REWARD_CREDIT_PERCENT}% off for this billing cycle — it's already reflected in the price above. Extra referrals this month won't lower your bill any further, but the credit resets to 0% next cycle so fresh referrals count again then.`
             : `You're earning ${rewardCreditPercent}% off from your referrals — it's already reflected in the price above.`}
         </div>
       )}
@@ -10792,57 +9919,37 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
             </div>
           )}
 
-          {/* No webhook on this manual path, so submitting a reference here
-              (see submitManualPayment/onConfirm above) only ever queues it
-              for the owner to verify by hand — it never activates the
-              account by itself. account?.manualPaymentStatus reflects
-              whether one's currently sitting in that review queue. */}
+          {/* Self-reported confirmation — there's no webhook on this manual
+              path, so the owner's account only activates once they submit a
+              reference here (see submitManualPayment/onConfirm above). */}
           <div className="mt-3 pt-3" style={{ borderTop: "1px solid var(--line)" }}>
-            {account?.manualPaymentStatus === "pending" ? (
-              <div className="rounded-lg px-2.5 py-2 text-xs" style={{ background: "#FBF1E7", color: "var(--ink-soft)" }}>
-                <div className="font-medium mb-0.5" style={{ color: "var(--ink)" }}>Reference submitted — awaiting verification</div>
-                We're checking <span className="mono-font">{account?.paymentReference}</span> against our records. This
-                usually takes a little while; your account unlocks automatically the moment it's confirmed, no need to
-                submit again.
-              </div>
-            ) : (
-              <>
-                <label className="block mb-1 font-medium" style={{ color: "var(--ink)" }}>
-                  {account?.manualPaymentStatus === "rejected"
-                    ? "We couldn't verify that reference — try again"
-                    : "Already paid? Enter your reference"}
-                </label>
-                {account?.manualPaymentStatus === "rejected" && (
-                  <p className="mb-1.5" style={{ color: "var(--alert)" }}>
-                    Double-check the number and resubmit, or email {SUPPORT_EMAIL} if you think this is a mistake.
-                  </p>
-                )}
-                <div className="flex gap-2">
-                  <input
-                    value={manualRef}
-                    onChange={(e) => setManualRef(e.target.value)}
-                    onKeyDown={(e) => e.key === "Enter" && submitManualPayment()}
-                    placeholder={isPHCustomer ? "GCash/bank reference no." : "PayPal transaction ID"}
-                    className="flex-1 border rounded-lg px-2.5 py-1.5 text-xs"
-                    style={{ borderColor: "var(--line)" }}
-                  />
-                  <button
-                    type="button"
-                    onClick={submitManualPayment}
-                    disabled={manualBusy || !manualRef.trim()}
-                    className="px-3 py-1.5 rounded-lg text-xs font-medium"
-                    style={{
-                      background: "var(--primary)",
-                      color: "#fff",
-                      opacity: manualBusy || !manualRef.trim() ? 0.6 : 1,
-                    }}
-                  >
-                    {manualBusy ? "Submitting…" : "Submit"}
-                  </button>
-                </div>
-                {manualError && <p className="mt-1.5" style={{ color: "var(--alert)" }}>{manualError}</p>}
-              </>
-            )}
+            <label className="block mb-1 font-medium" style={{ color: "var(--ink)" }}>
+              Already paid? Enter your reference to activate
+            </label>
+            <div className="flex gap-2">
+              <input
+                value={manualRef}
+                onChange={(e) => setManualRef(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && submitManualPayment()}
+                placeholder={isPHCustomer ? "GCash/bank reference no." : "PayPal transaction ID"}
+                className="flex-1 border rounded-lg px-2.5 py-1.5 text-xs"
+                style={{ borderColor: "var(--line)" }}
+              />
+              <button
+                type="button"
+                onClick={submitManualPayment}
+                disabled={manualBusy || !manualRef.trim()}
+                className="px-3 py-1.5 rounded-lg text-xs font-medium"
+                style={{
+                  background: "var(--primary)",
+                  color: "#fff",
+                  opacity: manualBusy || !manualRef.trim() ? 0.6 : 1,
+                }}
+              >
+                {manualBusy ? "Confirming…" : "Confirm"}
+              </button>
+            </div>
+            {manualError && <p className="mt-1.5" style={{ color: "var(--alert)" }}>{manualError}</p>}
           </div>
         </div>
       ) : (
@@ -11044,7 +10151,7 @@ function CompleteProfileView({ account, onSave, onLogOut }) {
   );
 }
 
-function SettingsView({ account, onUpdateField, onLogOut, onDeleteAccount, onUnsubscribe, trialInfo, currencyCode = "PHP", openUpgrade, thermalPrinter }) {
+function SettingsView({ account, onUpdateField, onLogOut, onDeleteAccount, onUnsubscribe, trialInfo, currencyCode = "PHP", openUpgrade }) {
   const [confirmLogout, setConfirmLogout] = useState(false);
   const [copied, setCopied] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
@@ -11126,65 +10233,6 @@ function SettingsView({ account, onUpdateField, onLogOut, onDeleteAccount, onUns
           minLength={6}
           helper="Type a new password to change it"
         />
-      </div>
-
-      {/* ---- Receipt printer (Bluetooth thermal) ---- */}
-      <div className="rounded-xl border p-4 sm:p-5 mt-4" style={{ borderColor: "var(--line)", background: "var(--surface)" }}>
-        <div className="flex items-center gap-2 text-xs font-medium mb-1" style={{ color: "var(--ink-soft)" }}>
-          <Printer size={13} /> Receipt printer
-        </div>
-        {!thermalPrinter?.supported ? (
-          <p className="text-[11px] mt-2" style={{ color: "var(--ink-soft)" }}>
-            Bluetooth printing isn't available in this browser (this includes all of Safari on iPhone/iPad). Receipts will use the regular print dialog instead — no setup needed.
-          </p>
-        ) : (
-          <>
-            <p className="text-[11px] mt-1 mb-3" style={{ color: "var(--ink-soft)" }}>
-              Pair a Bluetooth thermal receipt printer to print with one tap, skipping the print dialog. Works with most generic 58mm/80mm Bluetooth thermal printers.
-            </p>
-            {thermalPrinter.connected ? (
-              <div className="flex items-center justify-between gap-2 rounded-lg px-3 py-2 mb-3" style={{ background: "var(--bg)" }}>
-                <div className="flex items-center gap-1.5 text-xs font-medium">
-                  <span className="w-1.5 h-1.5 rounded-full" style={{ background: "#2F6B45" }} />
-                  {thermalPrinter.printerName || "Printer"} connected
-                </div>
-                <button
-                  onClick={thermalPrinter.disconnect}
-                  className="text-[11px] px-2 py-1 rounded-md border font-medium"
-                  style={{ borderColor: "var(--line)", color: "var(--ink-soft)" }}
-                >
-                  Disconnect
-                </button>
-              </div>
-            ) : (
-              <button
-                onClick={thermalPrinter.connect}
-                disabled={thermalPrinter.connecting}
-                className="flex items-center gap-1.5 text-xs px-3 py-2 rounded-lg font-medium mb-3 disabled:opacity-60"
-                style={{ background: "var(--primary)", color: "#fff" }}
-              >
-                <Printer size={13} /> {thermalPrinter.connecting ? "Connecting…" : "Connect printer"}
-              </button>
-            )}
-            <div className="text-xs font-medium mb-1.5" style={{ color: "var(--ink-soft)" }}>Paper width</div>
-            <div className="flex gap-2">
-              {[{ v: "32", label: "58mm" }, { v: "48", label: "80mm" }].map((opt) => (
-                <button
-                  key={opt.v}
-                  onClick={() => thermalPrinter.setWidth(opt.v)}
-                  className="flex-1 py-1.5 rounded-lg text-xs font-medium border"
-                  style={{
-                    borderColor: thermalPrinter.paperWidth === opt.v ? "var(--primary)" : "var(--line)",
-                    background: thermalPrinter.paperWidth === opt.v ? "var(--bg)" : "transparent",
-                    color: thermalPrinter.paperWidth === opt.v ? "var(--primary-dark)" : "var(--ink-soft)",
-                  }}
-                >
-                  {opt.label}
-                </button>
-              ))}
-            </div>
-          </>
-        )}
       </div>
 
       {/* ---- Subscription status ---- */}
@@ -11313,14 +10361,14 @@ function SettingsView({ account, onUpdateField, onLogOut, onDeleteAccount, onUns
             </button>
           </div>
           <p className="text-[11px]" style={{ color: "var(--ink-soft)" }}>
-            Share this code — new sign-ups who use it get {REFERRAL_DISCOUNT_PERCENT}% off their first month, and you earn a recurring {REFERRAL_REWARD_PERCENT}% credit for as long as they stay an active, paying subscriber (up to {MAX_REWARD_CREDIT_PERCENT}% off in total).
+            Share this code — new sign-ups who use it get {REFERRAL_DISCOUNT_PERCENT}% off their first month, and you earn a {REFERRAL_REWARD_PERCENT}% reward credit every time it's used (up to {MAX_REWARD_CREDIT_PERCENT}% off in one billing month).
           </p>
 
-          {/* ---- Recurring referral explainer ---- */}
+          {/* ---- Current-month referral explainer ---- */}
           <div className="rounded-lg p-3" style={{ background: "var(--bg)" }}>
-            <div className="text-[11px] font-medium mb-1">How your credit works</div>
+            <div className="text-[11px] font-medium mb-1">Current month</div>
             <p className="text-[11px]" style={{ color: "var(--ink-soft)" }}>
-              For every user who signs up with your referral code and stays an active, paying subscriber, you earn {REFERRAL_REWARD_PERCENT}% off — automatically, every month, for as long as they remain subscribed — up to a maximum of {MAX_REWARD_CREDIT_PERCENT}% off. If a referred user unsubscribes or deletes their account, their {REFERRAL_REWARD_PERCENT}% is automatically removed from your ongoing discount.
+              Every time a new user signs up with your referral code, you earn {REFERRAL_REWARD_PERCENT}% off your immediate current billing cycle, up to a maximum of {MAX_REWARD_CREDIT_PERCENT}% off. When the month ends and the next billing cycle begins, that discount resets to 0% for the new month until fresh referrals are made during that cycle.
             </p>
           </div>
           <div className="flex gap-3 pt-1">
@@ -11362,7 +10410,7 @@ function SettingsView({ account, onUpdateField, onLogOut, onDeleteAccount, onUns
                 not just in the general explainer text above. ---- */}
             {rewardCreditPercent >= MAX_REWARD_CREDIT_PERCENT && (
               <p className="text-[10px] mt-2 pt-2" style={{ color: "var(--primary-dark)", borderTop: "1px dashed var(--line)" }}>
-                You've reached the maximum reward credit ({MAX_REWARD_CREDIT_PERCENT}% off). Additional referrals won't reduce your bill further while you're at the cap — but this credit keeps applying every month for as long as your referred users stay active subscribers; it only drops if one of them unsubscribes or deletes their account.
+                You've reached the maximum reward credit ({MAX_REWARD_CREDIT_PERCENT}% off) for this billing cycle. Additional referrals this month won't reduce your bill further — the cap resets to 0% at the start of your next cycle.
               </p>
             )}
           </div>
@@ -11373,7 +10421,7 @@ function SettingsView({ account, onUpdateField, onLogOut, onDeleteAccount, onUns
             <Store size={13} /> Referral code
           </div>
           <p className="text-[11px] mt-2" style={{ color: "var(--ink-soft)" }}>
-            Your referral code unlocks once you're a paying subscriber — subscribe to get your own code to share, and start earning a recurring {REFERRAL_REWARD_PERCENT}% credit for every referred sign-up who stays an active, paying subscriber, up to a maximum of {MAX_REWARD_CREDIT_PERCENT}% off any single bill. The credit keeps applying for as long as they remain subscribed, and is automatically removed if they unsubscribe or delete their account. New users who sign up with your code get {REFERRAL_DISCOUNT_PERCENT}% off their first month.
+            Your referral code unlocks once you're a paying subscriber — subscribe to get your own code to share, and start earning a {REFERRAL_REWARD_PERCENT}% reward credit every time it's used, up to a maximum of {MAX_REWARD_CREDIT_PERCENT}% off any single bill. New users who sign up with your code get {REFERRAL_DISCOUNT_PERCENT}% off their first month.
           </p>
         </div>
       )}
@@ -11602,7 +10650,7 @@ function TermsGuidelinesModal({ onClose }) {
 
         <Section title="Referrals">
           <Point>Your code gives new sign-ups {REFERRAL_DISCOUNT_PERCENT}% off their first month.</Point>
-          <Point>You earn a recurring {REFERRAL_REWARD_PERCENT}% credit for each referred sign-up who stays an active, paying subscriber — capped at {MAX_REWARD_CREDIT_PERCENT}% off in total. This keeps applying to every bill for as long as that referral remains active, and is automatically removed the moment they unsubscribe or delete their account.</Point>
+          <Point>You earn {REFERRAL_REWARD_PERCENT}% credit per referral, capped at {MAX_REWARD_CREDIT_PERCENT}% off, resetting each billing cycle.</Point>
           <Point>Fake or self-referrals aren't allowed and may get an account suspended.</Point>
         </Section>
 
