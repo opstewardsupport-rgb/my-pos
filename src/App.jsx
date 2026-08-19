@@ -91,6 +91,63 @@
    alter table public.businesses
      add column if not exists last_payment_final_amount numeric;
 
+   -- SECURITY FIX — manual-payment review queue. Previously the app's
+   -- manual-payment fallback (GCash/bank transfer for PH, PayPal.me for
+   -- everyone else) called markSubscriptionActive() directly from the
+   -- browser the instant ANY text was typed into the reference box — that
+   -- function then wrote subscription_status = 'active' straight from the
+   -- client. Nothing verified the reference was real, so anyone could grant
+   -- themselves a free subscription forever just by typing garbage into
+   -- that box (or replaying the same Supabase call from devtools). These
+   -- two columns + submit_manual_payment() below replace that: the client
+   -- can now only ever mark a reference "pending", never "active" — only
+   -- you, running activate_subscription() by hand in the SQL Editor after
+   -- actually checking your GCash/bank/PayPal dashboard, can flip the
+   -- account on. Safe to run even if these columns already exist.
+   alter table public.businesses
+     add column if not exists manual_payment_status text; -- null | 'pending' | 'rejected'
+   alter table public.businesses
+     add column if not exists manual_payment_submitted_at timestamptz;
+
+   -- Called by the app the moment an owner submits a reference on the
+   -- manual-payment fallback. Deliberately does NOT touch
+   -- subscription_status/subscription_period_end at all — it only records
+   -- that a reference is awaiting your review, on the caller's OWN row
+   -- (auth.uid()), and lets the trg_notify_on_subscription_change trigger
+   -- below email you so you know to go check it. The actual activation
+   -- happens later, by you, via activate_subscription() (see the "PAYPAL
+   -- AUTOMATIC ACTIVATION SETUP" block further down this file) — that
+   -- function is deliberately NOT granted to `authenticated`, so it can
+   -- only ever be run from the Supabase SQL Editor or your service-role
+   -- key, never from a customer's browser.
+   drop function if exists submit_manual_payment(text) cascade;
+   create or replace function submit_manual_payment(p_reference text)
+   returns void
+   language plpgsql
+   security definer
+   set search_path = public
+   as $$
+   declare
+     v_caller_id uuid := auth.uid();
+     v_clean text := nullif(trim(p_reference), '');
+   begin
+     if v_caller_id is null then
+       raise exception 'You must be logged in to submit a payment reference.';
+     end if;
+     if v_clean is null then
+       raise exception 'A payment reference is required.';
+     end if;
+
+     update public.businesses
+       set payment_reference = v_clean,
+           manual_payment_status = 'pending',
+           manual_payment_submitted_at = now()
+       where id = v_caller_id;
+   end;
+   $$;
+
+   grant execute on function submit_manual_payment(text) to authenticated;
+
    -- Holds EVERY piece of day-to-day café data as one JSON blob — catalog
    -- (ingredients/products/categories), sales history, parked tabs,
    -- currency, employees, the current employee, shifts, the waste log, and
@@ -946,6 +1003,35 @@
        );
      end if;
 
+     -- ---- MANUAL PAYMENT SUBMITTED — AWAITING YOUR VERIFICATION ----
+     -- Fires the moment submit_manual_payment() (see the SQL near the top
+     -- of this file) marks a reference "pending" — i.e. the owner typed a
+     -- reference into the manual-payment fallback box. This account is
+     -- NOT active yet; go check the reference against your GCash/bank/
+     -- PayPal dashboard, then either run
+     --   select public.activate_subscription('<account id below>', '<reference>');
+     -- to unlock it, or
+     --   update public.businesses set manual_payment_status = 'rejected' where id = '<account id below>';
+     -- if it doesn't check out.
+     if new.manual_payment_status = 'pending' and old.manual_payment_status is distinct from 'pending' then
+       perform public.notify_owner(
+         '🕓 Manual payment awaiting verification: ' || coalesce(nullif(new.business_name, ''), new.email, 'someone'),
+         '<p><b>' || coalesce(nullif(new.business_name, ''), new.email, 'A business') || '</b> submitted a manual payment reference — nothing has been activated yet.</p>' ||
+         '<p>' ||
+           '<b>User Email Address:</b> ' || coalesce(new.email, '(unknown)') || '<br>' ||
+           '<b>Business Name:</b> ' || coalesce(nullif(new.business_name, ''), '(not set)') || '<br>' ||
+           '<b>Reference Submitted:</b> ' || coalesce(nullif(new.payment_reference, ''), '(none)') || '<br>' ||
+           '<b>Submitted At:</b> ' || to_char(coalesce(new.manual_payment_submitted_at, now()), 'Mon DD, YYYY HH12:MI AM') ||
+         '</p>' ||
+         '<p>Verify this against your GCash/bank/PayPal dashboard, then either run:<br>' ||
+         '<code>select public.activate_subscription(''' || new.id || ''', ''' || coalesce(nullif(new.payment_reference, ''), '') || ''');</code><br>' ||
+         'to activate, or:<br>' ||
+         '<code>update public.businesses set manual_payment_status = ''rejected'' where id = ''' || new.id || ''';</code><br>' ||
+         'if it does not check out.</p>' ||
+         '<p style="color:#888;font-size:11px;">Account ID: ' || new.id || '</p>'
+       );
+     end if;
+
      -- ---- UNSUBSCRIBE (subscription cancelled, account NOT deleted) ----
      if new.subscription_status = 'cancelled' and old.subscription_status is distinct from 'cancelled' then
        perform public.notify_owner(
@@ -1138,7 +1224,13 @@
        set subscription_status = 'active',
            subscription_period_end = now() + interval '30 days',
            payment_reference = p_reference,
-           discount_percent = case when coalesce(v_was_active, false) then discount_percent else 0 end
+           discount_percent = case when coalesce(v_was_active, false) then discount_percent else 0 end,
+           -- Clears out the manual-payment review flag this account may be
+           -- sitting in (see submit_manual_payment() near the top of this
+           -- file) — a no-op if it was never set, e.g. for the automatic
+           -- PayPal webhook path that also calls this function.
+           manual_payment_status = null,
+           manual_payment_submitted_at = null
        where id = p_business_id;
 
      if not coalesce(v_was_active, false) then
@@ -1841,6 +1933,14 @@ export default function CafePOS() {
       subscriptionPeriodEnd: data.subscription_period_end || null,
       subscriptionStartDate: data.subscription_start_date || null,
       paymentReference: data.payment_reference || "",
+      // Set by submit_manual_payment() the moment a manual GCash/bank/
+      // PayPal.me reference is submitted, and cleared again by
+      // activate_subscription() once you've verified it (or set to
+      // 'rejected' by hand if it didn't check out) — see the SQL near the
+      // top of this file. Lets the Upgrade screen show "we're checking
+      // this" instead of silently re-showing the same form.
+      manualPaymentStatus: data.manual_payment_status || null,
+      manualPaymentSubmittedAt: data.manual_payment_submitted_at || null,
       // Set once at sign-up (see SignUpView) and never changed afterward —
       // this is the account's single, permanent billing/display currency.
       // Falls back to PHP only for pre-existing accounts created before
@@ -2681,112 +2781,59 @@ export default function CafePOS() {
     }
   }, [authUser, notify]);
 
-  // Called from the Upgrade screen once the owner has paid via PayMongo (or
-  // manually — see MANUAL_PAYMENT_NOTE). There's no PayMongo webhook wired
-  // up here (that needs a small server function — see supabase-schema.sql's
-  // notes), so this is a self-reported confirmation: it flips
-  // subscription_status to "active", starts a new SUBSCRIPTION_PERIOD_DAYS
-  // period, and stores whatever reference the owner typed in, for you to
-  // reconcile against PayMongo's dashboard.
-  const markSubscriptionActive = useCallback(async (referenceNote) => {
+  // Called from the Upgrade screen's manual-payment fallback (GCash/bank
+  // transfer for PH, PayPal.me for everyone else) once the owner has typed
+  // in a payment reference.
+  //
+  // SECURITY FIX: this used to flip subscription_status to "active" itself,
+  // directly from the browser, the instant ANY text was submitted here —
+  // a "self-reported confirmation" with nothing on the server checking that
+  // a payment actually happened. That meant anyone could grant themselves a
+  // free subscription forever just by typing garbage into this box. It now
+  // does the opposite: it can ONLY ever mark the reference "pending" (via
+  // submit_manual_payment() — see the SQL setup block at the top of this
+  // file, which is the real enforcement here, same as redeem_referral() is
+  // for referral codes). That RPC only ever touches payment_reference and
+  // manual_payment_status on the CALLER's own row — it has no way to set
+  // subscription_status itself.
+  //
+  // Actually activating the account happens later, by you: the SQL trigger
+  // emails you the moment this fires, you check the reference against your
+  // GCash/bank/PayPal dashboard, then either:
+  //   - it's real: run this in the Supabase SQL Editor —
+  //       select public.activate_subscription('<account id>', '<reference>');
+  //     (activate_subscription() is the same function the PayPal webhook
+  //     already uses for the fully-automatic path — see the "PAYPAL
+  //     AUTOMATIC ACTIVATION SETUP" block further down this file. It's
+  //     deliberately NOT granted to `authenticated`, so a customer's
+  //     browser key can never call it — only the SQL Editor or your
+  //     service-role key can.)
+  //   - it's fake/unverifiable: run —
+  //       update public.businesses set manual_payment_status = 'rejected' where id = '<account id>';
+  //     so Settings shows them a "we couldn't verify that" state instead of
+  //     leaving them wondering. They can just submit a new reference to try
+  //     again, which puts them back in "pending".
+  const submitManualPayment = useCallback(async (referenceNote) => {
     if (!authUser) return false;
-    // First payment ever (was still on "trial") vs. a renewal of an
-    // already-active account. Only a first payment can be discounted by the
-    // one-time referral signup discount — and once used, it's gone for
-    // good, so it doesn't silently reapply to every future renewal.
-    const isFirstPayment = accountRef.current?.subscriptionStatus !== "active";
-    const periodEnd = new Date(Date.now() + SUBSCRIPTION_PERIOD_DAYS * MS_PER_DAY).toISOString();
+    const clean = (referenceNote || "").trim();
+    if (!clean) return false;
 
-    // On a first payment, actually "spend" any referral code that was
-    // applied-but-not-yet-paid (pending_referral_code) BEFORE the update
-    // below flips subscription_status to "active" — this is the ONLY
-    // moment a code is ever marked used, for both this account and the
-    // referrer, and it's why a code clicked "Apply" and then abandoned
-    // never blocks a later, real attempt. Awaited (unlike before) and done
-    // FIRST specifically so referred_by is already committed on this row
-    // by the time the subscription-change email trigger fires from the
-    // update further down — otherwise the "New Paid Subscription" email
-    // would always show "Referral Code Used: None", even when one was
-    // used, because the two writes used to race. See
-    // finalize_referral_redemption() in the SQL setup block at the top of
-    // this file, which is also the real enforcement: it's a no-op if this
-    // account never applied a code, and a safe no-op if this exact
-    // referral was somehow already finalized before (so this can never
-    // double-credit a referrer or double-count a redemption, even if this
-    // function ever runs twice for the same first payment). A failure here
-    // is logged but never blocks the subscriber's own upgrade below.
-    if (isFirstPayment) {
-      try {
-        const { error: rewardErr } = await supabase.rpc("finalize_referral_redemption");
-        if (rewardErr) console.error("finalize_referral_redemption failed:", rewardErr);
-      } catch (rewardErr) {
-        console.error("finalize_referral_redemption failed:", rewardErr);
-      }
-    }
-
-    // Snapshot the pricing that's about to be charged, in the subscriber's
-    // own currency, BEFORE discount_percent/reward_credits are reset below
-    // — this is what gets emailed to the owner (see notify_on_subscription_change
-    // in the SQL setup block) and is intentionally the exact numbers the
-    // subscriber was shown on the Upgrade screen, not a re-derived guess:
-    // first payment uses their one-time referral discount (discountPercent),
-    // a renewal uses whatever reward credit they'd built up (rewardCredits,
-    // capped the same way UpgradeView caps it for display/charging).
-    const originalAmount = lockedSubscriptionPrice(currencyCode);
-    const discountPercentApplied = isFirstPayment
-      ? (accountRef.current?.discountPercent || 0)
-      : Math.min(accountRef.current?.rewardCredits || 0, MAX_REWARD_CREDIT_PERCENT);
-    const finalAmount = originalAmount - originalAmount * (discountPercentApplied / 100);
-
-    // The referrer's reward_credits column is intentionally NOT touched here.
-    // It's maintained entirely by the SQL side (finalize_referral_redemption(),
-    // handle_referral_deactivation(), handle_referral_deletion() — see the
-    // setup block at the top of this file), which keeps it equal to
-    // active_referral_count * REFERRAL_REWARD_PERCENT (capped at
-    // MAX_REWARD_CREDIT_PERCENT) for as long as each referred account stays
-    // an active subscriber. Resetting it here on the referrer's OWN payment
-    // would wipe out a credit that should keep applying every month — it only
-    // ever goes down when a referred account actually unsubscribes or deletes
-    // its account.
-    const updates = {
-      subscription_status: "active",
-      subscription_period_end: periodEnd,
-      payment_reference: referenceNote || null,
-      last_payment_currency: currencyCode,
-      last_payment_original_amount: originalAmount,
-      last_payment_discount_percent: discountPercentApplied,
-      last_payment_final_amount: finalAmount,
-    };
-    if (isFirstPayment) {
-      updates.discount_percent = 0;
-      // Set once, the first time an account ever goes active — and reset
-      // again if they unsubscribe and later resubscribe, since that's
-      // treated as a fresh "first" subscription (see unsubscribeAccount /
-      // isFirstPayment above). Kept separate from subscription_period_end
-      // (which moves every renewal) so "Subscription Start Date" in the
-      // New Paid Subscription email always reflects this specific
-      // subscription, not the most recent renewal.
-      updates.subscription_start_date = new Date().toISOString();
-    }
-    const { error } = await supabase.from("businesses").update(updates).eq("id", authUser.id);
+    const { error } = await supabase.rpc("submit_manual_payment", { p_reference: clean });
     if (error) {
-      notify("Couldn't confirm the upgrade — " + error.message, "err");
+      notify("Couldn't submit that reference — " + error.message, "err");
       return false;
     }
+
     const next = {
       ...(accountRef.current || {}),
-      subscriptionStatus: "active",
-      subscriptionPeriodEnd: periodEnd,
-      paymentReference: referenceNote || "",
-      discountPercent: isFirstPayment ? 0 : (accountRef.current?.discountPercent || 0),
-      subscriptionStartDate: isFirstPayment ? updates.subscription_start_date : accountRef.current?.subscriptionStartDate,
+      paymentReference: clean,
+      manualPaymentStatus: "pending",
+      manualPaymentSubmittedAt: new Date().toISOString(),
     };
     accountRef.current = next;
     setAccount(next);
-
-    notify(isFirstPayment ? "You're upgraded — thanks for subscribing!" : "Renewed — thanks for staying with us!");
     return true;
-  }, [authUser, notify, currencyCode]);
+  }, [authUser, notify]);
 
   // Applies a referral/discount code from the Subscribe popup, for an owner
   // who's already signed in, before their first payment (unlike the old
@@ -4393,7 +4440,7 @@ export default function CafePOS() {
           account={account}
           trialInfo={trialInfo}
           currencyCode={currencyCode}
-          onConfirm={markSubscriptionActive}
+          onConfirm={submitManualPayment}
           onApplyCode={applyReferralCode}
           onClose={null}
           onLogOut={logOut}
@@ -4618,7 +4665,7 @@ export default function CafePOS() {
           account={account}
           trialInfo={trialInfo}
           currencyCode={currencyCode}
-          onConfirm={markSubscriptionActive}
+          onConfirm={submitManualPayment}
           onApplyCode={applyReferralCode}
           onClose={trialInfo.expired && !trialInfo.isSubscribed ? null : () => setShowUpgrade(false)}
           onRefreshAccount={refreshAccountStatus}
@@ -10517,9 +10564,14 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
   const manualPayPalLink = buildPayPalLink(usdFinalPrice, "USD");
 
   // Submits the self-reported reference for the manual-payment fallback
-  // (PH: GCash/bank transfer; international: PayPal.me) and activates the
-  // account via onConfirm/markSubscriptionActive — mirrors the ₱0/$0
-  // free-activation notify() messaging used elsewhere in this file.
+  // (PH: GCash/bank transfer; international: PayPal.me) via
+  // onConfirm/submitManualPayment. This does NOT activate the account —
+  // it only queues the reference for the owner (that's you) to verify by
+  // hand against your GCash/bank/PayPal dashboard before running
+  // activate_subscription() in the SQL Editor. Deliberately does not close
+  // the modal or claim the subscription is active, since it isn't yet —
+  // the pending-review banner below (see account?.manualPaymentStatus)
+  // is what tells the subscriber what happens next.
   const submitManualPayment = async () => {
     if (manualBusy || !manualRef.trim()) return;
     setManualError("");
@@ -10527,17 +10579,16 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
     try {
       const ok = await onConfirm?.(manualRef.trim());
       if (ok === false) {
-        setManualError("Couldn't confirm the upgrade. Please try again.");
+        setManualError("Couldn't submit that reference. Please try again.");
       } else {
         setManualRef("");
         notify?.(
-          `Thanks! We've noted your payment reference and activated your subscription for the next ${SUBSCRIPTION_PERIOD_DAYS} days.`
+          "Thanks — we've received your payment reference. We'll verify it and your account will unlock automatically once that's confirmed."
         );
-        if (typeof onClose === "function") onClose();
       }
     } catch (err) {
       console.error("submitManualPayment failed:", err);
-      setManualError("Something went wrong confirming that. Please try again.");
+      setManualError("Something went wrong submitting that. Please try again.");
     } finally {
       setManualBusy(false);
     }
@@ -10711,37 +10762,57 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
             </div>
           )}
 
-          {/* Self-reported confirmation — there's no webhook on this manual
-              path, so the owner's account only activates once they submit a
-              reference here (see submitManualPayment/onConfirm above). */}
+          {/* No webhook on this manual path, so submitting a reference here
+              (see submitManualPayment/onConfirm above) only ever queues it
+              for the owner to verify by hand — it never activates the
+              account by itself. account?.manualPaymentStatus reflects
+              whether one's currently sitting in that review queue. */}
           <div className="mt-3 pt-3" style={{ borderTop: "1px solid var(--line)" }}>
-            <label className="block mb-1 font-medium" style={{ color: "var(--ink)" }}>
-              Already paid? Enter your reference to activate
-            </label>
-            <div className="flex gap-2">
-              <input
-                value={manualRef}
-                onChange={(e) => setManualRef(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && submitManualPayment()}
-                placeholder={isPHCustomer ? "GCash/bank reference no." : "PayPal transaction ID"}
-                className="flex-1 border rounded-lg px-2.5 py-1.5 text-xs"
-                style={{ borderColor: "var(--line)" }}
-              />
-              <button
-                type="button"
-                onClick={submitManualPayment}
-                disabled={manualBusy || !manualRef.trim()}
-                className="px-3 py-1.5 rounded-lg text-xs font-medium"
-                style={{
-                  background: "var(--primary)",
-                  color: "#fff",
-                  opacity: manualBusy || !manualRef.trim() ? 0.6 : 1,
-                }}
-              >
-                {manualBusy ? "Confirming…" : "Confirm"}
-              </button>
-            </div>
-            {manualError && <p className="mt-1.5" style={{ color: "var(--alert)" }}>{manualError}</p>}
+            {account?.manualPaymentStatus === "pending" ? (
+              <div className="rounded-lg px-2.5 py-2 text-xs" style={{ background: "#FBF1E7", color: "var(--ink-soft)" }}>
+                <div className="font-medium mb-0.5" style={{ color: "var(--ink)" }}>Reference submitted — awaiting verification</div>
+                We're checking <span className="mono-font">{account?.paymentReference}</span> against our records. This
+                usually takes a little while; your account unlocks automatically the moment it's confirmed, no need to
+                submit again.
+              </div>
+            ) : (
+              <>
+                <label className="block mb-1 font-medium" style={{ color: "var(--ink)" }}>
+                  {account?.manualPaymentStatus === "rejected"
+                    ? "We couldn't verify that reference — try again"
+                    : "Already paid? Enter your reference"}
+                </label>
+                {account?.manualPaymentStatus === "rejected" && (
+                  <p className="mb-1.5" style={{ color: "var(--alert)" }}>
+                    Double-check the number and resubmit, or email {SUPPORT_EMAIL} if you think this is a mistake.
+                  </p>
+                )}
+                <div className="flex gap-2">
+                  <input
+                    value={manualRef}
+                    onChange={(e) => setManualRef(e.target.value)}
+                    onKeyDown={(e) => e.key === "Enter" && submitManualPayment()}
+                    placeholder={isPHCustomer ? "GCash/bank reference no." : "PayPal transaction ID"}
+                    className="flex-1 border rounded-lg px-2.5 py-1.5 text-xs"
+                    style={{ borderColor: "var(--line)" }}
+                  />
+                  <button
+                    type="button"
+                    onClick={submitManualPayment}
+                    disabled={manualBusy || !manualRef.trim()}
+                    className="px-3 py-1.5 rounded-lg text-xs font-medium"
+                    style={{
+                      background: "var(--primary)",
+                      color: "#fff",
+                      opacity: manualBusy || !manualRef.trim() ? 0.6 : 1,
+                    }}
+                  >
+                    {manualBusy ? "Submitting…" : "Submit"}
+                  </button>
+                </div>
+                {manualError && <p className="mt-1.5" style={{ color: "var(--alert)" }}>{manualError}</p>}
+              </>
+            )}
           </div>
         </div>
       ) : (
