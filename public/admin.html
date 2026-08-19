@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Payment Review — OpSteward</title>
+<style>
+  :root {
+    --bg: #211a15;
+    --surface: #2c231d;
+    --surface-raised: #362b23;
+    --ink: #f3ece3;
+    --ink-soft: #b7a996;
+    --line: #4a3c30;
+    --primary: #d97a3f;
+    --primary-ink: #241a10;
+    --good: #6fae6a;
+    --bad: #c26b5e;
+    --radius: 14px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    min-height: 100vh;
+  }
+  .wrap { max-width: 640px; margin: 0 auto; padding: 28px 18px 80px; }
+  h1 {
+    font-size: 20px;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    margin: 0 0 4px;
+  }
+  .sub { color: var(--ink-soft); font-size: 13px; margin: 0 0 28px; }
+
+  /* ---- Gate ---- */
+  #gate { display: flex; flex-direction: column; gap: 10px; max-width: 340px; margin-top: 60px; }
+  #gate input {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    color: var(--ink);
+    padding: 12px 14px;
+    border-radius: var(--radius);
+    font-size: 14px;
+  }
+  #gate button, .btn {
+    border: none;
+    border-radius: var(--radius);
+    padding: 12px 14px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  #gate button { background: var(--primary); color: var(--primary-ink); }
+  #gateError { color: var(--bad); font-size: 12px; min-height: 16px; }
+
+  /* ---- List ---- */
+  #app { display: none; }
+  #status { color: var(--ink-soft); font-size: 13px; margin-bottom: 16px; }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 16px 18px;
+    margin-bottom: 14px;
+  }
+  .card-top { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
+  .biz-name { font-weight: 700; font-size: 15px; }
+  .submitted-at { color: var(--ink-soft); font-size: 11px; white-space: nowrap; }
+  .biz-email { color: var(--ink-soft); font-size: 12px; margin-top: 2px; }
+  .ref-row {
+    margin-top: 12px;
+    background: var(--surface-raised);
+    border-radius: 10px;
+    padding: 10px 12px;
+    font-size: 13px;
+  }
+  .ref-label { color: var(--ink-soft); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 2px; }
+  .ref-value { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
+  .actions { display: flex; gap: 10px; margin-top: 14px; }
+  .approve { background: var(--good); color: #12210f; flex: 1; }
+  .reject { background: var(--bad); color: #2a0f0a; flex: 1; }
+  .actions button:disabled { opacity: 0.5; cursor: default; }
+  .result-msg { font-size: 12px; margin-top: 10px; }
+  .result-msg.ok { color: var(--good); }
+  .result-msg.warn { color: #d9a13f; }
+  .result-msg.err { color: var(--bad); }
+
+  .empty {
+    text-align: center;
+    color: var(--ink-soft);
+    padding: 60px 20px;
+    font-size: 14px;
+  }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Payment review</h1>
+    <p class="sub">Manual payments waiting on you to check against GCash / bank / PayPal.</p>
+
+    <div id="gate">
+      <input id="secretInput" type="password" placeholder="Admin password" autocomplete="off" />
+      <button id="gateBtn">Unlock</button>
+      <div id="gateError"></div>
+    </div>
+
+    <div id="app">
+      <div id="status">Loading…</div>
+      <div id="list"></div>
+    </div>
+  </div>
+
+<script>
+  const gate = document.getElementById("gate");
+  const app = document.getElementById("app");
+  const secretInput = document.getElementById("secretInput");
+  const gateBtn = document.getElementById("gateBtn");
+  const gateError = document.getElementById("gateError");
+  const statusEl = document.getElementById("status");
+  const listEl = document.getElementById("list");
+
+  let secret = sessionStorage.getItem("opsteward_admin_secret") || "";
+
+  function fmtDate(iso) {
+    if (!iso) return "";
+    const d = new Date(iso);
+    return d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+  }
+
+  function render(pending) {
+    listEl.innerHTML = "";
+    if (!pending.length) {
+      listEl.innerHTML = '<div class="empty">Nothing waiting on you right now.</div>';
+      return;
+    }
+    pending.forEach((biz) => {
+      const card = document.createElement("div");
+      card.className = "card";
+      card.innerHTML = `
+        <div class="card-top">
+          <div>
+            <div class="biz-name">${biz.business_name || "(no business name set)"}</div>
+            <div class="biz-email">${biz.email || ""}</div>
+          </div>
+          <div class="submitted-at">${fmtDate(biz.manual_payment_submitted_at)}</div>
+        </div>
+        <div class="ref-row">
+          <div class="ref-label">Reference submitted</div>
+          <div class="ref-value">${biz.payment_reference || "(empty)"}</div>
+        </div>
+        <div class="actions">
+          <button class="btn approve" data-id="${biz.id}" data-action="approve">Approve</button>
+          <button class="btn reject" data-id="${biz.id}" data-action="reject">Reject</button>
+        </div>
+        <div class="result-msg" id="result-${biz.id}"></div>
+      `;
+      listEl.appendChild(card);
+    });
+  }
+
+  async function loadPending() {
+    statusEl.textContent = "Loading…";
+    try {
+      const res = await fetch(`/api/admin-manual-payments?secret=${encodeURIComponent(secret)}`);
+      if (res.status === 401) {
+        // Secret got rejected (e.g. changed on the server) — send back to the gate.
+        sessionStorage.removeItem("opsteward_admin_secret");
+        app.style.display = "none";
+        gate.style.display = "flex";
+        gateError.textContent = "That password isn't valid anymore. Try again.";
+        return;
+      }
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Something went wrong.");
+      statusEl.textContent = data.pending.length
+        ? `${data.pending.length} awaiting review`
+        : "All caught up";
+      render(data.pending);
+    } catch (err) {
+      statusEl.textContent = "Couldn't load pending payments: " + err.message;
+    }
+  }
+
+  async function act(businessId, action, btnGroup) {
+    const resultEl = document.getElementById(`result-${businessId}`);
+    btnGroup.querySelectorAll("button").forEach((b) => (b.disabled = true));
+    resultEl.className = "result-msg";
+    resultEl.textContent = action === "approve" ? "Activating…" : "Rejecting…";
+
+    try {
+      const res = await fetch("/api/admin-manual-payments", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ secret, businessId, action }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Something went wrong.");
+
+      if (data.emailSent) {
+        resultEl.className = "result-msg ok";
+        resultEl.textContent = action === "approve"
+          ? "Activated — customer emailed."
+          : "Rejected — customer emailed.";
+      } else {
+        resultEl.className = "result-msg warn";
+        resultEl.textContent = (action === "approve" ? "Activated" : "Rejected")
+          + `, but the email failed to send (${data.emailError || "unknown error"}). You may want to let them know directly.`;
+      }
+
+      // Remove the card after a short pause so the outcome is readable first.
+      setTimeout(() => loadPending(), 1400);
+    } catch (err) {
+      resultEl.className = "result-msg err";
+      resultEl.textContent = "Failed: " + err.message;
+      btnGroup.querySelectorAll("button").forEach((b) => (b.disabled = false));
+    }
+  }
+
+  listEl.addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-action]");
+    if (!btn) return;
+    act(btn.dataset.id, btn.dataset.action, btn.parentElement);
+  });
+
+  async function unlock() {
+    secret = secretInput.value.trim();
+    if (!secret) return;
+    gateError.textContent = "";
+    gateBtn.disabled = true;
+    gateBtn.textContent = "Checking…";
+    try {
+      const res = await fetch(`/api/admin-manual-payments?secret=${encodeURIComponent(secret)}`);
+      if (res.status === 401) {
+        gateError.textContent = "Wrong password.";
+        gateBtn.disabled = false;
+        gateBtn.textContent = "Unlock";
+        return;
+      }
+      sessionStorage.setItem("opsteward_admin_secret", secret);
+      gate.style.display = "none";
+      app.style.display = "block";
+      loadPending();
+    } catch (err) {
+      gateError.textContent = "Couldn't reach the server: " + err.message;
+      gateBtn.disabled = false;
+      gateBtn.textContent = "Unlock";
+    }
+  }
+
+  gateBtn.addEventListener("click", unlock);
+  secretInput.addEventListener("keydown", (e) => { if (e.key === "Enter") unlock(); });
+
+  if (secret) {
+    gate.style.display = "none";
+    app.style.display = "block";
+    loadPending();
+  }
+</script>
+</body>
+</html>
