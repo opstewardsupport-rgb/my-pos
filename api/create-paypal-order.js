@@ -44,6 +44,15 @@ const LOCKED_SUBSCRIPTION_PRICE_PHP = {
 };
 const ZERO_DECIMAL_CURRENCIES = new Set(["JPY", "IDR", "VND"]);
 
+// PayPal only settles in a specific list of currencies. Subscribers billed
+// in INR, IDR, or VND (the ones deliberately left OUT of this set) get
+// their order created in USD instead — see computePriceForBusiness below.
+// Mirrors PAYPAL_SUPPORTED_CURRENCIES in cafe-pos.jsx exactly; keep both in
+// sync if you ever add/remove a currency there.
+const PAYPAL_SUPPORTED_CURRENCIES = new Set([
+  "PHP", "USD", "EUR", "GBP", "JPY", "AUD", "SGD", "MYR", "THB",
+]);
+
 // See "ACTION NEEDED FROM YOU" above.
 const MAX_REWARD_CREDIT_PERCENT = 100;
 
@@ -53,7 +62,11 @@ function formatAmount(amount, currency) {
 }
 
 function computePriceForBusiness(business) {
-  const requestedCode = business.currency_code || "PHP";
+  const storedCode = business.currency_code || "PHP";
+  // If the account's own display currency isn't one PayPal settles in
+  // (INR/IDR/VND), price and charge in USD instead — same fallback the
+  // client used to compute itself via paypalNeedsUsd/usdFinalPrice.
+  const requestedCode = PAYPAL_SUPPORTED_CURRENCIES.has(storedCode) ? storedCode : "USD";
   const code = LOCKED_SUBSCRIPTION_PRICE_PHP[requestedCode] !== undefined ? requestedCode : "PHP";
   const fullPrice = LOCKED_SUBSCRIPTION_PRICE_PHP[code];
 
