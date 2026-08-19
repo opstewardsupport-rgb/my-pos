@@ -1199,6 +1199,12 @@
    -- PayPal order/capture id, so it shows up in Settings the same way a
    -- manual payment reference does, and you can look it up in your PayPal
    -- dashboard if a subscriber ever has a billing question.
+   --
+   -- Note: this function only changes data — it doesn't send any email
+   -- itself. The admin dashboard (api/admin-manual-payments.js) sends the
+   -- "you're active" customer email via Gmail right after calling this;
+   -- the PayPal webhook path doesn't currently email the customer at all
+   -- (PayPal's own receipt covers that).
    drop function if exists public.activate_subscription(uuid, text) cascade;
    create or replace function public.activate_subscription(p_business_id uuid, p_reference text)
    returns void
@@ -1239,11 +1245,35 @@
    end;
    $$;
 
+   -- Companion to activate_subscription() above, for the OTHER outcome of
+   -- reviewing a manual payment: the reference didn't check out. Sets
+   -- manual_payment_status = 'rejected' (which flips the Upgrade screen
+   -- back to a resubmit form with an explanatory message — see
+   -- account?.manualPaymentStatus in the app code). Like
+   -- activate_subscription() above, this only changes data — the admin
+   -- dashboard sends the customer's "we couldn't verify that" email via
+   -- Gmail right after calling this.
+   drop function if exists public.reject_manual_payment(uuid) cascade;
+   create or replace function public.reject_manual_payment(p_business_id uuid)
+   returns void
+   language plpgsql
+   security definer
+   set search_path = public
+   as $$
+   begin
+     update public.businesses
+       set manual_payment_status = 'rejected'
+       where id = p_business_id;
+   end;
+   $$;
+
    -- Deliberately NOT granted to `authenticated` or `anon` — only your
-   -- service-role key (which only api/paypal-webhook.js ever holds) can
-   -- call this. A logged-in customer's browser key can't call it at all,
-   -- which is exactly what stops anyone from activating their own account
-   -- for free by guessing this function's name.
+   -- service-role key (used by api/paypal-webhook.js AND
+   -- api/admin-manual-payments.js, the admin dashboard's backend) can call
+   -- either of these two functions. A logged-in customer's browser key
+   -- can't call them at all, which is exactly what stops anyone from
+   -- activating (or maliciously rejecting someone else's) account by
+   -- guessing a function name.
 
    ---- END: paste into Supabase SQL Editor ----
 ============================================================================= */
