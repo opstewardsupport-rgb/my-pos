@@ -388,30 +388,44 @@
    -- referral_count — so someone who clicked Apply and then never paid
    -- never counts as having "used" a code at all, for either side.
    --
-   -- Also grants the referrer their one-time 3% reward credit for having
-   -- referred the caller — but ONLY the first time this runs for a given
-   -- caller, and ONLY if the caller actually has a code queued up or
-   -- already finalized. This is what makes the reward reflect a real
-   -- paying referral instead of just someone typing in a code and
-   -- abandoning the upgrade screen.
+   -- Also adds the referrer's RECURRING 3% reward credit for having
+   -- referred the caller — not a one-time bump. The referrer keeps earning
+   -- this 3% (as part of active_referral_count * 3, capped at
+   -- MAX_REWARD_CREDIT_PERCENT/50% total across ALL their active referrals
+   -- combined) for as long as THIS specific referred account stays an
+   -- active, paying subscriber. The moment this account unsubscribes or
+   -- deletes its account, that 3% is automatically removed from the
+   -- referrer's ongoing discount — see handle_referral_deactivation() and
+   -- handle_referral_deletion() further below, which are the other half of
+   -- this mechanism.
+   --
+   -- Runs on EVERY confirmed payment (first payment AND every renewal — see
+   -- markSubscriptionActive() in the app code, which calls this every time,
+   -- not just on a first payment), so it can also detect a REACTIVATION: an
+   -- account that unsubscribed (which cleared its referral_reward_granted
+   -- flag below and decremented the referrer's active_referral_count) and
+   -- later resubscribes gets counted again, restoring the referrer's 3%
+   -- for it.
    --
    -- Guards against ever double-crediting or double-counting the same
    -- referral:
-   --   - referral_reward_granted on the CALLER's row flips to true the
-   --     first time this runs for them and is checked up front, so a
-   --     second call (e.g. a renewal, or the confirm button being pressed
-   --     twice) is a safe no-op.
+   --   - referral_reward_granted on the CALLER's row is the live "am I
+   --     currently counted toward my referrer's active_referral_count" flag
+   --     — checked up front, so a call that finds it already true (a normal
+   --     renewal that isn't a reactivation) is a safe no-op; it only
+   --     proceeds to add a fresh 3% when this account isn't currently
+   --     counted (a first-ever payment, or a resubscribe after having been
+   --     decremented).
    --   - pending_referral_code is cleared the moment it's finalized (or
    --     found unusable), so it's never finalized twice.
    --   - the same permanent referral_redemptions uniqueness redeem_referral()
    --     checks before allowing an apply is re-checked here too, so a race
    --     between two tabs both applying-then-paying can't double-insert.
-   -- Mirrors the same subscriber-only eligibility redeem_referral() checks:
-   -- the referrer only actually receives the 3% if THEY are currently an
-   -- active, non-lapsed subscriber at the moment their referral pays — if
-   -- not, the referral still gets marked as "granted" (so it's never
-   -- retried later once the referrer's status changes), it just doesn't
-   -- add any credit.
+   -- Unlike the old one-time version of this reward, this does NOT gate on
+   -- the REFERRER'S OWN subscription status — the credit is entirely about
+   -- whether the REFERRED account is active, and simply sits there ready to
+   -- apply the next time the referrer has a bill, whether or not they
+   -- happen to be actively subscribed at this exact moment.
    drop function if exists grant_referral_reward_on_payment() cascade;
    drop function if exists finalize_referral_redemption() cascade;
    create or replace function finalize_referral_redemption()
@@ -428,9 +442,7 @@
      v_already_granted boolean;
      v_referrer_id uuid;
      v_referrer_email text;
-     v_referrer_status text;
-     v_referrer_period_end timestamptz;
-     v_referrer_is_eligible boolean;
+     v_new_active_count int;
    begin
      if v_caller_id is null then
        return;
@@ -485,36 +497,39 @@
        end if;
      end if;
 
-     -- Nothing to reward: this account was never referred (no code was
-     -- ever applied, or it turned out unusable above), or this exact
-     -- referral has already been credited once before.
+     -- Nothing to (re-)count: this account was never referred (no code was
+     -- ever applied, or it turned out unusable above), or this account is
+     -- already counted as an active referral for its referrer right now
+     -- (a normal renewal, not a first payment or a reactivation).
      if v_referred_by is null or v_already_granted then
        return;
      end if;
 
-     select subscription_status, subscription_period_end
-       into v_referrer_status, v_referrer_period_end
-       from public.businesses
+     -- Bump the referrer's count of currently-active referred subscribers,
+     -- then recompute their reward credit from that new count — capped at
+     -- 50 so it stops growing once the referrer hits the maximum discount,
+     -- matching MAX_REWARD_CREDIT_PERCENT in the app code (cafe-pos.jsx).
+     -- If you ever change that constant, change the 3 and 50 here (and in
+     -- the other identical pair of UPDATEs in
+     -- finalize_referral_redemption_for below) to match, or the two will
+     -- drift out of sync. Deliberately NOT gated on the referrer's own
+     -- subscription status — the credit is about the REFERRED account being
+     -- active, and just sits ready for whenever the referrer next has a
+     -- bill.
+     update public.businesses
+       set active_referral_count = coalesce(active_referral_count, 0) + 1
+       where id = v_referred_by
+       returning active_referral_count into v_new_active_count;
+
+     update public.businesses
+       set reward_credits = least(v_new_active_count * 3, 50)
        where id = v_referred_by;
 
-     v_referrer_is_eligible := (v_referrer_status = 'active')
-       and (v_referrer_period_end is null or v_referrer_period_end > now());
-
-     if v_referrer_is_eligible then
-       -- Capped at 50 so accumulation genuinely stops once a referrer hits
-       -- the maximum discount for the month — matches MAX_REWARD_CREDIT_PERCENT
-       -- in the app code (cafe-pos.jsx). If you ever change that constant,
-       -- change the 50 here (and in the other identical UPDATE below) to
-       -- match, or the two will drift out of sync.
-       update public.businesses
-         set reward_credits = least(coalesce(reward_credits, 0) + 3, 50)
-         where id = v_referred_by;
-     end if;
-
-     -- Marked granted regardless of the eligibility outcome above, so this
-     -- referral is never re-evaluated or re-credited again later — it's a
-     -- one-time perk tied to this one first payment, not something that
-     -- keeps checking back in on the referrer's status.
+     -- Marks this account as currently counted, so a normal future renewal
+     -- is a no-op (see the check above) and so
+     -- handle_referral_deactivation()/handle_referral_deletion() below know
+     -- to decrement the referrer when THIS account eventually stops being
+     -- active.
      update public.businesses
        set referral_reward_granted = true
        where id = v_caller_id;
@@ -523,12 +538,119 @@
 
    grant execute on function finalize_referral_redemption() to authenticated;
 
-   -- Tracks whether THIS account's referral reward (the 3% it owes its
-   -- referrer) has already been granted, so finalize_referral_redemption()
-   -- above can never fire twice for the same referral. Safe to run even if
-   -- this column already exists.
+   -- Tracks whether THIS account currently counts toward its referrer's
+   -- active_referral_count / reward_credits below. Kept the same column
+   -- name as before, but its meaning changed from a one-time "has this
+   -- referral ever been rewarded" flag to a live "is this referral
+   -- currently active" flag: it flips true the moment this account's first
+   -- (or reactivating) payment is finalized (see
+   -- finalize_referral_redemption() above), and back to false the moment
+   -- this account unsubscribes or deletes its account (see
+   -- handle_referral_deactivation()/handle_referral_deletion() below) — so
+   -- finalize_referral_redemption() can correctly re-grant the referrer's
+   -- credit if this account later resubscribes. Safe to run even if this
+   -- column already exists.
    alter table public.businesses
      add column if not exists referral_reward_granted boolean not null default false;
+
+   -- How many of a business's referred sign-ups currently have an ACTIVE
+   -- paid subscription. This — not a lifetime referral_count — is what
+   -- reward_credits is derived from (least(active_referral_count * 3, 50)),
+   -- so a referrer's discount rises and falls in step with how many of the
+   -- people they referred are still paying customers right now, rather than
+   -- accumulating permanently or resetting every billing cycle. Incremented
+   -- by finalize_referral_redemption()/finalize_referral_redemption_for()
+   -- the moment a referred account's payment is confirmed, and decremented
+   -- by handle_referral_deactivation() (unsubscribe) or
+   -- handle_referral_deletion() (account deletion) right below. Safe to run
+   -- even if this column already exists.
+   alter table public.businesses
+     add column if not exists active_referral_count integer not null default 0;
+
+   -- Recurring-referral upkeep, part 1 of 2: fires whenever a business's
+   -- subscription_status changes AWAY FROM 'active' — i.e. the app's
+   -- unsubscribeAccount() setting it to 'cancelled'. If this account was
+   -- currently counted toward its referrer's active_referral_count (see
+   -- referral_reward_granted above), that referral is no longer active:
+   -- decrement the referrer's active_referral_count, recompute their
+   -- reward_credits from the new count, and clear this account's own
+   -- referral_reward_granted flag so a later resubscribe correctly
+   -- re-counts it (see finalize_referral_redemption() above). A BEFORE
+   -- trigger, so it can set NEW.referral_reward_granted directly instead of
+   -- issuing a second UPDATE on this same row (which would just retrigger
+   -- this same function harmlessly, but there's no reason to). Deliberately
+   -- does NOT fire for a subscription simply lapsing (subscription_period_end
+   -- passing without an explicit unsubscribe) — this app has no server-side
+   -- cron to detect that, so subscription_status stays 'active' in the
+   -- database until the owner explicitly unsubscribes or deletes their
+   -- account; only those two actions ever remove a referral from the count.
+   drop function if exists public.handle_referral_deactivation() cascade;
+   create or replace function public.handle_referral_deactivation()
+   returns trigger
+   language plpgsql
+   security definer
+   set search_path = public
+   as $$
+   declare
+     v_new_active_count int;
+   begin
+     if old.subscription_status = 'active'
+        and new.subscription_status is distinct from 'active'
+        and old.referred_by is not null
+        and coalesce(old.referral_reward_granted, false) then
+       update public.businesses
+         set active_referral_count = greatest(coalesce(active_referral_count, 0) - 1, 0)
+         where id = old.referred_by
+         returning active_referral_count into v_new_active_count;
+
+       update public.businesses
+         set reward_credits = least(coalesce(v_new_active_count, 0) * 3, 50)
+         where id = old.referred_by;
+
+       new.referral_reward_granted := false;
+     end if;
+     return new;
+   end;
+   $$;
+
+   drop trigger if exists trg_referral_deactivation on public.businesses;
+   create trigger trg_referral_deactivation
+     before update on public.businesses
+     for each row execute function public.handle_referral_deactivation();
+
+   -- Recurring-referral upkeep, part 2 of 2: the same decrement as above,
+   -- but for when a referred account is DELETED instead of merely
+   -- unsubscribed (see delete_own_account() near the top of this file). An
+   -- AFTER DELETE trigger, since OLD is still fully available after the row
+   -- is gone and there's no NEW row left to update.
+   drop function if exists public.handle_referral_deletion() cascade;
+   create or replace function public.handle_referral_deletion()
+   returns trigger
+   language plpgsql
+   security definer
+   set search_path = public
+   as $$
+   declare
+     v_new_active_count int;
+   begin
+     if old.referred_by is not null and coalesce(old.referral_reward_granted, false) then
+       update public.businesses
+         set active_referral_count = greatest(coalesce(active_referral_count, 0) - 1, 0)
+         where id = old.referred_by
+         returning active_referral_count into v_new_active_count;
+
+       update public.businesses
+         set reward_credits = least(coalesce(v_new_active_count, 0) * 3, 50)
+         where id = old.referred_by;
+     end if;
+     return old;
+   end;
+   $$;
+
+   drop trigger if exists trg_referral_deletion on public.businesses;
+   create trigger trg_referral_deletion
+     after delete on public.businesses
+     for each row execute function public.handle_referral_deletion();
 
    -- FIX: some signups ended up with an auth.users account but NO row in
    -- businesses at all (Settings showed blank Business name / Email because
@@ -1245,24 +1367,30 @@ const SUBSCRIPTION_PERIOD_DAYS = 30;
 //    gets on their very first payment (first month only), if they redeemed
 //    someone else's code before paying. It's consumed after that first
 //    payment (see markSubscriptionActive) — it never applies to renewals.
-//  - REFERRAL_REWARD_PERCENT: what the CODE OWNER earns, every time their
-//    code is redeemed by someone new. This is a CURRENT-BILLING-MONTH-ONLY
-//    credit: it accumulates as new referrals come in during the owner's
-//    current billing cycle, then resets back to 0% the moment a new billing
-//    cycle starts (see markSubscriptionActive, which zeroes reward_credits
-//    on every renewal) — it does NOT roll over or stack across months.
-// Both numbers are enforced server-side in the redeem_referral() SQL
-// function at the top of this file — these constants are just what the UI
-// displays, so keep them in sync if you ever change the SQL.
+//  - REFERRAL_REWARD_PERCENT: what the CODE OWNER earns for EACH referred
+//    sign-up that is CURRENTLY an active, paying subscriber — a RECURRING
+//    benefit, not a one-time bump. It keeps applying to every renewal for
+//    as long as that specific referred account stays subscribed, and is
+//    automatically removed the moment that referred account unsubscribes
+//    or deletes its account (see handle_referral_deactivation() and
+//    handle_referral_deletion() in the SQL setup block at the top of this
+//    file). The referrer's total credit is always
+//    active_referral_count * REFERRAL_REWARD_PERCENT, capped below.
+// Both numbers are enforced server-side — REFERRAL_DISCOUNT_PERCENT in the
+// redeem_referral() SQL function, REFERRAL_REWARD_PERCENT in
+// finalize_referral_redemption()/finalize_referral_redemption_for() and the
+// two deactivation triggers — at the top of this file. These constants are
+// just what the UI displays, so keep them in sync if you ever change the
+// SQL.
 const REFERRAL_DISCOUNT_PERCENT = 25;
 const REFERRAL_REWARD_PERCENT = 3;
 // Safety cap on how much of the price reward credits can ever discount.
-// Set to 50 so a subscriber's renewal is never more than half off, no
-// matter how many referrals they rack up in one billing cycle. This is a
-// display/UI cap — the underlying reward_credits column in Supabase keeps
-// accumulating past 50 with no ceiling (see redeem_referral() in the SQL
-// setup block), but every screen that reads it (UpgradeView, SettingsView)
-// clamps to this constant before showing or charging anything, so the
+// Set to 50 so a subscriber's bill is never more than half off, no matter
+// how many currently-active referrals they have. Enforced on both sides:
+// the underlying reward_credits column in Supabase is itself capped at 50
+// by every SQL function that writes it (least(active_referral_count * 3,
+// 50)), and every screen that reads it (UpgradeView, SettingsView) clamps
+// to this same constant again before showing or charging anything, so the
 // subscriber is never actually charged below 50% of the full price.
 const MAX_REWARD_CREDIT_PERCENT = 50;
 
@@ -11080,7 +11208,7 @@ function SettingsView({ account, onUpdateField, onLogOut, onDeleteAccount, onUns
           <div className="rounded-lg p-3" style={{ background: "var(--bg)" }}>
             <div className="text-[11px] font-medium mb-1">Current month</div>
             <p className="text-[11px]" style={{ color: "var(--ink-soft)" }}>
-              Every time a new user signs up with your referral code, you earn {REFERRAL_REWARD_PERCENT}% off your immediate current billing cycle, up to a maximum of {MAX_REWARD_CREDIT_PERCENT}% off. When the month ends and the next billing cycle begins, that discount resets to 0% for the new month until fresh referrals are made during that cycle.
+              For each referred sign-up who becomes and stays an active, paying subscriber, you earn a recurring {REFERRAL_REWARD_PERCENT}% credit toward every future bill — up to a maximum of {MAX_REWARD_CREDIT_PERCENT}% off in total. This isn't a one-time bonus: it keeps applying automatically for as long as that referral stays subscribed, and is removed the moment they unsubscribe or delete their account.
             </p>
           </div>
           <div className="flex gap-3 pt-1">
@@ -11362,7 +11490,7 @@ function TermsGuidelinesModal({ onClose }) {
 
         <Section title="Referrals">
           <Point>Your code gives new sign-ups {REFERRAL_DISCOUNT_PERCENT}% off their first month.</Point>
-          <Point>You earn {REFERRAL_REWARD_PERCENT}% credit per referral, capped at {MAX_REWARD_CREDIT_PERCENT}% off, resetting each billing cycle.</Point>
+          <Point>You earn a recurring {REFERRAL_REWARD_PERCENT}% credit for each referred sign-up who stays an active, paying subscriber — capped at {MAX_REWARD_CREDIT_PERCENT}% off in total. This keeps applying to every bill for as long as that referral remains active, and is automatically removed the moment they unsubscribe or delete their account.</Point>
           <Point>Fake or self-referrals aren't allowed and may get an account suspended.</Point>
         </Section>
 
