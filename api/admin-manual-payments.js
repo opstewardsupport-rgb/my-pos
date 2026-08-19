@@ -105,6 +105,50 @@ const SUPPORT_EMAIL = process.env.GMAIL_USER || "opsteward.support@gmail.com";
 // control anything in the database itself.
 const SUBSCRIPTION_PERIOD_DAYS = 30;
 
+// Mirrors LOCKED_SUBSCRIPTION_PRICE_PHP / CURRENCIES in App.jsx exactly — if
+// you ever change a price or add a currency there, update it here too, or
+// the amount shown on a pending card will drift from what the customer
+// actually saw on the Upgrade screen.
+const LOCKED_SUBSCRIPTION_PRICE_PHP = {
+  PHP: 1699,
+  USD: 35.00,
+  EUR: 28.00,
+  GBP: 24.00,
+  JPY: 5200,
+  AUD: 53.00,
+  SGD: 47.00,
+  MYR: 155.00,
+  INR: 2950,
+  IDR: 550000,
+  THB: 1250,
+  VND: 875000,
+};
+
+const CURRENCIES = {
+  PHP: { symbol: "₱" },
+  USD: { symbol: "$" },
+  EUR: { symbol: "€" },
+  GBP: { symbol: "£" },
+  JPY: { symbol: "¥", zeroDecimal: true },
+  AUD: { symbol: "A$" },
+  SGD: { symbol: "S$" },
+  MYR: { symbol: "RM" },
+  INR: { symbol: "₹" },
+  IDR: { symbol: "Rp", zeroDecimal: true },
+  THB: { symbol: "฿" },
+  VND: { symbol: "₫", zeroDecimal: true },
+};
+
+function formatExpectedAmount(currencyCode, discountPercent) {
+  const code = currencyCode || "PHP";
+  const full = LOCKED_SUBSCRIPTION_PRICE_PHP[code] ?? LOCKED_SUBSCRIPTION_PRICE_PHP.PHP;
+  const cur = CURRENCIES[code] || CURRENCIES.PHP;
+  const final = full - full * ((Number(discountPercent) || 0) / 100);
+  const decimals = cur.zeroDecimal ? 0 : 2;
+  const formatted = final.toLocaleString(undefined, { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
+  return `${cur.symbol}${formatted}`;
+}
+
 function formatDate(date) {
   return date.toLocaleDateString("en-US", {
     year: "numeric",
@@ -177,7 +221,7 @@ export default async function handler(req, res) {
     // Pending: the live, current state — straight from businesses.
     const { data: pending, error: pendingError } = await supabaseAdmin
       .from("businesses")
-      .select("id, business_name, email, payment_reference, manual_payment_submitted_at, currency_code")
+      .select("id, business_name, email, payment_reference, manual_payment_submitted_at, currency_code, discount_percent")
       .eq("manual_payment_status", "pending")
       .order("manual_payment_submitted_at", { ascending: true });
 
@@ -201,7 +245,41 @@ export default async function handler(req, res) {
       return;
     }
 
-    res.status(200).json({ pending, history });
+    // Duplicate-reference check: flags a reference that's either used by
+    // more than one pending row right now, or matches a reference that was
+    // already approved before for ANY business. Either case is worth a
+    // second look before you approve — the first catches two people
+    // submitting the same screenshot/reference, the second catches someone
+    // reusing a reference that already paid out once.
+    const referenceCounts = new Map();
+    pending.forEach((biz) => {
+      const ref = (biz.payment_reference || "").trim().toLowerCase();
+      if (!ref) return;
+      referenceCounts.set(ref, (referenceCounts.get(ref) || 0) + 1);
+    });
+    const approvedReferences = new Set(
+      history
+        .filter((h) => h.action === "approved")
+        .map((h) => (h.reference || "").trim().toLowerCase())
+        .filter(Boolean)
+    );
+
+    const pendingWithFlags = pending.map((biz) => {
+      const ref = (biz.payment_reference || "").trim().toLowerCase();
+      const isDuplicatePending = ref && referenceCounts.get(ref) > 1;
+      const wasAlreadyApproved = ref && approvedReferences.has(ref);
+      return {
+        ...biz,
+        expectedAmount: formatExpectedAmount(biz.currency_code, biz.discount_percent),
+        duplicateWarning: isDuplicatePending
+          ? "This exact reference was also submitted by another pending account."
+          : wasAlreadyApproved
+          ? "This exact reference was already approved once before."
+          : null,
+      };
+    });
+
+    res.status(200).json({ pending: pendingWithFlags, history });
     return;
   }
 
