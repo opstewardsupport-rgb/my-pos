@@ -11201,14 +11201,14 @@ function SettingsView({ account, onUpdateField, onLogOut, onDeleteAccount, onUns
             </button>
           </div>
           <p className="text-[11px]" style={{ color: "var(--ink-soft)" }}>
-            Share this code — new sign-ups who use it get {REFERRAL_DISCOUNT_PERCENT}% off their first month, and you earn a {REFERRAL_REWARD_PERCENT}% reward credit every time it's used (up to {MAX_REWARD_CREDIT_PERCENT}% off in one billing month).
+            Share this code — new sign-ups who use it get {REFERRAL_DISCOUNT_PERCENT}% off their first month, and you earn a recurring {REFERRAL_REWARD_PERCENT}% credit for as long as they stay an active, paying subscriber (up to {MAX_REWARD_CREDIT_PERCENT}% off in total).
           </p>
 
-          {/* ---- Current-month referral explainer ---- */}
+          {/* ---- Recurring referral explainer ---- */}
           <div className="rounded-lg p-3" style={{ background: "var(--bg)" }}>
-            <div className="text-[11px] font-medium mb-1">Current month</div>
+            <div className="text-[11px] font-medium mb-1">How your credit works</div>
             <p className="text-[11px]" style={{ color: "var(--ink-soft)" }}>
-              For each referred sign-up who becomes and stays an active, paying subscriber, you earn a recurring {REFERRAL_REWARD_PERCENT}% credit toward every future bill — up to a maximum of {MAX_REWARD_CREDIT_PERCENT}% off in total. This isn't a one-time bonus: it keeps applying automatically for as long as that referral stays subscribed, and is removed the moment they unsubscribe or delete their account.
+              For every user who signs up with your referral code and stays an active, paying subscriber, you earn {REFERRAL_REWARD_PERCENT}% off — automatically, every month, for as long as they remain subscribed — up to a maximum of {MAX_REWARD_CREDIT_PERCENT}% off. If a referred user unsubscribes or deletes their account, their {REFERRAL_REWARD_PERCENT}% is automatically removed from your ongoing discount.
             </p>
           </div>
           <div className="flex gap-3 pt-1">
@@ -11250,7 +11250,7 @@ function SettingsView({ account, onUpdateField, onLogOut, onDeleteAccount, onUns
                 not just in the general explainer text above. ---- */}
             {rewardCreditPercent >= MAX_REWARD_CREDIT_PERCENT && (
               <p className="text-[10px] mt-2 pt-2" style={{ color: "var(--primary-dark)", borderTop: "1px dashed var(--line)" }}>
-                You've reached the maximum reward credit ({MAX_REWARD_CREDIT_PERCENT}% off) for this billing cycle. Additional referrals this month won't reduce your bill further — the cap resets to 0% at the start of your next cycle.
+                You've reached the maximum reward credit ({MAX_REWARD_CREDIT_PERCENT}% off). Additional referrals won't reduce your bill further while you're at the cap — but this credit keeps applying every month for as long as your referred users stay active subscribers; it only drops if one of them unsubscribes or deletes their account.
               </p>
             )}
           </div>
@@ -11261,7 +11261,7 @@ function SettingsView({ account, onUpdateField, onLogOut, onDeleteAccount, onUns
             <Store size={13} /> Referral code
           </div>
           <p className="text-[11px] mt-2" style={{ color: "var(--ink-soft)" }}>
-            Your referral code unlocks once you're a paying subscriber — subscribe to get your own code to share, and start earning a {REFERRAL_REWARD_PERCENT}% reward credit every time it's used, up to a maximum of {MAX_REWARD_CREDIT_PERCENT}% off any single bill. New users who sign up with your code get {REFERRAL_DISCOUNT_PERCENT}% off their first month.
+            Your referral code unlocks once you're a paying subscriber — subscribe to get your own code to share, and start earning a recurring {REFERRAL_REWARD_PERCENT}% credit for every referred sign-up who stays an active, paying subscriber, up to a maximum of {MAX_REWARD_CREDIT_PERCENT}% off any single bill. The credit keeps applying for as long as they remain subscribed, and is automatically removed if they unsubscribe or delete their account. New users who sign up with your code get {REFERRAL_DISCOUNT_PERCENT}% off their first month.
           </p>
         </div>
       )}
