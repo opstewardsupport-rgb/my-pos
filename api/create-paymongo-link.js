@@ -61,7 +61,7 @@ const LOCKED_SUBSCRIPTION_PRICE_PHP = {
 const ZERO_DECIMAL_CURRENCIES = new Set(["JPY", "IDR", "VND"]);
 
 // See "ACTION NEEDED FROM YOU" above.
-const MAX_REWARD_CREDIT_PERCENT = 100;
+const MAX_REWARD_CREDIT_PERCENT = 50; // 3% per active referral, capped at 50% total — confirmed by app owner
 
 function computePriceForBusiness(business, currencyCode) {
   const code = LOCKED_SUBSCRIPTION_PRICE_PHP[currencyCode] !== undefined ? currencyCode : "PHP";
