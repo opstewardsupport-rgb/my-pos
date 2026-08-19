@@ -1,32 +1,81 @@
-// api/create-paypal-order.js
+// =============================================================================
+// api/create-paypal-order.js — Vercel serverless function (SECURITY FIX)
+// =============================================================================
+// WHAT CHANGED AND WHY — same issue and same fix as create-paymongo-link.js:
+// the old version trusted `amount`, `currency`, and `businessId` straight
+// from the browser. That let anyone (a) get any account activated for
+// free by sending amount: 0, or (b) pay any amount they typed for a real
+// order (e.g. $0.01 instead of $35). Neither the PayPal order creation nor
+// the webhook that confirms payment had any way to know the "right" price.
 //
-// Called by startPayPalCheckout() in cafe-pos.jsx whenever an international
-// subscriber clicks "Pay now". Creates a real PayPal Order (via PayPal's
-// Checkout API) for the exact amount shown on screen, with the subscriber's
-// account id attached as custom_id — that's what lets api/paypal-webhook.js
-// know whose account to activate once this order is paid.
+// THE FIX: this file now verifies who is logged in from their Supabase
+// session token, and computes the price itself from that account's own
+// discount_percent / reward_credits / currency_code in the database — the
+// browser no longer gets a say in either.
 //
-// ONE-TIME SETUP — see the big comment above PAYPAL_CREATE_ORDER_ENDPOINT
-// near the top of cafe-pos.jsx. In short, this file needs these Vercel
-// environment variables set:
-//   PAYPAL_CLIENT_ID
-//   PAYPAL_CLIENT_SECRET
-//   PAYPAL_ENV        ("live" or "sandbox" — defaults to "live" if unset)
+// ACTION NEEDED FROM YOU: see the MAX_REWARD_CREDIT_PERCENT comment below
+// — same note as in create-paymongo-link.js.
+// =============================================================================
 
 import { createClient } from "@supabase/supabase-js";
 
-const SUPABASE_URL = "https://tdgcyffbblxxccsujtdy.supabase.co";
+const SUPABASE_URL = process.env.SUPABASE_URL || "https://tdgcyffbblxxccsujtdy.supabase.co";
+const SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 const PAYPAL_API_BASE = (process.env.PAYPAL_ENV || "live") === "sandbox"
   ? "https://api-m.sandbox.paypal.com"
   : "https://api-m.paypal.com";
 
-// PayPal requires whole-cent amounts as a plain string with the right
-// number of decimal places for the currency (0 for JPY-style currencies).
+// ---- Pricing table — must match LOCKED_SUBSCRIPTION_PRICE_PHP in
+// cafe-pos.jsx exactly. ----
+const LOCKED_SUBSCRIPTION_PRICE_PHP = {
+  PHP: 1699,
+  USD: 35.00,
+  EUR: 28.00,
+  GBP: 24.00,
+  JPY: 5200,
+  AUD: 53.00,
+  SGD: 47.00,
+  MYR: 155.00,
+  INR: 2950,
+  IDR: 550000,
+  THB: 1250,
+  VND: 875000,
+};
 const ZERO_DECIMAL_CURRENCIES = new Set(["JPY", "IDR", "VND"]);
+
+// See "ACTION NEEDED FROM YOU" above.
+const MAX_REWARD_CREDIT_PERCENT = 100;
+
 function formatAmount(amount, currency) {
   const n = Math.max(0, Number(amount) || 0);
   return ZERO_DECIMAL_CURRENCIES.has(currency) ? String(Math.round(n)) : n.toFixed(2);
+}
+
+function computePriceForBusiness(business) {
+  const requestedCode = business.currency_code || "PHP";
+  const code = LOCKED_SUBSCRIPTION_PRICE_PHP[requestedCode] !== undefined ? requestedCode : "PHP";
+  const fullPrice = LOCKED_SUBSCRIPTION_PRICE_PHP[code];
+
+  const hasSubscribedBefore = business.subscription_status === "active";
+  const rewardCreditPercent = Math.min(Number(business.reward_credits) || 0, MAX_REWARD_CREDIT_PERCENT);
+  const signupDiscountPercent = Number(business.discount_percent) || 0;
+  const discountPercent = hasSubscribedBefore ? rewardCreditPercent : signupDiscountPercent;
+
+  const rawFinal = fullPrice * (1 - discountPercent / 100);
+  const finalPrice = ZERO_DECIMAL_CURRENCIES.has(code) ? Math.round(rawFinal) : Math.round(rawFinal * 100) / 100;
+
+  return { currencyCode: code, finalPrice };
+}
+
+async function getVerifiedBusinessId(req, supabaseAdmin) {
+  const authHeader = req.headers.authorization || "";
+  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+  if (!token) return null;
+
+  const { data, error } = await supabaseAdmin.auth.getUser(token);
+  if (error || !data?.user?.id) return null;
+  return data.user.id;
 }
 
 async function getAccessToken() {
@@ -57,26 +106,48 @@ export default async function handler(req, res) {
     return;
   }
 
+  if (!SERVICE_ROLE_KEY) {
+    res.status(500).json({ error: "SUPABASE_SERVICE_ROLE_KEY is not set on the server." });
+    return;
+  }
+
+  const supabaseAdmin = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
+
   try {
-    const { amount, currency, description, businessId } = req.body || {};
-    const amt = Number(amount);
+    // ---- WHO: verified from the login token, never from req.body ----
+    const businessId = await getVerifiedBusinessId(req, supabaseAdmin);
     if (!businessId) {
-      res.status(400).json({ error: "Missing businessId." });
-      return;
-    }
-    if (!currency || !Number.isFinite(amt) || amt < 0) {
-      res.status(400).json({ error: "Missing or invalid amount/currency." });
+      res.status(401).json({ error: "You must be logged in to start a payment." });
       return;
     }
 
-    // A 100% discount brings the final price to exactly 0 — PayPal can't
-    // create an order for $0, so activate the subscription directly
-    // instead, the same way create-paymongo-link.js already does for a
-    // ₱0 PayMongo link. Uses the SERVICE ROLE key because this runs on
-    // your server, not as the logged-in subscriber.
-    if (amt === 0) {
-      const supabase = createClient(SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
-      const { error } = await supabase.rpc("activate_subscription", {
+    // ---- HOW MUCH: looked up and computed here, never from req.body ----
+    const { data: business, error: fetchError } = await supabaseAdmin
+      .from("businesses")
+      .select("subscription_status, discount_percent, reward_credits, currency_code")
+      .eq("id", businessId)
+      .single();
+
+    if (fetchError || !business) {
+      res.status(404).json({ error: "Couldn't find your account." });
+      return;
+    }
+
+    const { currencyCode, finalPrice } = computePriceForBusiness(business);
+
+    // PayPal is only offered to non-PHP accounts (PHP uses PayMongo) —
+    // refuse rather than silently creating a PayPal order for a PHP
+    // account.
+    if (currencyCode === "PHP") {
+      res.status(400).json({ error: "This account is billed in PHP — use the PayMongo checkout instead." });
+      return;
+    }
+
+    const description = "OpSteward subscription";
+
+    // ---- FREE RENEWAL PATH: server's OWN calculation rounds to exactly 0 ----
+    if (finalPrice === 0) {
+      const { error } = await supabaseAdmin.rpc("activate_subscription", {
         p_business_id: businessId,
         p_reference: "free-100pct-discount",
       });
@@ -89,12 +160,6 @@ export default async function handler(req, res) {
     }
 
     const accessToken = await getAccessToken();
-
-    // The URLs PayPal sends the subscriber back to after approving or
-    // cancelling — these pages just need to exist so the popup has
-    // somewhere to land; the webhook (not these pages) is what actually
-    // activates the account. req.headers.origin is the domain this POS is
-    // hosted on, whatever that is.
     const origin = req.headers.origin || `https://${req.headers.host}`;
 
     const orderResp = await fetch(`${PAYPAL_API_BASE}/v2/checkout/orders`, {
@@ -107,12 +172,13 @@ export default async function handler(req, res) {
         intent: "CAPTURE",
         purchase_units: [
           {
-            // Lets api/paypal-webhook.js know whose account to activate.
+            // Read by api/paypal-webhook.js — this is the SERVER-VERIFIED
+            // businessId, not anything the browser sent.
             custom_id: String(businessId),
-            description: (description || "Subscription").slice(0, 127),
+            description: description.slice(0, 127),
             amount: {
-              currency_code: currency,
-              value: formatAmount(amt, currency),
+              currency_code: currencyCode,
+              value: formatAmount(finalPrice, currencyCode),
             },
           },
         ],
