@@ -54,7 +54,7 @@ const PAYPAL_SUPPORTED_CURRENCIES = new Set([
 ]);
 
 // See "ACTION NEEDED FROM YOU" above.
-const MAX_REWARD_CREDIT_PERCENT = 100;
+const MAX_REWARD_CREDIT_PERCENT = 50; // 3% per active referral, capped at 50% total — confirmed by app owner
 
 function formatAmount(amount, currency) {
   const n = Math.max(0, Number(amount) || 0);
