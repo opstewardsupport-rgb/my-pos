@@ -2731,15 +2731,20 @@ export default function CafePOS() {
       : Math.min(accountRef.current?.rewardCredits || 0, MAX_REWARD_CREDIT_PERCENT);
     const finalAmount = originalAmount - originalAmount * (discountPercentApplied / 100);
 
-    // Every time a billing cycle starts (first payment OR a renewal), the
-    // 3% referral reward credit resets back to 0% for the new month — it
-    // does not accumulate or roll over. Fresh referrals made DURING the new
-    // cycle build the credit back up toward the *next* bill.
+    // The referrer's reward_credits column is intentionally NOT touched here.
+    // It's maintained entirely by the SQL side (finalize_referral_redemption(),
+    // handle_referral_deactivation(), handle_referral_deletion() — see the
+    // setup block at the top of this file), which keeps it equal to
+    // active_referral_count * REFERRAL_REWARD_PERCENT (capped at
+    // MAX_REWARD_CREDIT_PERCENT) for as long as each referred account stays
+    // an active subscriber. Resetting it here on the referrer's OWN payment
+    // would wipe out a credit that should keep applying every month — it only
+    // ever goes down when a referred account actually unsubscribes or deletes
+    // its account.
     const updates = {
       subscription_status: "active",
       subscription_period_end: periodEnd,
       payment_reference: referenceNote || null,
-      reward_credits: 0,
       last_payment_currency: currencyCode,
       last_payment_original_amount: originalAmount,
       last_payment_discount_percent: discountPercentApplied,
@@ -2767,13 +2772,12 @@ export default function CafePOS() {
       subscriptionPeriodEnd: periodEnd,
       paymentReference: referenceNote || "",
       discountPercent: isFirstPayment ? 0 : (accountRef.current?.discountPercent || 0),
-      rewardCredits: 0,
       subscriptionStartDate: isFirstPayment ? updates.subscription_start_date : accountRef.current?.subscriptionStartDate,
     };
     accountRef.current = next;
     setAccount(next);
 
-    notify(isFirstPayment ? "You're upgraded — thanks for subscribing!" : "Renewed — thanks for staying with us! Your reward credit has reset to 0% for the new billing cycle.");
+    notify(isFirstPayment ? "You're upgraded — thanks for subscribing!" : "Renewed — thanks for staying with us!");
     return true;
   }, [authUser, notify, currencyCode]);
 
@@ -10361,8 +10365,8 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
         notify?.(
           `This month's bill (${fmt(fullPrice)}) was fully covered by your ` +
             `${discountPercent}% ${hasSubscribedBefore ? "reward credit" : "referral discount"} — nothing to ` +
-            `pay, and your subscription is active for the next ${SUBSCRIPTION_PERIOD_DAYS} days. Reward credit ` +
-            `resets to 0% next cycle, so next month's bill will be ${fmt(fullPrice)} unless new referrals come in.`
+            `pay, and your subscription is active for the next ${SUBSCRIPTION_PERIOD_DAYS} days. Your reward ` +
+            `credit keeps applying to future bills for as long as your referred users stay active subscribers.`
         );
         if (typeof onClose === "function") onClose();
         return;
@@ -10658,7 +10662,7 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
       {hasSubscribedBefore && rewardCreditPercent > 0 && (
         <div className="rounded-lg px-3 py-2 mb-4 text-xs" style={{ background: "#EAF0E2", color: "var(--primary-dark)" }}>
           {rewardCreditPercent >= MAX_REWARD_CREDIT_PERCENT
-            ? `You've hit the maximum reward credit of ${MAX_REWARD_CREDIT_PERCENT}% off for this billing cycle — it's already reflected in the price above. Extra referrals this month won't lower your bill any further, but the credit resets to 0% next cycle so fresh referrals count again then.`
+            ? `You've hit the maximum reward credit of ${MAX_REWARD_CREDIT_PERCENT}% off — it's already reflected in the price above. Additional referrals won't lower your bill any further while you're at the cap, and this credit keeps applying every month for as long as your referred users stay active subscribers.`
             : `You're earning ${rewardCreditPercent}% off from your referrals — it's already reflected in the price above.`}
         </div>
       )}
