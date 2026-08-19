@@ -184,6 +184,17 @@
   let currentTab = "pending";
   let latestData = { pending: [], history: [] };
 
+  // SECURITY FIX: the admin password used to be appended to the URL as
+  // ?secret=... on every request (both here and in the fetch calls below).
+  // That meant it could end up sitting in browser history and in server/
+  // proxy access logs — anyone with access to either could read it later.
+  // It's now sent as an X-Admin-Secret request header instead, which
+  // browsers and standard server logs don't record. This helper builds
+  // that header for every request in this file.
+  function authHeaders(extra) {
+    return Object.assign({ "X-Admin-Secret": secret }, extra || {});
+  }
+
   function fmtDate(iso) {
     if (!iso) return "";
     const d = new Date(iso);
@@ -291,7 +302,8 @@
   async function loadPending() {
     statusEl.textContent = "Loading…";
     try {
-      const res = await fetch(`/api/admin-manual-payments?secret=${encodeURIComponent(secret)}`);
+      // SECURITY FIX: secret sent as a header, not ?secret=... in the URL.
+      const res = await fetch(`/api/admin-manual-payments`, { headers: authHeaders() });
       if (res.status === 401) {
         // Secret got rejected (e.g. changed on the server) — send back to the gate.
         sessionStorage.removeItem("opsteward_admin_secret");
@@ -316,10 +328,11 @@
     resultEl.textContent = action === "approve" ? "Activating…" : "Rejecting…";
 
     try {
+      // SECURITY FIX: secret sent as a header, not in the JSON body.
       const res = await fetch("/api/admin-manual-payments", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ secret, businessId, action }),
+        headers: authHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify({ businessId, action }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Something went wrong.");
@@ -357,7 +370,8 @@
     gateBtn.disabled = true;
     gateBtn.textContent = "Checking…";
     try {
-      const res = await fetch(`/api/admin-manual-payments?secret=${encodeURIComponent(secret)}`);
+      // SECURITY FIX: secret sent as a header, not ?secret=... in the URL.
+      const res = await fetch(`/api/admin-manual-payments`, { headers: authHeaders() });
       if (res.status === 401) {
         gateError.textContent = "Wrong password.";
         gateBtn.disabled = false;
