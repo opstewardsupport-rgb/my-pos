@@ -1126,11 +1126,18 @@
      select (subscription_status = 'active') into v_was_active
        from public.businesses where id = p_business_id;
 
+     -- reward_credits is deliberately NOT reset here. It's maintained
+     -- entirely by finalize_referral_redemption_for() and the deactivation/
+     -- deletion triggers, based on how many of THIS account's own referred
+     -- sign-ups are currently active subscribers — that has nothing to do
+     -- with this account paying its OWN bill, so this account's own
+     -- self-payment must never zero it out. It only ever goes down when
+     -- one of this account's referred accounts unsubscribes or deletes
+     -- itself.
      update public.businesses
        set subscription_status = 'active',
            subscription_period_end = now() + interval '30 days',
            payment_reference = p_reference,
-           reward_credits = 0,
            discount_percent = case when coalesce(v_was_active, false) then discount_percent else 0 end
        where id = p_business_id;
 
