@@ -1,6 +1,17 @@
 // =============================================================================
 // ADMIN MANUAL-PAYMENT REVIEW — api/admin-manual-payments.js
 // =============================================================================
+// SECURITY FIX: this file used to accept ADMIN_SECRET as a URL query
+// parameter on GET requests (?secret=...). That's a problem because URLs —
+// including query strings — routinely end up in browser history and in
+// standard server/proxy access logs, both of which could leak the
+// password later even if the connection itself was encrypted. It's now
+// read from an X-Admin-Secret request header on every request instead,
+// which browsers and typical server logs don't record. See admin.html for
+// the matching frontend change — both files must be deployed together.
+//
+// Everything else below is unchanged from the original version.
+// -----------------------------------------------------------------------------
 // This is the backend for public/admin.html. It does three things:
 //
 //   1. GET  -> lists every business currently sitting with
@@ -198,11 +209,13 @@ async function sendRejectionEmail({ to, businessName }) {
 // multi-user product — but it's still required on every request, GET or
 // POST, so nobody can hit this URL and see or act on customer data without
 // knowing ADMIN_SECRET.
+//
+// SECURITY FIX: previously read the secret from req.query.secret (GET) or
+// req.body.secret (POST) — the GET case meant it traveled in the URL. Both
+// now read it from the X-Admin-Secret header instead, which admin.html
+// sends on every request.
 function isAuthorized(req) {
-  const provided =
-    req.method === "GET"
-      ? req.query.secret
-      : (req.body && req.body.secret);
+  const provided = req.headers["x-admin-secret"];
   return (
     typeof provided === "string" &&
     typeof process.env.ADMIN_SECRET === "string" &&
@@ -387,5 +400,5 @@ export default async function handler(req, res) {
     }
   }
 
-  res.status(405).json({ error: "Method not allowed." });
+  res.status(405).json({ error: "Method not allowed" });
 }
