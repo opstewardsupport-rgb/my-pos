@@ -3936,7 +3936,14 @@ export default function CafePOS() {
       bestMap[i.name].qty += i.qty;
       bestMap[i.name].revenue += i.price * i.qty;
     }));
-    const best = Object.values(bestMap).sort((a, b) => b.qty - a.qty).slice(0, 6);
+    // Full product list (every distinct item sold this period, not just the
+    // top performers) — the downloadable report needs a complete sales
+    // summary, so this stays unsliced. `best` below is the same data capped
+    // to 6 rows, kept only for the on-screen "Best sellers" chart.
+    const allSold = Object.values(bestMap)
+      .map((b) => ({ ...b, price: b.qty ? b.revenue / b.qty : 0 }))
+      .sort((a, b) => b.revenue - a.revenue);
+    const best = allSold.slice(0, 6);
     const empMap = {};
     filteredSales.forEach((s) => {
       const key = s.employeeName || "Unassigned";
@@ -3957,11 +3964,64 @@ export default function CafePOS() {
       reason: r,
       cost: filteredWaste.filter((w) => w.reason === r).reduce((s, w) => s + w.cost, 0),
     })).filter((r) => r.cost > 0);
+
+    // Itemized voided products — true voids only (wasteLogged items are
+    // pulled out below into wasteItems instead, since a voided item's stock
+    // goes back on the shelf and isn't a real cost, while a wasted item's
+    // isn't). Scanned across both still-active orders that had some items
+    // voided (filteredSales) and orders voided in full (filteredVoidedSales),
+    // since a partial void never shows up in filteredVoidedSales.
+    const voidedItemsMap = {};
+    [...filteredSales, ...filteredVoidedSales].forEach((s) => {
+      s.items.forEach((it) => {
+        if (itemIsVoided(s, it) && !it.wasteLogged) {
+          voidedItemsMap[it.name] = voidedItemsMap[it.name] || { name: it.name, qty: 0, total: 0 };
+          voidedItemsMap[it.name].qty += it.qty;
+          voidedItemsMap[it.name].total += it.price * it.qty;
+        }
+      });
+    });
+    const voidedItems = Object.values(voidedItemsMap)
+      .map((v) => ({ ...v, price: v.qty ? v.total / v.qty : 0 }))
+      .sort((a, b) => b.total - a.total);
+
+    // Itemized logged waste — the only section that represents an actual
+    // financial loss (ingredients are gone, nothing goes back to stock).
+    // Waste entries are recorded one row per ingredient, so first collapse
+    // each waste event (shared batchId) back into a single line: a
+    // product-tied event (logged from a sale or "log waste" on a finished
+    // product) becomes one row per product, everything else stays a
+    // per-ingredient row.
+    const wasteBatches = {};
+    filteredWaste.forEach((w) => {
+      const key = w.batchId || w.id;
+      if (!wasteBatches[key]) {
+        wasteBatches[key] = {
+          name: w.productName || w.ingredientName,
+          qty: w.productName ? w.productQty : 0,
+          unit: w.productName ? "" : w.unit,
+          cost: 0,
+        };
+      }
+      if (!w.productName) wasteBatches[key].qty += w.amount;
+      wasteBatches[key].cost += w.cost;
+    });
+    const wasteItemsMap = {};
+    Object.values(wasteBatches).forEach((b) => {
+      const key = `${b.name}|${b.unit}`;
+      wasteItemsMap[key] = wasteItemsMap[key] || { name: b.name, unit: b.unit, qty: 0, total: 0 };
+      wasteItemsMap[key].qty += b.qty;
+      wasteItemsMap[key].total += b.cost;
+    });
+    const wasteItems = Object.values(wasteItemsMap)
+      .map((w) => ({ ...w, price: w.qty ? w.total / w.qty : 0 }))
+      .sort((a, b) => b.total - a.total);
+
     return {
-      revenue, cost, profit: revenue - cost, orders: filteredSales.length, itemsSold, best,
+      revenue, cost, profit: revenue - cost, orders: filteredSales.length, itemsSold, best, allSold,
       discountsGiven, cashRevenue, onlineRevenue, byEmployee,
-      voidedOrders: filteredVoidedSales.length, voidedRevenue, voidedCost, voidedProfit,
-      wasteCost, wasteEntries: filteredWaste.length, wasteByReason,
+      voidedOrders: filteredVoidedSales.length, voidedRevenue, voidedCost, voidedProfit, voidedItems,
+      wasteCost, wasteEntries: filteredWaste.length, wasteByReason, wasteItems,
     };
   }, [filteredSales, filteredVoidedSales, filteredWaste]);
 
@@ -9101,6 +9161,7 @@ function PrintableReport({ periodLabel, stats, lowStock, sales }) {
             ["Cash sales", money(stats.cashRevenue)],
             ["Online sales", money(stats.onlineRevenue)],
             ["Discounts given", money(stats.discountsGiven)],
+            ["Logged waste cost (financial loss)", money(stats.wasteCost)],
           ].map(([label, val]) => (
             <tr key={label} style={{ borderBottom: "1px solid #E4DCC8" }}>
               <td style={{ padding: "4px 6px 4px 0", color: "#7A6D5C" }}>{label}</td>
@@ -9110,68 +9171,115 @@ function PrintableReport({ periodLabel, stats, lowStock, sales }) {
         </tbody>
       </table>
 
-      {stats.voidedOrders > 0 && (
+      {/* Every distinct product sold this period, with unit price, quantity, and
+          line total, so the sales summary is a complete record rather than a
+          top-N snapshot. */}
+      {stats.allSold.length > 0 && (
         <>
-          <h2 style={{ fontSize: 14, fontWeight: 600, marginTop: 12, marginBottom: 6 }}>Voided (excluded above)</h2>
+          <h2 style={{ fontSize: 14, fontWeight: 600, marginTop: 12, marginBottom: 6 }}>Sales summary — all products sold ({stats.itemsSold} items)</h2>
           <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, marginBottom: 16 }}>
+            <thead>
+              <tr style={{ borderBottom: "1px solid #2B2420" }}>
+                <th style={{ textAlign: "left", padding: "4px 6px 4px 0" }}>Item</th>
+                <th style={{ textAlign: "right", padding: "4px 6px" }}>Unit price</th>
+                <th style={{ textAlign: "right", padding: "4px 6px" }}>Qty sold</th>
+                <th style={{ textAlign: "right", padding: "4px 0" }}>Total</th>
+              </tr>
+            </thead>
             <tbody>
-              {[
-                ["Voided orders", stats.voidedOrders],
-                ["Revenue lost", money(stats.voidedRevenue)],
-                ["Cost avoided", money(stats.voidedCost)],
-                ["Profit forgone", money(stats.voidedProfit)],
-              ].map(([label, val]) => (
-                <tr key={label} style={{ borderBottom: "1px solid #E4DCC8" }}>
-                  <td style={{ padding: "4px 6px 4px 0", color: "#7A6D5C" }}>{label}</td>
-                  <td style={{ padding: "4px 0", textAlign: "right", fontWeight: 600 }}>{val}</td>
+              {stats.allSold.map((b) => (
+                <tr key={b.name} style={{ borderBottom: "1px solid #E4DCC8" }}>
+                  <td style={{ padding: "4px 6px 4px 0" }}>{b.name}</td>
+                  <td style={{ textAlign: "right", padding: "4px 6px" }}>{money(b.price)}</td>
+                  <td style={{ textAlign: "right", padding: "4px 6px" }}>{b.qty}</td>
+                  <td style={{ textAlign: "right", padding: "4px 0" }}>{money(b.revenue)}</td>
                 </tr>
               ))}
             </tbody>
+            <tfoot>
+              <tr style={{ borderTop: "1px solid #2B2420" }}>
+                <td colSpan={3} style={{ padding: "4px 6px 4px 0", fontWeight: 600 }}>Total</td>
+                <td style={{ textAlign: "right", padding: "4px 0", fontWeight: 600 }}>{money(stats.revenue)}</td>
+              </tr>
+            </tfoot>
+          </table>
+        </>
+      )}
+
+      {stats.voidedOrders > 0 && (
+        <>
+          {/* Voided items are automatically returned to inventory by the POS, so
+              this is informational only — it is NOT counted as a financial loss
+              anywhere in this report. Logged waste (below) is the only section
+              that represents an actual cost. */}
+          <h2 style={{ fontSize: 14, fontWeight: 600, marginTop: 12, marginBottom: 6 }}>Voided — items returned to inventory, not a financial loss</h2>
+          <p style={{ fontSize: 11, color: "#7A6D5C", marginBottom: 6 }}>
+            {stats.voidedOrders} voided order{stats.voidedOrders === 1 ? "" : "s"} this period. Ingredients for every voided item go back into stock, so none of this is included in the revenue, cost, or profit above.
+          </p>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, marginBottom: 16 }}>
+            <thead>
+              <tr style={{ borderBottom: "1px solid #2B2420" }}>
+                <th style={{ textAlign: "left", padding: "4px 6px 4px 0" }}>Item</th>
+                <th style={{ textAlign: "right", padding: "4px 6px" }}>Unit price</th>
+                <th style={{ textAlign: "right", padding: "4px 6px" }}>Qty voided</th>
+                <th style={{ textAlign: "right", padding: "4px 0" }}>Total</th>
+              </tr>
+            </thead>
+            <tbody>
+              {stats.voidedItems.map((v) => (
+                <tr key={v.name} style={{ borderBottom: "1px solid #E4DCC8" }}>
+                  <td style={{ padding: "4px 6px 4px 0" }}>{v.name}</td>
+                  <td style={{ textAlign: "right", padding: "4px 6px" }}>{money(v.price)}</td>
+                  <td style={{ textAlign: "right", padding: "4px 6px" }}>{v.qty}</td>
+                  <td style={{ textAlign: "right", padding: "4px 0" }}>{money(v.total)}</td>
+                </tr>
+              ))}
+            </tbody>
+            <tfoot>
+              <tr style={{ borderTop: "1px solid #2B2420" }}>
+                <td colSpan={3} style={{ padding: "4px 6px 4px 0", fontWeight: 600 }}>Total (not a loss)</td>
+                <td style={{ textAlign: "right", padding: "4px 0", fontWeight: 600 }}>{money(stats.voidedRevenue)}</td>
+              </tr>
+            </tfoot>
           </table>
         </>
       )}
 
       {stats.wasteEntries > 0 && (
         <>
-          <h2 style={{ fontSize: 14, fontWeight: 600, marginTop: 12, marginBottom: 6 }}>Waste / spoilage</h2>
-          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, marginBottom: 16 }}>
-            <tbody>
-              {[
-                ["Entries", stats.wasteEntries],
-                ["Total cost", money(stats.wasteCost)],
-                ...stats.wasteByReason.map((r) => [r.reason, money(r.cost)]),
-              ].map(([label, val]) => (
-                <tr key={label} style={{ borderBottom: "1px solid #E4DCC8" }}>
-                  <td style={{ padding: "4px 6px 4px 0", color: "#7A6D5C" }}>{label}</td>
-                  <td style={{ padding: "4px 0", textAlign: "right", fontWeight: 600 }}>{val}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </>
-      )}
-
-      {stats.best.length > 0 && (
-        <>
-          <h2 style={{ fontSize: 14, fontWeight: 600, marginTop: 12, marginBottom: 6 }}>Best sellers</h2>
-          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, marginBottom: 16 }}>
+          {/* The only section in this report that represents a real financial
+              loss — ingredients logged as waste are gone and are not returned
+              to stock the way a void's are. */}
+          <h2 style={{ fontSize: 14, fontWeight: 600, marginTop: 12, marginBottom: 6 }}>Logged waste — financial loss</h2>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, marginBottom: 8 }}>
             <thead>
               <tr style={{ borderBottom: "1px solid #2B2420" }}>
                 <th style={{ textAlign: "left", padding: "4px 6px 4px 0" }}>Item</th>
-                <th style={{ textAlign: "right", padding: "4px 6px" }}>Qty sold</th>
-                <th style={{ textAlign: "right", padding: "4px 0" }}>Revenue</th>
+                <th style={{ textAlign: "right", padding: "4px 6px" }}>Unit cost</th>
+                <th style={{ textAlign: "right", padding: "4px 6px" }}>Qty</th>
+                <th style={{ textAlign: "right", padding: "4px 0" }}>Total cost</th>
               </tr>
             </thead>
             <tbody>
-              {stats.best.map((b) => (
-                <tr key={b.name} style={{ borderBottom: "1px solid #E4DCC8" }}>
-                  <td style={{ padding: "4px 6px 4px 0" }}>{b.name}</td>
-                  <td style={{ textAlign: "right", padding: "4px 6px" }}>{b.qty}</td>
-                  <td style={{ textAlign: "right", padding: "4px 0" }}>{money(b.revenue)}</td>
+              {stats.wasteItems.map((w) => (
+                <tr key={`${w.name}-${w.unit}`} style={{ borderBottom: "1px solid #E4DCC8" }}>
+                  <td style={{ padding: "4px 6px 4px 0" }}>{w.name}</td>
+                  <td style={{ textAlign: "right", padding: "4px 6px" }}>{money(w.price)}</td>
+                  <td style={{ textAlign: "right", padding: "4px 6px" }}>{w.qty}{w.unit}</td>
+                  <td style={{ textAlign: "right", padding: "4px 0" }}>{money(w.total)}</td>
                 </tr>
               ))}
             </tbody>
+            <tfoot>
+              <tr style={{ borderTop: "1px solid #2B2420" }}>
+                <td colSpan={3} style={{ padding: "4px 6px 4px 0", fontWeight: 600 }}>Total loss</td>
+                <td style={{ textAlign: "right", padding: "4px 0", fontWeight: 600 }}>{money(stats.wasteCost)}</td>
+              </tr>
+            </tfoot>
           </table>
+          <p style={{ fontSize: 11, color: "#7A6D5C", marginBottom: 16 }}>
+            By reason: {stats.wasteByReason.map((r) => `${r.reason} ${money(r.cost)}`).join("  ·  ")}
+          </p>
         </>
       )}
 
