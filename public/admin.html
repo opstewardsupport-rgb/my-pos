@@ -58,7 +58,32 @@
 
   /* ---- List ---- */
   #app { display: none; }
+  .tabs { display: flex; gap: 6px; margin-bottom: 18px; }
+  .tab {
+    flex: 1;
+    text-align: center;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    color: var(--ink-soft);
+    padding: 10px 8px;
+    border-radius: var(--radius);
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .tab.active { background: var(--primary); color: var(--primary-ink); border-color: var(--primary); }
   #status { color: var(--ink-soft); font-size: 13px; margin-bottom: 16px; }
+  .badge {
+    display: inline-block;
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    padding: 3px 8px;
+    border-radius: 999px;
+  }
+  .badge.approved { background: rgba(111,174,106,0.18); color: var(--good); }
+  .badge.rejected { background: rgba(194,107,94,0.18); color: var(--bad); }
   .card {
     background: var(--surface);
     border: 1px solid var(--line);
@@ -108,6 +133,10 @@
     </div>
 
     <div id="app">
+      <div class="tabs">
+        <div class="tab active" data-tab="pending">Pending</div>
+        <div class="tab" data-tab="history">History</div>
+      </div>
       <div id="status">Loading…</div>
       <div id="list"></div>
     </div>
@@ -123,14 +152,16 @@
   const listEl = document.getElementById("list");
 
   let secret = sessionStorage.getItem("opsteward_admin_secret") || "";
+  let currentTab = "pending";
+  let latestData = { pending: [], history: [] };
 
   function fmtDate(iso) {
     if (!iso) return "";
     const d = new Date(iso);
-    return d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+    return d.toLocaleString(undefined, { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" });
   }
 
-  function render(pending) {
+  function renderPending(pending) {
     listEl.innerHTML = "";
     if (!pending.length) {
       listEl.innerHTML = '<div class="empty">Nothing waiting on you right now.</div>';
@@ -161,6 +192,55 @@
     });
   }
 
+  function renderHistory(history) {
+    listEl.innerHTML = "";
+    if (!history.length) {
+      listEl.innerHTML = '<div class="empty">No decisions logged yet.</div>';
+      return;
+    }
+    history.forEach((entry) => {
+      const card = document.createElement("div");
+      card.className = "card";
+      card.innerHTML = `
+        <div class="card-top">
+          <div>
+            <div class="biz-name">${entry.business_name || "(no business name set)"}</div>
+            <div class="biz-email">${entry.email || ""}</div>
+          </div>
+          <span class="badge ${entry.action}">${entry.action}</span>
+        </div>
+        <div class="ref-row">
+          <div class="ref-label">Reference · ${fmtDate(entry.reviewed_at)}</div>
+          <div class="ref-value">${entry.reference || "(empty)"}</div>
+        </div>
+      `;
+      listEl.appendChild(card);
+    });
+  }
+
+  function renderCurrentTab() {
+    if (currentTab === "pending") {
+      statusEl.textContent = latestData.pending.length
+        ? `${latestData.pending.length} awaiting review`
+        : "All caught up";
+      renderPending(latestData.pending);
+    } else {
+      statusEl.textContent = latestData.history.length
+        ? `Last ${latestData.history.length} decisions`
+        : "No decisions logged yet";
+      renderHistory(latestData.history);
+    }
+  }
+
+  document.querySelectorAll(".tab").forEach((tabEl) => {
+    tabEl.addEventListener("click", () => {
+      document.querySelectorAll(".tab").forEach((t) => t.classList.remove("active"));
+      tabEl.classList.add("active");
+      currentTab = tabEl.dataset.tab;
+      renderCurrentTab();
+    });
+  });
+
   async function loadPending() {
     statusEl.textContent = "Loading…";
     try {
@@ -175,12 +255,10 @@
       }
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Something went wrong.");
-      statusEl.textContent = data.pending.length
-        ? `${data.pending.length} awaiting review`
-        : "All caught up";
-      render(data.pending);
+      latestData = { pending: data.pending || [], history: data.history || [] };
+      renderCurrentTab();
     } catch (err) {
-      statusEl.textContent = "Couldn't load pending payments: " + err.message;
+      statusEl.textContent = "Couldn't load payments: " + err.message;
     }
   }
 
