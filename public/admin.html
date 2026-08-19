@@ -84,6 +84,33 @@
   }
   .badge.approved { background: rgba(111,174,106,0.18); color: var(--good); }
   .badge.rejected { background: rgba(194,107,94,0.18); color: var(--bad); }
+  .amount-row { display: flex; justify-content: space-between; align-items: baseline; margin-top: 10px; }
+  .amount-label { color: var(--ink-soft); font-size: 12px; }
+  .amount-value { font-weight: 700; font-size: 15px; }
+  .warning-row {
+    margin-top: 10px;
+    background: rgba(217,161,63,0.14);
+    border: 1px solid rgba(217,161,63,0.4);
+    color: #e0af52;
+    border-radius: 10px;
+    padding: 8px 12px;
+    font-size: 12px;
+    display: flex;
+    gap: 6px;
+    align-items: flex-start;
+  }
+  #searchBox {
+    width: 100%;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    color: var(--ink);
+    padding: 10px 14px;
+    border-radius: var(--radius);
+    font-size: 13px;
+    margin-bottom: 14px;
+    display: none;
+  }
+  #searchBox.visible { display: block; }
   .card {
     background: var(--surface);
     border: 1px solid var(--line);
@@ -137,6 +164,7 @@
         <div class="tab active" data-tab="pending">Pending</div>
         <div class="tab" data-tab="history">History</div>
       </div>
+      <input id="searchBox" type="text" placeholder="Search by business name or email…" />
       <div id="status">Loading…</div>
       <div id="list"></div>
     </div>
@@ -150,6 +178,7 @@
   const gateError = document.getElementById("gateError");
   const statusEl = document.getElementById("status");
   const listEl = document.getElementById("list");
+  const searchBox = document.getElementById("searchBox");
 
   let secret = sessionStorage.getItem("opsteward_admin_secret") || "";
   let currentTab = "pending";
@@ -182,6 +211,11 @@
           <div class="ref-label">Reference submitted</div>
           <div class="ref-value">${biz.payment_reference || "(empty)"}</div>
         </div>
+        <div class="amount-row">
+          <span class="amount-label">Expected amount</span>
+          <span class="amount-value">${biz.expectedAmount || ""}</span>
+        </div>
+        ${biz.duplicateWarning ? `<div class="warning-row">⚠️ ${biz.duplicateWarning}</div>` : ""}
         <div class="actions">
           <button class="btn approve" data-id="${biz.id}" data-action="approve">Approve</button>
           <button class="btn reject" data-id="${biz.id}" data-action="reject">Reject</button>
@@ -220,17 +254,30 @@
 
   function renderCurrentTab() {
     if (currentTab === "pending") {
+      searchBox.classList.remove("visible");
       statusEl.textContent = latestData.pending.length
         ? `${latestData.pending.length} awaiting review`
         : "All caught up";
       renderPending(latestData.pending);
     } else {
-      statusEl.textContent = latestData.history.length
+      searchBox.classList.add("visible");
+      const query = searchBox.value.trim().toLowerCase();
+      const filtered = query
+        ? latestData.history.filter((entry) =>
+            (entry.business_name || "").toLowerCase().includes(query) ||
+            (entry.email || "").toLowerCase().includes(query)
+          )
+        : latestData.history;
+      statusEl.textContent = query
+        ? `${filtered.length} matching "${searchBox.value.trim()}"`
+        : latestData.history.length
         ? `Last ${latestData.history.length} decisions`
         : "No decisions logged yet";
-      renderHistory(latestData.history);
+      renderHistory(filtered);
     }
   }
+
+  searchBox.addEventListener("input", renderCurrentTab);
 
   document.querySelectorAll(".tab").forEach((tabEl) => {
     tabEl.addEventListener("click", () => {
