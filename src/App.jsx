@@ -2093,33 +2093,53 @@ export default function CafePOS() {
   // screen reads/writes to instantly; this effect is purely the
   // "eventually mirror it to the cloud too" side of that, so a second
   // device logging in later sees it (via the load effect above).
+  // Pulled out so both the automatic debounced sync below AND the manual
+  // "Sync now" button (see Header) call the exact same logic — one place
+  // to fix if this ever needs to change. Also refreshes account status in
+  // the same pass, so tapping the button also picks up things like a
+  // payment that just got approved, without a full page reload — handy on
+  // iPad/PWA installs where pull-to-refresh isn't always available.
+  const syncNow = useCallback(async () => {
+    const userId = authUser?.id || null;
+    if (!userId) return false;
+    setSyncStatus("syncing");
+    const [pushOk] = await Promise.all([
+      pushPosData(userId, {
+        catalog, sales, parkedOrders, currencyCode, employees,
+        currentEmployeeId, shifts, wasteLogs, orderCounter: nextOrderNo,
+      }),
+      refreshAccountStatus(),
+    ]);
+    if (pushOk) {
+      setSyncStatus("synced");
+      setLastSyncedAt(Date.now());
+    } else {
+      setSyncStatus("error");
+    }
+    return pushOk;
+  }, [
+    authUser?.id, pushPosData, refreshAccountStatus,
+    catalog, sales, parkedOrders, currencyCode, employees,
+    currentEmployeeId, shifts, wasteLogs, nextOrderNo,
+  ]);
+
   useEffect(() => {
     const userId = authUser?.id || null;
     if (!userId || !initialLoadDoneRef.current) return;
 
     if (cloudSyncTimerRef.current) clearTimeout(cloudSyncTimerRef.current);
     cloudSyncTimerRef.current = setTimeout(() => {
-      setSyncStatus("syncing");
-      pushPosData(userId, {
-        catalog, sales, parkedOrders, currencyCode, employees,
-        currentEmployeeId, shifts, wasteLogs, orderCounter: nextOrderNo,
-      }).then((ok) => {
-        if (ok) {
-          setSyncStatus("synced");
-          setLastSyncedAt(Date.now());
-        } else {
-          setSyncStatus("error");
-        }
-      });
+      syncNow();
     }, 1200);
 
     return () => {
       if (cloudSyncTimerRef.current) clearTimeout(cloudSyncTimerRef.current);
     };
   }, [
-    authUser?.id, pushPosData,
+    authUser?.id,
     catalog, sales, parkedOrders, currencyCode, employees,
     currentEmployeeId, shifts, wasteLogs, nextOrderNo,
+    syncNow,
   ]);
 
   const changeCurrency = useCallback(async (code) => {
@@ -3953,6 +3973,7 @@ export default function CafePOS() {
         openEmployeeModal={() => setEmployeeModal(true)}
         syncStatus={syncStatus}
         lastSyncedAt={lastSyncedAt}
+        onSyncNow={syncNow}
       />
       <Nav view={view} setView={setView} lowCount={lowStock.length} shiftOpen={!!activeShift} kitchenCount={kitchenPreparing.length} tabsCount={parkedOrders.length} />
 
@@ -4313,6 +4334,10 @@ function Shell({ children }) {
         @keyframes pulse {
           0%, 100% { opacity: 1; }
           50% { opacity: 0.35; }
+        }
+        @keyframes spin {
+          from { transform: rotate(0deg); }
+          to { transform: rotate(360deg); }
         }
         @media print {
           .no-print { display: none !important; }
@@ -4760,7 +4785,7 @@ function SyncStatusBadge({ status, lastSyncedAt }) {
   );
 }
 
-function Header({ businessName, low, confirmReset, setConfirmReset, resetAll, currencyCode, changeCurrency, employees, currentEmployee, selectEmployee, openEmployeeModal, syncStatus, lastSyncedAt }) {
+function Header({ businessName, low, confirmReset, setConfirmReset, resetAll, currencyCode, changeCurrency, employees, currentEmployee, selectEmployee, openEmployeeModal, syncStatus, lastSyncedAt, onSyncNow }) {
   return (
     <header className="max-w-6xl mx-auto px-4 sm:px-6 pt-6 pb-3 flex items-start justify-between no-print">
       <div>
@@ -4804,6 +4829,22 @@ function Header({ businessName, low, confirmReset, setConfirmReset, resetAll, cu
           {(CURRENCIES.find((c) => c.code === currencyCode) || CURRENCIES[0]).symbol}
         </span>
         {syncStatus !== undefined && <SyncStatusBadge status={syncStatus} lastSyncedAt={lastSyncedAt} />}
+        {onSyncNow && (
+          <button
+            onClick={onSyncNow}
+            disabled={syncStatus === "syncing"}
+            className="flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-full border"
+            style={{
+              borderColor: "var(--line)",
+              color: syncStatus === "error" ? "var(--alert)" : "var(--ink-soft)",
+              opacity: syncStatus === "syncing" ? 0.6 : 1,
+            }}
+            title="Manually sync now — pushes your latest data to the cloud and checks for account updates (e.g. a payment that just got approved). Useful on tablets/iPad where pull-to-refresh isn't always available."
+          >
+            <RefreshCw size={12} style={syncStatus === "syncing" ? { animation: "spin 1s linear infinite" } : undefined} />
+            <span className="hidden sm:inline">Sync now</span>
+          </button>
+        )}
         <button
           onClick={() => (confirmReset ? resetAll() : setConfirmReset(true))}
           onBlur={() => setConfirmReset(false)}
