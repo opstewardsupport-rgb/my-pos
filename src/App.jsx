@@ -2216,8 +2216,17 @@ export default function CafePOS() {
     // guarantees the row exists. This upsert just means that when a session
     // DOES exist immediately (the common case, "Confirm email" off), the row
     // is ready the instant we call fetchBusiness() below, without waiting on
-    // trigger timing. onConflict: "id" makes this safe to run whether or not
-    // the trigger already created the row — it merges instead of erroring.
+    // trigger timing.
+    // SECURITY FIX side effect, corrected: onConflict:"id" alone does an
+    // INSERT ... ON CONFLICT DO UPDATE — since trial_start_date/currency_code
+    // are locked down (authenticated has no UPDATE grant on them, see
+    // fix-lockdown-subscription-columns.sql), that UPDATE branch would fail
+    // with a permission error EVERY time the trigger has already created the
+    // row first, which is almost always. ignoreDuplicates makes this
+    // INSERT ... ON CONFLICT DO NOTHING instead — it only ever inserts a
+    // brand-new row (the case where the trigger hasn't landed yet); when the
+    // row already exists it's silently a no-op, which is exactly what this
+    // fallback was always meant to be.
     const { error: bizErr } = await supabase.from("businesses").upsert(
       {
         id: user.id,
@@ -2226,7 +2235,7 @@ export default function CafePOS() {
         trial_start_date: new Date().toISOString(),
         currency_code: chosenCurrency,
       },
-      { onConflict: "id" }
+      { onConflict: "id", ignoreDuplicates: true }
     );
     if (bizErr) {
       // No longer fatal to the account existing — the trigger already
@@ -2385,21 +2394,28 @@ export default function CafePOS() {
   //   2. markSubscriptionActive()'s isFirstPayment recomputes to true, so
   //      the confirmation toast is the "You're upgraded — thanks for
   //      subscribing!" NEW SUBSCRIBER message, not the "Renewed —..." one.
+  // SECURITY FIX: now calls unsubscribe_own_account() instead of writing
+  // subscription_status/subscription_period_end/referral_code directly.
+  // This isn't about trusting this specific call less — it's the other
+  // side of locking down direct client writes to those columns at the
+  // database level (see fix-lockdown-subscription-columns.sql), which is
+  // what actually stops someone from opening dev tools and calling
+  // supabase.from("businesses").update({ subscription_status: "active" })
+  // themselves. Once that lockdown is in place, ANY direct client write to
+  // these columns fails — including this one — so this now goes through a
+  // narrow, server-side function that can only ever set "cancelled", never
+  // "active".
   const unsubscribeAccount = useCallback(async () => {
     if (!authUser) return false;
     try {
-      const updates = {
-        subscription_status: "cancelled",
-        subscription_period_end: null,
-        payment_reference: null,
-      };
-      const { error } = await supabase.from("businesses").update(updates).eq("id", authUser.id);
+      const { error } = await supabase.rpc("unsubscribe_own_account");
       if (error) throw error;
       const next = {
         ...(accountRef.current || {}),
         subscriptionStatus: "cancelled",
         subscriptionPeriodEnd: null,
         paymentReference: "",
+        referralCode: null,
       };
       accountRef.current = next;
       setAccount(next);
@@ -2449,108 +2465,20 @@ export default function CafePOS() {
     }
   }, [authUser, notify]);
 
-  // Called from the Upgrade screen once the owner has paid via PayMongo (or
-  // manually — see MANUAL_PAYMENT_NOTE). There's no PayMongo webhook wired
-  // up here (that needs a small server function — see supabase-schema.sql's
-  // notes), so this is a self-reported confirmation: it flips
-  // subscription_status to "active", starts a new SUBSCRIPTION_PERIOD_DAYS
-  // period, and stores whatever reference the owner typed in, for you to
-  // reconcile against PayMongo's dashboard.
-  const markSubscriptionActive = useCallback(async (referenceNote) => {
-    if (!authUser) return false;
-    // First payment ever (was still on "trial") vs. a renewal of an
-    // already-active account. Only a first payment can be discounted by the
-    // one-time referral signup discount — and once used, it's gone for
-    // good, so it doesn't silently reapply to every future renewal.
-    const isFirstPayment = accountRef.current?.subscriptionStatus !== "active";
-    const periodEnd = new Date(Date.now() + SUBSCRIPTION_PERIOD_DAYS * MS_PER_DAY).toISOString();
+  // REMOVED (security fix): this used to be markSubscriptionActive() — a
+  // function that let the customer's own browser flip subscription_status
+  // to "active" directly, with zero server verification. It's gone now.
+  // Real activation only ever happens two ways, both server-side:
+  //   1. A PayMongo/PayPal webhook confirms a genuine payment and calls
+  //      activate_subscription()/activate_subscription_for_business() —
+  //      see api/paymongo-webhook.js and api/paypal-webhook.js.
+  //   2. A human approves a manual payment submission in admin.html — see
+  //      api/admin-manual-payments.js.
+  // The client's job is only ever to ASK for activation (submitManualPayment
+  // below now calls submit_manual_payment(), which just queues a review)
+  // and to POLL for the result (see pollForActivation in UpgradeView) —
+  // never to grant it directly.
 
-    // On a first payment, actually "spend" any referral code that was
-    // applied-but-not-yet-paid (pending_referral_code) BEFORE the update
-    // below flips subscription_status to "active" — this is the ONLY
-    // moment a code is ever marked used, for both this account and the
-    // referrer, and it's why a code clicked "Apply" and then abandoned
-    // never blocks a later, real attempt. Awaited (unlike before) and done
-    // FIRST specifically so referred_by is already committed on this row
-    // by the time the subscription-change email trigger fires from the
-    // update further down — otherwise the "New Paid Subscription" email
-    // would always show "Referral Code Used: None", even when one was
-    // used, because the two writes used to race. See
-    // finalize_referral_redemption() in the SQL setup block at the top of
-    // this file, which is also the real enforcement: it's a no-op if this
-    // account never applied a code, and a safe no-op if this exact
-    // referral was somehow already finalized before (so this can never
-    // double-credit a referrer or double-count a redemption, even if this
-    // function ever runs twice for the same first payment). A failure here
-    // is logged but never blocks the subscriber's own upgrade below.
-    if (isFirstPayment) {
-      try {
-        const { error: rewardErr } = await supabase.rpc("finalize_referral_redemption");
-        if (rewardErr) console.error("finalize_referral_redemption failed:", rewardErr);
-      } catch (rewardErr) {
-        console.error("finalize_referral_redemption failed:", rewardErr);
-      }
-    }
-
-    // Snapshot the pricing that's about to be charged, in the subscriber's
-    // own currency, BEFORE discount_percent/reward_credits are reset below
-    // — this is what gets emailed to the owner (see notify_on_subscription_change
-    // in the SQL setup block) and is intentionally the exact numbers the
-    // subscriber was shown on the Upgrade screen, not a re-derived guess:
-    // first payment uses their one-time referral discount (discountPercent),
-    // a renewal uses whatever reward credit they'd built up (rewardCredits,
-    // capped the same way UpgradeView caps it for display/charging).
-    const originalAmount = lockedSubscriptionPrice(currencyCode);
-    const discountPercentApplied = isFirstPayment
-      ? (accountRef.current?.discountPercent || 0)
-      : Math.min(accountRef.current?.rewardCredits || 0, MAX_REWARD_CREDIT_PERCENT);
-    const finalAmount = originalAmount - originalAmount * (discountPercentApplied / 100);
-
-    // Every time a billing cycle starts (first payment OR a renewal), the
-    // 3% referral reward credit resets back to 0% for the new month — it
-    // does not accumulate or roll over. Fresh referrals made DURING the new
-    // cycle build the credit back up toward the *next* bill.
-    const updates = {
-      subscription_status: "active",
-      subscription_period_end: periodEnd,
-      payment_reference: referenceNote || null,
-      reward_credits: 0,
-      last_payment_currency: currencyCode,
-      last_payment_original_amount: originalAmount,
-      last_payment_discount_percent: discountPercentApplied,
-      last_payment_final_amount: finalAmount,
-    };
-    if (isFirstPayment) {
-      updates.discount_percent = 0;
-      // Set once, the first time an account ever goes active — and reset
-      // again if they unsubscribe and later resubscribe, since that's
-      // treated as a fresh "first" subscription (see unsubscribeAccount /
-      // isFirstPayment above). Kept separate from subscription_period_end
-      // (which moves every renewal) so "Subscription Start Date" in the
-      // New Paid Subscription email always reflects this specific
-      // subscription, not the most recent renewal.
-      updates.subscription_start_date = new Date().toISOString();
-    }
-    const { error } = await supabase.from("businesses").update(updates).eq("id", authUser.id);
-    if (error) {
-      notify("Couldn't confirm the upgrade — " + error.message, "err");
-      return false;
-    }
-    const next = {
-      ...(accountRef.current || {}),
-      subscriptionStatus: "active",
-      subscriptionPeriodEnd: periodEnd,
-      paymentReference: referenceNote || "",
-      discountPercent: isFirstPayment ? 0 : (accountRef.current?.discountPercent || 0),
-      rewardCredits: 0,
-      subscriptionStartDate: isFirstPayment ? updates.subscription_start_date : accountRef.current?.subscriptionStartDate,
-    };
-    accountRef.current = next;
-    setAccount(next);
-
-    notify(isFirstPayment ? "You're upgraded — thanks for subscribing!" : "Renewed — thanks for staying with us! Your reward credit has reset to 0% for the new billing cycle.");
-    return true;
-  }, [authUser, notify, currencyCode]);
 
   // Applies a referral/discount code from the Subscribe popup, for an owner
   // who's already signed in, before their first payment (unlike the old
@@ -3999,7 +3927,6 @@ export default function CafePOS() {
           account={account}
           trialInfo={trialInfo}
           currencyCode={currencyCode}
-          onConfirm={markSubscriptionActive}
           onApplyCode={applyReferralCode}
           onClose={null}
           onLogOut={logOut}
@@ -4220,7 +4147,6 @@ export default function CafePOS() {
           account={account}
           trialInfo={trialInfo}
           currencyCode={currencyCode}
-          onConfirm={markSubscriptionActive}
           onApplyCode={applyReferralCode}
           onClose={trialInfo.expired && !trialInfo.isSubscribed ? null : () => setShowUpgrade(false)}
           onRefreshAccount={refreshAccountStatus}
@@ -9279,7 +9205,7 @@ function AutoSaveField({ label, value, onSave, type = "text", placeholder, minLe
 // fallback for the manual-payment note (needsManualPayment below), for the
 // rare case a live checkout call fails or a currency PayPal doesn't settle
 // in at all.
-function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onApplyCode, onClose, onLogOut, onRefreshAccount, notify }) {
+function UpgradeView({ account, trialInfo, currencyCode = "PHP", onApplyCode, onClose, onLogOut, onRefreshAccount, notify }) {
   const [code, setCode] = useState("");
   const [codeBusy, setCodeBusy] = useState(false);
   const [codeError, setCodeError] = useState("");
@@ -9724,25 +9650,30 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onConfirm, onAp
   // can send/receive, matching manualPaymentAmount below.
   const manualPayPalLink = buildPayPalLink(usdFinalPrice, "USD");
 
-  // Submits the self-reported reference for the manual-payment fallback
-  // (PH: GCash/bank transfer; international: PayPal.me) and activates the
-  // account via onConfirm/markSubscriptionActive — mirrors the ₱0/$0
-  // free-activation notify() messaging used elsewhere in this file.
+  // SECURITY FIX: this used to call onConfirm/markSubscriptionActive, which
+  // activated the subscription IMMEDIATELY, client-side, the moment this
+  // button was clicked — no verification of any kind. A subscriber could
+  // type anything into the reference box and get a free, permanent
+  // "active" subscription. This now calls the submit_manual_payment()
+  // database function instead, which only ever sets manual_payment_status
+  // to 'pending' — the account is only actually activated later, by a
+  // human reviewing it in admin.html (see api/admin-manual-payments.js),
+  // the same way a real PayMongo/PayPal payment is only ever confirmed by
+  // a server-verified webhook, never by the customer's own browser.
   const submitManualPayment = async () => {
     if (manualBusy || !manualRef.trim()) return;
     setManualError("");
     setManualBusy(true);
     try {
-      const ok = await onConfirm?.(manualRef.trim());
-      if (ok === false) {
-        setManualError("Couldn't confirm the upgrade. Please try again.");
-      } else {
-        setManualRef("");
-        notify?.(
-          `Thanks! We've noted your payment reference and activated your subscription for the next ${SUBSCRIPTION_PERIOD_DAYS} days.`
-        );
-        if (typeof onClose === "function") onClose();
-      }
+      const { error } = await supabase.rpc("submit_manual_payment", {
+        p_reference: manualRef.trim(),
+      });
+      if (error) throw error;
+      setManualRef("");
+      notify?.(
+        "Thanks! We've noted your payment reference — we'll verify it and activate your subscription shortly."
+      );
+      if (typeof onClose === "function") onClose();
     } catch (err) {
       console.error("submitManualPayment failed:", err);
       setManualError("Something went wrong confirming that. Please try again.");
