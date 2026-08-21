@@ -5946,6 +5946,197 @@ function buildReceiptHTML(sale) {
   return html;
 }
 
+// Small helpers used only by the canvas-based receipt image below.
+function wrapReceiptText(ctx, text, size, maxWidth) {
+  ctx.font = `${size}px 'Courier New', monospace`;
+  const words = String(text).split(" ");
+  const lines = [];
+  let cur = "";
+  for (const w of words) {
+    const test = cur ? `${cur} ${w}` : w;
+    if (ctx.measureText(test).width > maxWidth && cur) {
+      lines.push(cur);
+      cur = w;
+    } else {
+      cur = test;
+    }
+  }
+  if (cur) lines.push(cur);
+  return lines.length ? lines : [""];
+}
+const capitalizeWord = (s) => String(s || "").replace(/^./, (c) => c.toUpperCase());
+
+// Draws a sale receipt onto a canvas and returns it as a PNG Blob — an
+// actual image file (like a photo of the printed slip) rather than an .html
+// document, so it can be viewed, shared, or saved as a picture on any
+// device. Runs the layout twice: once with draw=false purely to measure how
+// tall the receipt needs to be (canvas size must be known up front), then
+// again with draw=true on a canvas sized exactly to fit, at 2x scale for a
+// crisp, non-blurry image.
+async function buildReceiptImageBlob(sale) {
+  const width = 340;
+  const contentWidth = width - 40;
+  const leftX = 20;
+  const rightX = width - 20;
+  const centerX = width / 2;
+  const scale = 2;
+
+  // Payment-proof screenshots (if any) get embedded into the image too —
+  // load it once up front so its height is known before either layout pass.
+  let proofImg = null;
+  let proofDrawHeight = 0;
+  if ((sale.paymentMethod === "online" || sale.paymentMethod === "split") && sale.paymentProof) {
+    try {
+      proofImg = await new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => resolve(img);
+        img.onerror = reject;
+        img.src = sale.paymentProof;
+      });
+      const ratio = proofImg.naturalWidth ? proofImg.naturalHeight / proofImg.naturalWidth : 0.6;
+      proofDrawHeight = Math.min(220, contentWidth * ratio);
+    } catch {
+      proofImg = null; // broken/unreachable image — just skip it, rest of receipt still renders
+    }
+  }
+
+  // Renders the full receipt starting at y=24. When draw is false nothing
+  // is actually painted — only text is measured/wrapped — so this can be
+  // called against a throwaway context first to compute total height.
+  function renderReceipt(ctx, draw) {
+    let y = 24;
+
+    const setFont = (size, weight) => {
+      ctx.font = `${weight === 700 ? "700 " : ""}${size}px 'Courier New', monospace`;
+    };
+    const centerLine = (text, size, weight, color, gapAfter) => {
+      setFont(size, weight);
+      if (draw) {
+        ctx.fillStyle = color;
+        ctx.textAlign = "center";
+        ctx.fillText(text, centerX, y);
+      }
+      y += size + gapAfter;
+    };
+    const leftLine = (text, size, weight, color, gapAfter) => {
+      setFont(size, weight);
+      if (draw) {
+        ctx.fillStyle = color;
+        ctx.textAlign = "left";
+        ctx.fillText(text, leftX, y);
+      }
+      y += size + gapAfter;
+    };
+    const rowLine = (left, right, size, weight, color, gapAfter) => {
+      setFont(size, weight);
+      if (draw) {
+        ctx.fillStyle = color;
+        ctx.textAlign = "left";
+        ctx.fillText(left, leftX, y);
+        ctx.textAlign = "right";
+        ctx.fillText(right, rightX, y);
+      }
+      y += size + gapAfter;
+    };
+    const divider = () => {
+      y += 6;
+      if (draw) {
+        ctx.strokeStyle = "#bbb";
+        ctx.setLineDash([3, 3]);
+        ctx.beginPath();
+        ctx.moveTo(leftX, y);
+        ctx.lineTo(rightX, y);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+      y += 12;
+    };
+
+    centerLine("The Counter", 18, 700, "#2B2420", 6);
+    centerLine(`Order #${sale.orderNo} · ${new Date(sale.timestamp).toLocaleString()}`, 11, 400, "#6b6058", 3);
+    if (sale.employeeName) centerLine(`Served by ${sale.employeeName}`, 11, 400, "#6b6058", 3);
+    if (sale.tabLabel) centerLine(`Tab: ${sale.tabLabel}`, 11, 400, "#6b6058", 3);
+
+    if (sale.voided) {
+      y += 4;
+      leftLine("VOIDED — not counted in reports", 11, 700, "#B23B2E", 3);
+      const reason = `Reason: ${sale.voidReason}${sale.voidedAt ? " · " + new Date(sale.voidedAt).toLocaleString() : ""}${sale.voidedByName ? " · by " + sale.voidedByName : ""}`;
+      wrapReceiptText(ctx, reason, 11, contentWidth).forEach((l) => leftLine(l, 11, 400, "#B23B2E", 2));
+      if (sale.approvedByName) leftLine(`Approved by ${sale.approvedByName}`, 11, 400, "#B23B2E", 2);
+      if (sale.voidNote) wrapReceiptText(ctx, `Note: ${sale.voidNote}`, 11, contentWidth).forEach((l) => leftLine(l, 11, 400, "#B23B2E", 2));
+      y += 4;
+    } else if (sale.restoredAt) {
+      y += 4;
+      leftLine("Restored", 11, 700, "#8A5A2B", 3);
+      const restoreText = `${new Date(sale.restoredAt).toLocaleString()}${sale.restoredByName ? " · by " + sale.restoredByName : ""}${sale.voidReason ? " · originally voided (" + sale.voidReason + ")" : ""}`;
+      wrapReceiptText(ctx, restoreText, 11, contentWidth).forEach((l) => leftLine(l, 11, 400, "#6b6058", 2));
+      if (sale.restoreApprovedByName) leftLine(`Approved by ${sale.restoreApprovedByName}`, 11, 400, "#6b6058", 2);
+      y += 4;
+    }
+
+    divider();
+
+    sale.items.forEach((it) => {
+      const priceText = money(it.price * it.qty);
+      setFont(12, 400);
+      const priceWidth = ctx.measureText(priceText).width;
+      const nameLines = wrapReceiptText(ctx, `${it.qty} × ${it.name}`, 12, contentWidth - priceWidth - 10);
+      nameLines.forEach((ln, idx) => {
+        if (idx === 0) rowLine(ln, priceText, 12, 400, "#2B2420", 4);
+        else leftLine(ln, 12, 400, "#2B2420", 4);
+      });
+    });
+
+    divider();
+
+    rowLine("Subtotal", money(sale.subtotal ?? sale.total), 12, 400, "#6b6058", 4);
+    if (sale.discountAmount > 0) {
+      const label = `Discount${sale.discountType === "percent" ? ` (${sale.discountValue}%)` : ""}`;
+      rowLine(label, `-${money(sale.discountAmount)}`, 12, 400, "#B23B2E", 4);
+    }
+    y += 2;
+    rowLine("Total", money(sale.total), 15, 700, "#2B2420", 4);
+
+    divider();
+
+    rowLine("Payment", capitalizeWord(sale.paymentMethod || "cash"), 11, 400, "#6b6058", 4);
+    if (sale.paymentMethod === "cash") {
+      rowLine("Cash received", money(sale.amountTendered), 11, 400, "#6b6058", 4);
+      rowLine("Change", money(sale.change), 11, 400, "#6b6058", 4);
+    } else if (sale.paymentMethod === "split" && sale.payments) {
+      sale.payments.forEach((p) => rowLine(capitalizeWord(p.method), money(p.amount), 11, 400, "#6b6058", 4));
+    }
+
+    if (proofImg) {
+      y += 8;
+      leftLine("Payment screenshot", 10, 400, "#6b6058", 4);
+      if (draw) ctx.drawImage(proofImg, leftX, y, contentWidth, proofDrawHeight);
+      y += proofDrawHeight + 4;
+    }
+
+    y += 10;
+    centerLine("Thanks for stopping by ☕", 12, 400, "#2B2420", 0);
+    y += 20;
+
+    return y;
+  }
+
+  const measureCanvas = document.createElement("canvas");
+  const mctx = measureCanvas.getContext("2d");
+  const totalHeight = renderReceipt(mctx, false);
+
+  const canvas = document.createElement("canvas");
+  canvas.width = width * scale;
+  canvas.height = totalHeight * scale;
+  const ctx = canvas.getContext("2d");
+  ctx.scale(scale, scale);
+  ctx.fillStyle = "#fdfaf6";
+  ctx.fillRect(0, 0, width, totalHeight);
+  renderReceipt(ctx, true);
+
+  return new Promise((resolve) => canvas.toBlob((blob) => resolve(blob), "image/png"));
+}
+
 // Sends a receipt to the browser's print dialog via a real popup window
 // (window.open). This works well on desktop and Android, but on iPad —
 // especially when the app is installed as a standalone PWA — window.open
