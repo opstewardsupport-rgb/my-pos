@@ -9532,8 +9532,14 @@ function LogoUploadField({ value, onSave }) {
     setStatus("saving");
     try {
       const dataUrl = await fileToResizedDataURL(file, 300, 0.85);
-      const ok = await onSave(dataUrl);
-      if (ok === false) { setStatus("error"); setError("Couldn't save — try again"); return; }
+      const result = await onSave(dataUrl);
+      if (result === false || (result && result.ok === false)) {
+        setStatus("error");
+        // Surface the real reason (e.g. a missing database column) instead
+        // of a generic message that hides what actually went wrong.
+        setError((result && result.message) || "Couldn't save — try again");
+        return;
+      }
       setStatus("saved");
       setTimeout(() => setStatus((s) => (s === "saved" ? "idle" : s)), 1800);
     } catch {
@@ -9545,8 +9551,12 @@ function LogoUploadField({ value, onSave }) {
   const handleRemove = async () => {
     setError("");
     setStatus("saving");
-    const ok = await onSave(null);
-    if (ok === false) { setStatus("error"); setError("Couldn't remove — try again"); return; }
+    const result = await onSave(null);
+    if (result === false || (result && result.ok === false)) {
+      setStatus("error");
+      setError((result && result.message) || "Couldn't remove — try again");
+      return;
+    }
     setStatus("idle");
   };
 
