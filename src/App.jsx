@@ -63,6 +63,17 @@
    alter table public.businesses
      add column if not exists currency_code text default 'PHP';
 
+   -- The business's logo, uploaded from Settings (see SettingsView in the
+   -- app code) and stored as a small resized/compressed data URL — the same
+   -- way payment-proof screenshots are stored — so it travels with the
+   -- account to any device, the same as business_name. Shown next to the
+   -- business name on every printed/downloaded/on-screen receipt (see
+   -- buildReceiptHTML, buildReceiptImageBlob, and ReceiptModal in the app
+   -- code). Null/blank just means no logo has been uploaded yet — receipts
+   -- fall back to text-only. Safe to run even if this column already exists.
+   alter table public.businesses
+     add column if not exists business_logo_url text;
+
    -- Set once, the moment an account's FIRST payment is confirmed (see
    -- markSubscriptionActive in the app code) — unlike subscription_period_end
    -- (which moves forward on every renewal), this stays fixed for the life
@@ -1701,6 +1712,10 @@ export default function CafePOS() {
       // Falls back to PHP only for pre-existing accounts created before
       // this field existed.
       currencyCode: data.currency_code || "PHP",
+      // Uploaded from Settings — a resized/compressed data URL, or null if
+      // the owner hasn't set one. Shown next to the business name on every
+      // receipt (print, download, and the on-screen ReceiptModal).
+      logoUrl: data.business_logo_url || null,
       // Set by submit_manual_payment()/reject_manual_payment() — lets the
       // UI show "your payment is under review" instead of leaving the
       // customer wondering whether their submission actually went through.
@@ -2451,12 +2466,13 @@ export default function CafePOS() {
     }
   }, [authUser, notify]);
 
-  // Used by the Settings page — saves a single field (businessName, email,
-  // or password) the moment the owner is done typing it. Email and password
-  // changes go through Supabase Auth itself (so login credentials actually
-  // change); business name is just a column on `businesses`. Reads/writes
-  // accountRef (kept in sync below) instead of the `account` state directly,
-  // so two fields autosaving close together can't clobber each other.
+  // Used by the Settings page — saves a single field (businessName, logoUrl,
+  // email, or password) the moment the owner is done typing/uploading it.
+  // Email and password changes go through Supabase Auth itself (so login
+  // credentials actually change); business name and logo are just columns
+  // on `businesses`. Reads/writes accountRef (kept in sync below) instead
+  // of the `account` state directly, so two fields autosaving close
+  // together can't clobber each other.
   const updateAccountField = useCallback(async (field, value) => {
     if (!authUser) return false;
     try {
@@ -2474,6 +2490,14 @@ export default function CafePOS() {
         accountRef.current = next;
         setAccount(next);
         notify("Check your new email address to confirm the change.");
+        return true;
+      }
+      if (field === "logoUrl") {
+        const { error } = await supabase.from("businesses").update({ business_logo_url: value }).eq("id", authUser.id);
+        if (error) throw error;
+        const next = { ...(accountRef.current || {}), logoUrl: value };
+        accountRef.current = next;
+        setAccount(next);
         return true;
       }
       // businessName
@@ -5842,9 +5866,14 @@ function isIPadDevice() {
 // Builds a small, self-contained HTML page for a single sale receipt.
 // Kept separate from the "how do we actually print it" step below because
 // that step differs by device (see printReceipt).
-function buildReceiptHTML(sale) {
+function buildReceiptHTML(sale, business) {
   const esc = (s) =>
     String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+  const storeName = (business?.businessName && business.businessName.trim()) || "The Counter";
+  const logoHTML = business?.logoUrl
+    ? `<img src="${esc(business.logoUrl)}" alt="" style="max-width:64px;max-height:64px;object-fit:contain;margin:0 auto 6px;display:block;" />`
+    : "";
 
   const itemsHTML = sale.items
     .map(
@@ -5922,7 +5951,8 @@ function buildReceiptHTML(sale) {
 </head>
 <body>
   <div class="center">
-    <div class="store">The Counter</div>
+    ${logoHTML}
+    <div class="store">${esc(storeName)}</div>
     <div class="meta">Order #${esc(sale.orderNo)} · ${esc(new Date(sale.timestamp).toLocaleString())}</div>
     ${sale.employeeName ? `<div class="meta">Served by ${esc(sale.employeeName)}</div>` : ""}
     ${sale.tabLabel ? `<div class="meta">Tab: ${esc(sale.tabLabel)}</div>` : ""}
@@ -5973,13 +6003,37 @@ const capitalizeWord = (s) => String(s || "").replace(/^./, (c) => c.toUpperCase
 // tall the receipt needs to be (canvas size must be known up front), then
 // again with draw=true on a canvas sized exactly to fit, at 2x scale for a
 // crisp, non-blurry image.
-async function buildReceiptImageBlob(sale) {
+async function buildReceiptImageBlob(sale, business) {
   const width = 340;
   const contentWidth = width - 40;
   const leftX = 20;
   const rightX = width - 20;
   const centerX = width / 2;
   const scale = 2;
+
+  const storeName = (business?.businessName && business.businessName.trim()) || "The Counter";
+
+  // The business logo (if the owner uploaded one in Settings) gets drawn
+  // centered above the store name — loaded up front, same pattern as the
+  // payment-proof screenshot below, so its height is known before either
+  // layout pass runs.
+  let logoImg = null;
+  let logoDrawHeight = 0;
+  if (business?.logoUrl) {
+    try {
+      logoImg = await new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => resolve(img);
+        img.onerror = reject;
+        img.src = business.logoUrl;
+      });
+      const maxLogoHeight = 48;
+      const ratio = logoImg.naturalWidth ? logoImg.naturalHeight / logoImg.naturalWidth : 1;
+      logoDrawHeight = Math.min(maxLogoHeight, maxLogoHeight * ratio || maxLogoHeight);
+    } catch {
+      logoImg = null; // broken/unreachable logo — just skip it, rest of receipt still renders
+    }
+  }
 
   // Payment-proof screenshots (if any) get embedded into the image too —
   // load it once up front so its height is known before either layout pass.
@@ -6052,7 +6106,15 @@ async function buildReceiptImageBlob(sale) {
       y += 12;
     };
 
-    centerLine("The Counter", 18, 700, "#2B2420", 6);
+    if (logoImg) {
+      const logoDrawWidth = logoImg.naturalWidth
+        ? logoDrawHeight * (logoImg.naturalWidth / logoImg.naturalHeight)
+        : logoDrawHeight;
+      if (draw) ctx.drawImage(logoImg, centerX - logoDrawWidth / 2, y, logoDrawWidth, logoDrawHeight);
+      y += logoDrawHeight + 6;
+    }
+
+    centerLine(storeName, 18, 700, "#2B2420", 6);
     centerLine(`Order #${sale.orderNo} · ${new Date(sale.timestamp).toLocaleString()}`, 11, 400, "#6b6058", 3);
     if (sale.employeeName) centerLine(`Served by ${sale.employeeName}`, 11, 400, "#6b6058", 3);
     if (sale.tabLabel) centerLine(`Tab: ${sale.tabLabel}`, 11, 400, "#6b6058", 3);
@@ -9421,6 +9483,90 @@ function ResetPasswordView({ onConfirm, onCancel }) {
 // A text/email/password field that saves itself a moment after the owner
 // stops typing — no Save button needed. Shows a tiny "Saving…" / "Saved ✓"
 // status underneath so it's obvious it worked.
+// Upload/preview/remove control for the business logo shown in Settings.
+// Reuses fileToResizedDataURL (the same downscale-and-compress helper used
+// for payment-proof photos) so the logo stays small before it's stored on
+// the account row and synced to every device. Saves immediately on
+// upload/remove — no separate "save" step, matching AutoSaveField's
+// autosave-as-you-go feel elsewhere on this page.
+function LogoUploadField({ value, onSave }) {
+  const [status, setStatus] = useState("idle"); // idle | saving | saved | error
+  const [error, setError] = useState("");
+  const fileInputRef = useRef(null);
+
+  const handleFile = async (e) => {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = ""; // allow re-selecting the same file again later
+    if (!file) return;
+    setError("");
+    setStatus("saving");
+    try {
+      const dataUrl = await fileToResizedDataURL(file, 300, 0.85);
+      const ok = await onSave(dataUrl);
+      if (ok === false) { setStatus("error"); setError("Couldn't save — try again"); return; }
+      setStatus("saved");
+      setTimeout(() => setStatus((s) => (s === "saved" ? "idle" : s)), 1800);
+    } catch {
+      setStatus("error");
+      setError("Couldn't read that image — try a different file");
+    }
+  };
+
+  const handleRemove = async () => {
+    setError("");
+    setStatus("saving");
+    const ok = await onSave(null);
+    if (ok === false) { setStatus("error"); setError("Couldn't remove — try again"); return; }
+    setStatus("idle");
+  };
+
+  return (
+    <Field label="Business logo">
+      <div className="flex items-center gap-3">
+        <div
+          className="w-14 h-14 rounded-lg border flex items-center justify-center overflow-hidden shrink-0"
+          style={{ borderColor: "var(--line)", background: "var(--bg)" }}
+        >
+          {value ? (
+            <img src={value} alt="Business logo" className="w-full h-full object-contain" />
+          ) : (
+            <ImagePlus size={18} color="var(--ink-soft)" />
+          )}
+        </div>
+        <div className="flex-1">
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={() => fileInputRef.current && fileInputRef.current.click()}
+              className="text-xs px-3 py-1.5 rounded-lg border font-medium"
+              style={{ borderColor: "var(--line)", color: "var(--ink-soft)" }}
+            >
+              {value ? "Change" : "Upload"}
+            </button>
+            {value && (
+              <button
+                type="button"
+                onClick={handleRemove}
+                className="text-xs px-3 py-1.5 rounded-lg border font-medium"
+                style={{ borderColor: "var(--line)", color: "var(--alert)" }}
+              >
+                Remove
+              </button>
+            )}
+          </div>
+          <input ref={fileInputRef} type="file" accept="image/*" onChange={handleFile} className="hidden" />
+          <div className="h-4 mt-1.5 text-[11px] flex items-center gap-1" style={{ color: status === "error" ? "var(--alert)" : "var(--ink-soft)" }}>
+            {status === "saving" && (<><Loader2 size={11} className="animate-spin" /> Saving…</>)}
+            {status === "saved" && (<span style={{ color: "var(--primary-dark)" }}>Saved ✓</span>)}
+            {status === "error" && error}
+            {status === "idle" && "Shown on printed and downloaded receipts"}
+          </div>
+        </div>
+      </div>
+    </Field>
+  );
+}
+
 function AutoSaveField({ label, value, onSave, type = "text", placeholder, minLength = 0, helper }) {
   const [val, setVal] = useState(value || "");
   const [status, setStatus] = useState("idle"); // idle | saving | saved | error
@@ -10513,6 +10659,10 @@ function SettingsView({ account, onUpdateField, onLogOut, onDeleteAccount, onUns
           onSave={(v) => onUpdateField("businessName", v)}
           placeholder="e.g. Sunrise Café"
           minLength={1}
+        />
+        <LogoUploadField
+          value={account?.logoUrl}
+          onSave={(dataUrl) => onUpdateField("logoUrl", dataUrl)}
         />
         <AutoSaveField
           label="Email"
