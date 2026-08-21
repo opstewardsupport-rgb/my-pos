@@ -150,6 +150,29 @@ const CURRENCIES = {
   VND: { symbol: "₫", zeroDecimal: true },
 };
 
+// BUG FIX: this used to always use discount_percent, which is only correct
+// for a first-ever payment. A RENEWAL's real discount is reward_credits
+// (the recurring referral reward, capped at MAX_REWARD_CREDIT_PERCENT) —
+// discount_percent is almost always 0 by the time someone renews, since it
+// gets spent on the first payment. This mirrors the exact same logic
+// create-paymongo-link.js/create-paypal-order.js use to compute the real
+// charge, so what you see here always matches what the customer was shown.
+const MAX_REWARD_CREDIT_PERCENT = 50;
+
+function computeExpectedAmount(biz) {
+  const code = biz.currency_code || "PHP";
+  const full = LOCKED_SUBSCRIPTION_PRICE_PHP[code] ?? LOCKED_SUBSCRIPTION_PRICE_PHP.PHP;
+  const isRenewal = biz.manual_payment_purpose === "renewal";
+  const discountPercent = isRenewal
+    ? Math.min(Number(biz.reward_credits) || 0, MAX_REWARD_CREDIT_PERCENT)
+    : (Number(biz.discount_percent) || 0);
+  const cur = CURRENCIES[code] || CURRENCIES.PHP;
+  const finalAmount = full - full * (discountPercent / 100);
+  const decimals = cur.zeroDecimal ? 0 : 2;
+  const formatted = finalAmount.toLocaleString(undefined, { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
+  return { formatted: `${cur.symbol}${formatted}`, numeric: finalAmount, discountPercent };
+}
+
 function formatExpectedAmount(currencyCode, discountPercent) {
   const code = currencyCode || "PHP";
   const full = LOCKED_SUBSCRIPTION_PRICE_PHP[code] ?? LOCKED_SUBSCRIPTION_PRICE_PHP.PHP;
@@ -157,6 +180,14 @@ function formatExpectedAmount(currencyCode, discountPercent) {
   const final = full - full * ((Number(discountPercent) || 0) / 100);
   const decimals = cur.zeroDecimal ? 0 : 2;
   const formatted = final.toLocaleString(undefined, { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
+  return `${cur.symbol}${formatted}`;
+}
+
+function formatCurrencyAmount(currencyCode, amount) {
+  const code = currencyCode || "PHP";
+  const cur = CURRENCIES[code] || CURRENCIES.PHP;
+  const decimals = cur.zeroDecimal ? 0 : 2;
+  const formatted = Number(amount).toLocaleString(undefined, { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
   return `${cur.symbol}${formatted}`;
 }
 
@@ -234,7 +265,7 @@ export default async function handler(req, res) {
     // Pending: the live, current state — straight from businesses.
     const { data: pending, error: pendingError } = await supabaseAdmin
       .from("businesses")
-      .select("id, business_name, email, payment_reference, manual_payment_submitted_at, currency_code, discount_percent")
+      .select("id, business_name, email, payment_reference, manual_payment_submitted_at, currency_code, discount_percent, reward_credits, manual_payment_amount, manual_payment_method, manual_payment_purpose")
       .eq("manual_payment_status", "pending")
       .order("manual_payment_submitted_at", { ascending: true });
 
@@ -249,7 +280,7 @@ export default async function handler(req, res) {
     // at 100 so this stays fast as the log grows.
     const { data: history, error: historyError } = await supabaseAdmin
       .from("manual_payment_reviews")
-      .select("id, business_id, business_name, email, reference, action, reviewed_at")
+      .select("id, business_id, business_name, email, reference, action, reviewed_at, amount_paid, payment_method, purpose, expected_amount, currency_code")
       .order("reviewed_at", { ascending: false })
       .limit(100);
 
@@ -281,9 +312,23 @@ export default async function handler(req, res) {
       const ref = (biz.payment_reference || "").trim().toLowerCase();
       const isDuplicatePending = ref && referenceCounts.get(ref) > 1;
       const wasAlreadyApproved = ref && approvedReferences.has(ref);
+      const expected = computeExpectedAmount(biz);
+      const amountPaid = biz.manual_payment_amount !== null && biz.manual_payment_amount !== undefined
+        ? Number(biz.manual_payment_amount)
+        : null;
+      // A little leeway (1 unit of currency) for rounding — anything
+      // meaningfully short of the expected amount gets flagged so you
+      // don't approve a partial payment by mistake.
+      const isUnderpaid = amountPaid !== null && amountPaid < expected.numeric - 1;
       return {
         ...biz,
-        expectedAmount: formatExpectedAmount(biz.currency_code, biz.discount_percent),
+        expectedAmount: expected.formatted,
+        amountPaid: amountPaid !== null ? formatCurrencyAmount(biz.currency_code, amountPaid) : null,
+        paymentMethod: biz.manual_payment_method || "(not specified)",
+        purpose: biz.manual_payment_purpose === "renewal" ? "Renewal" : "New subscription",
+        underpaidWarning: isUnderpaid
+          ? `Reported amount is less than the expected ${expected.formatted} — check before approving.`
+          : null,
         duplicateWarning: isDuplicatePending
           ? "This exact reference was also submitted by another pending account."
           : wasAlreadyApproved
@@ -309,7 +354,7 @@ export default async function handler(req, res) {
     // admin didn't type a different one in on the approve form.
     const { data: business, error: fetchError } = await supabaseAdmin
       .from("businesses")
-      .select("id, business_name, email, payment_reference, manual_payment_status")
+      .select("id, business_name, email, payment_reference, manual_payment_status, manual_payment_amount, manual_payment_method, manual_payment_purpose, currency_code, discount_percent, reward_credits")
       .eq("id", businessId)
       .single();
 
@@ -344,6 +389,11 @@ export default async function handler(req, res) {
           email: business.email,
           reference: finalReference,
           action: "approved",
+          amount_paid: business.manual_payment_amount,
+          payment_method: business.manual_payment_method,
+          purpose: business.manual_payment_purpose,
+          expected_amount: computeExpectedAmount(business).numeric,
+          currency_code: business.currency_code,
         });
 
         // Email sending failures deliberately do NOT roll back the
@@ -379,6 +429,11 @@ export default async function handler(req, res) {
         email: business.email,
         reference: business.payment_reference,
         action: "rejected",
+        amount_paid: business.manual_payment_amount,
+        payment_method: business.manual_payment_method,
+        purpose: business.manual_payment_purpose,
+        expected_amount: computeExpectedAmount(business).numeric,
+        currency_code: business.currency_code,
       });
 
       try {
