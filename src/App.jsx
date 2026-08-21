@@ -7592,8 +7592,8 @@ function InventoryView({ ingredients, products, openNew, openEdit, deleteIngredi
       {ingredients.length === 0 ? (
         <EmptyState text="No ingredients yet. Add coffee, milk, syrups, or anything you track by weight or volume." />
       ) : (
-        <div className="rounded-xl border overflow-hidden" style={{ borderColor: "var(--line)", background: "var(--surface)" }}>
-          <div className="grid grid-cols-[1fr_90px_110px_110px_80px] gap-2 px-3.5 py-2 text-xs font-medium" style={{ color: "var(--ink-soft)", borderBottom: "1px solid var(--line)" }}>
+        <div className="rounded-xl border overflow-x-auto" style={{ borderColor: "var(--line)", background: "var(--surface)" }}>
+          <div className="grid grid-cols-[1fr_70px_100px_90px_150px] gap-2 px-3.5 py-2 text-xs font-medium min-w-[560px]" style={{ color: "var(--ink-soft)", borderBottom: "1px solid var(--line)" }}>
             <span>Ingredient</span><span>Unit</span><span>Stock</span><span>Low at</span><span></span>
           </div>
           {sortedIngredients.map((i) => {
@@ -7605,7 +7605,7 @@ function InventoryView({ ingredients, products, openNew, openEdit, deleteIngredi
             const isExpiringSoon = daysToExpiry !== null && daysToExpiry >= 0 && daysToExpiry <= 3;
             const servings = servingsByIngredient[i.id] || [];
             return (
-              <div key={i.id} className="grid grid-cols-[1fr_90px_110px_110px_80px] gap-2 px-3.5 py-2.5 items-center text-sm mono-font" style={{ borderBottom: "1px solid var(--line)", background: isExpired ? "#F3E3DC" : (isLow || isExpiringSoon) ? "#FBF1EC" : "transparent" }}>
+              <div key={i.id} className="grid grid-cols-[1fr_70px_100px_90px_150px] gap-2 px-3.5 py-2.5 items-center text-sm mono-font min-w-[560px]" style={{ borderBottom: "1px solid var(--line)", background: isExpired ? "#F3E3DC" : (isLow || isExpiringSoon) ? "#FBF1EC" : "transparent" }}>
                 <div className="min-w-0" style={{ fontFamily: "'IBM Plex Sans', sans-serif" }}>
                   <span className="truncate block">
                     {i.name}
@@ -7629,17 +7629,17 @@ function InventoryView({ ingredients, products, openNew, openEdit, deleteIngredi
                 <span style={{ color: "var(--ink-soft)" }}>{i.unit}</span>
                 {restockId === i.id ? (
                   <div className="flex items-center gap-1">
-                    <input autoFocus type="number" value={restockVal} onChange={(e) => setRestockVal(e.target.value)} onKeyDown={(e) => e.key === "Enter" && applyRestock(i.id)} className="w-16 border rounded px-1.5 py-1 text-xs" style={{ borderColor: "var(--line)" }} placeholder="+amt" />
-                    <button onClick={() => applyRestock(i.id)}><Check size={13} color="var(--primary-dark)" /></button>
+                    <input autoFocus type="number" value={restockVal} onChange={(e) => setRestockVal(e.target.value)} onKeyDown={(e) => e.key === "Enter" && applyRestock(i.id)} className="w-14 border rounded-lg px-1.5 py-2 text-xs" style={{ borderColor: "var(--line)" }} placeholder="+amt" />
+                    <button onClick={() => applyRestock(i.id)} className="w-9 h-9 flex items-center justify-center rounded-full"><Check size={16} color="var(--primary-dark)" /></button>
                   </div>
                 ) : (
                   <span style={{ color: isLow ? "var(--alert)" : "var(--ink)" }}>{i.stock}</span>
                 )}
                 <span style={{ color: "var(--ink-soft)" }}>{i.low}</span>
-                <div className="flex items-center gap-1 justify-end">
-                  <button onClick={() => setRestockId(restockId === i.id ? null : i.id)} className="text-xs px-1.5 py-1 rounded border" style={{ borderColor: "var(--line)" }}>+stock</button>
-                  <button onClick={() => openEdit(i)}><Pencil size={12} color="var(--ink-soft)" /></button>
-                  <ConfirmDeleteButton onConfirm={() => deleteIngredient(i.id)} compact />
+                <div className="flex items-center gap-1.5 justify-end">
+                  <button onClick={() => setRestockId(restockId === i.id ? null : i.id)} className="text-xs px-3 py-2 rounded-lg border font-medium min-h-[36px]" style={{ borderColor: "var(--line)" }}>+stock</button>
+                  <button onClick={() => openEdit(i)} className="w-9 h-9 flex items-center justify-center rounded-full"><Pencil size={15} color="var(--ink-soft)" /></button>
+                  <ConfirmDeleteButton onConfirm={() => deleteIngredient(i.id)} compact size={15} className="w-9 h-9 flex items-center justify-center rounded-full" />
                 </div>
               </div>
             );
@@ -8718,7 +8718,7 @@ function ConfirmDeleteButton({ onConfirm, className, size = 12, round = true, la
         title={armed ? "Click again to delete" : "Delete"}
         onClick={() => (armed ? (onConfirm(), setArmed(false)) : setArmed(true))}
         onMouseLeave={() => setArmed(false)}
-        className={`w-6 h-6 flex items-center justify-center rounded-full ${armed ? "" : ""}`}
+        className={className || `w-6 h-6 flex items-center justify-center rounded-full ${armed ? "" : ""}`}
         style={armed ? { background: "var(--alert)" } : undefined}
       >
         <Trash2 size={size} color={armed ? "#fff" : "var(--alert)"} />
