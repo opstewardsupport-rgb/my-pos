@@ -1035,7 +1035,7 @@ import {
   Tag, Banknote, CreditCard, ImagePlus, Loader2, Camera, History as HistoryIcon,
   Ban, Undo2, ChevronDown, ChevronUp, StickyNote, Coins, ChefHat, Circle, CheckCircle2,
   Settings as SettingsIcon, LogOut, Eye, EyeOff, Store, ArrowRight, Users, ClipboardList,
-  Printer, Download, Smartphone, RefreshCw, FileText, UserX,
+  Printer, Download, Smartphone, RefreshCw, FileText, UserX, Clock, AlertCircle,
 } from "lucide-react";
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell,
@@ -1701,6 +1701,10 @@ export default function CafePOS() {
       // Falls back to PHP only for pre-existing accounts created before
       // this field existed.
       currencyCode: data.currency_code || "PHP",
+      // Set by submit_manual_payment()/reject_manual_payment() — lets the
+      // UI show "your payment is under review" instead of leaving the
+      // customer wondering whether their submission actually went through.
+      manualPaymentStatus: data.manual_payment_status || null,
     };
   }, []);
 
@@ -9272,12 +9276,13 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onApplyCode, on
   const [justApplied, setJustApplied] = useState(false);
   // Reference number/text the subscriber types in after paying manually
   // (GCash/bank transfer for PH, or PayPal.me for international currencies
-  // PayPal itself can't settle in — see needsManualPayment below). Submitting
-  // this calls onConfirm/markSubscriptionActive, which is the ONLY thing
-  // that actually activates the account on the manual-payment path, since
-  // there's no webhook to do it automatically the way PayMongo/PayPal
-  // checkout does.
+  // PayPal itself can't settle in — see needsManualPayment below).
+  // Submitting this calls submit_manual_payment(), which only ever queues
+  // the payment for admin review (see admin.html) — it never activates the
+  // account directly.
   const [manualRef, setManualRef] = useState("");
+  const [manualAmount, setManualAmount] = useState("");
+  const [manualMethod, setManualMethod] = useState("");
   const [manualBusy, setManualBusy] = useState(false);
   const [manualError, setManualError] = useState("");
 
@@ -9704,16 +9709,25 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onApplyCode, on
   const submitManualPayment = async () => {
     if (manualBusy || !manualRef.trim()) return;
     setManualError("");
+    if (!manualMethod) {
+      setManualError("Please select how you paid.");
+      return;
+    }
     setManualBusy(true);
     try {
       const { error } = await supabase.rpc("submit_manual_payment", {
         p_reference: manualRef.trim(),
+        p_amount: manualAmount.trim() ? Number(manualAmount.trim()) : null,
+        p_method: manualMethod,
       });
       if (error) throw error;
       setManualRef("");
+      setManualAmount("");
+      setManualMethod("");
       notify?.(
-        "Thanks! We've noted your payment reference — we'll verify it and activate your subscription shortly."
+        "Thanks! We've noted your payment — this is reviewed by a person, so it can take up to 24 hours to be approved. You'll get an email either way."
       );
+      if (typeof onRefreshAccount === "function") onRefreshAccount();
       if (typeof onClose === "function") onClose();
     } catch (err) {
       console.error("submitManualPayment failed:", err);
@@ -9758,6 +9772,25 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onApplyCode, on
       <img src={LOGO_DATA_URL} alt="" className="h-12 w-auto mx-auto mb-4" style={{ objectFit: "contain" }} />
       <h2 className="display-font text-lg text-center mb-1" style={{ fontWeight: 600 }}>{headline}</h2>
       <p className="text-xs text-center mb-5" style={{ color: "var(--ink-soft)" }}>{subhead}</p>
+
+      {account?.manualPaymentStatus === "pending" && (
+        <div className="rounded-lg px-3 py-2.5 mb-4 text-xs flex items-start gap-2" style={{ background: "#FBF1DC", color: "#8A6415" }}>
+          <Clock size={14} style={{ flexShrink: 0, marginTop: 1 }} />
+          <span>
+            Your payment is under review — a real person checks each one, so this can take up to 24 hours.
+            You'll get an email once it's approved. No need to submit again.
+          </span>
+        </div>
+      )}
+      {account?.manualPaymentStatus === "rejected" && (
+        <div className="rounded-lg px-3 py-2.5 mb-4 text-xs flex items-start gap-2" style={{ background: "#F7E4E0", color: "var(--alert)" }}>
+          <AlertCircle size={14} style={{ flexShrink: 0, marginTop: 1 }} />
+          <span>
+            We couldn't verify your last payment reference — it may have had a typo, or the payment hasn't
+            fully gone through yet. Please double-check and resubmit below, or email us if you're sure it went through.
+          </span>
+        </div>
+      )}
 
       {/* ---- Price breakdown ----
           New sign-up with a code: Original Price / 25% Referral Discount /
@@ -9896,8 +9929,41 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onApplyCode, on
               reference here (see submitManualPayment/onConfirm above). */}
           <div className="mt-3 pt-3" style={{ borderTop: "1px solid var(--line)" }}>
             <label className="block mb-1 font-medium" style={{ color: "var(--ink)" }}>
-              Already paid? Enter your reference to activate
+              Already paid? Tell us the details to activate
             </label>
+            <div className="grid grid-cols-2 gap-2 mb-2">
+              <input
+                type="number"
+                inputMode="decimal"
+                value={manualAmount}
+                onChange={(e) => setManualAmount(e.target.value)}
+                placeholder={`Amount you paid`}
+                className="border rounded-lg px-2.5 py-1.5 text-xs"
+                style={{ borderColor: "var(--line)" }}
+              />
+              <select
+                value={manualMethod}
+                onChange={(e) => setManualMethod(e.target.value)}
+                className="border rounded-lg px-2.5 py-1.5 text-xs"
+                style={{ borderColor: "var(--line)" }}
+              >
+                <option value="">How did you pay?</option>
+                {isPHCustomer ? (
+                  <>
+                    <option value="GCash">GCash</option>
+                    <option value="Bank transfer">Bank transfer</option>
+                    <option value="Card">Card</option>
+                  </>
+                ) : (
+                  <>
+                    <option value="PayPal.me">PayPal.me</option>
+                    <option value="Bank transfer">Bank transfer</option>
+                    <option value="Card">Card</option>
+                  </>
+                )}
+                <option value="Other">Other</option>
+              </select>
+            </div>
             <div className="flex gap-2">
               <input
                 value={manualRef}
@@ -9921,6 +9987,9 @@ function UpgradeView({ account, trialInfo, currencyCode = "PHP", onApplyCode, on
                 {manualBusy ? "Confirming…" : "Confirm"}
               </button>
             </div>
+            <p className="mt-1.5" style={{ color: "var(--ink-soft)" }}>
+              A real person checks this — approval can take up to 24 hours. You'll get an email once it's reviewed.
+            </p>
             {manualError && <p className="mt-1.5" style={{ color: "var(--alert)" }}>{manualError}</p>}
           </div>
         </div>
