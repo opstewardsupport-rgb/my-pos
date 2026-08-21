@@ -6162,23 +6162,24 @@ function printReceipt(sale) {
   win.onafterprint = () => win.close();
 }
 
-// Saves the same receipt markup used for printing as a standalone .html
-// file the customer/owner can keep, re-open, or print later from anywhere.
-// On phones/tablets (iOS Safari in particular, including installed PWAs)
-// the plain <a download> trick below is unreliable — Safari often just
-// opens the file instead of saving it, so a tap looks like it did nothing.
-// The Web Share API's file-sharing (supported on iOS 15+/most modern
-// mobile browsers) instead hands the file to the OS share sheet, where
-// "Save to Files" actually works. Desktop browsers (and any mobile browser
-// without file-sharing support) fall back to the classic anchor-download.
+// Saves the receipt as a PNG image (via buildReceiptImageBlob) the
+// customer/owner can keep, view, or print later from anywhere — a real
+// picture file so it lands in Photos/gallery, not a webpage the gallery app
+// can't display. On phones/tablets (iOS Safari in particular, including
+// installed PWAs) the plain <a download> trick below is unreliable — Safari
+// often just opens the file instead of saving it, so a tap looks like it
+// did nothing. The Web Share API's file-sharing (supported on iOS 15+/most
+// modern mobile browsers) instead hands the file to the OS share sheet,
+// where "Save Image" actually saves it to Photos/gallery. Desktop browsers
+// (and any mobile browser without file-sharing support) fall back to the
+// classic anchor-download, which saves a normal .png file.
 async function downloadReceipt(sale) {
-  const html = buildReceiptHTML(sale);
-  const fileName = `receipt-order-${sale.orderNo ?? "unknown"}.html`;
-  const blob = new Blob([html], { type: "text/html" });
+  const blob = await buildReceiptImageBlob(sale);
+  const fileName = `receipt-order-${sale.orderNo ?? "unknown"}.png`;
 
   if (typeof navigator !== "undefined" && navigator.canShare && navigator.share) {
     try {
-      const file = new File([blob], fileName, { type: "text/html" });
+      const file = new File([blob], fileName, { type: "image/png" });
       if (navigator.canShare({ files: [file] })) {
         await navigator.share({ files: [file], title: fileName });
         return;
