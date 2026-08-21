@@ -5972,16 +5972,39 @@ function printReceipt(sale) {
 }
 
 // Saves the same receipt markup used for printing as a standalone .html
-// file the customer/owner can keep, re-open, or print later from anywhere —
-// no popup, no print dialog, works the same on every device including
-// iPad/PWA where window.open is unreliable (see printReceipt above).
-function downloadReceipt(sale) {
+// file the customer/owner can keep, re-open, or print later from anywhere.
+// On phones/tablets (iOS Safari in particular, including installed PWAs)
+// the plain <a download> trick below is unreliable — Safari often just
+// opens the file instead of saving it, so a tap looks like it did nothing.
+// The Web Share API's file-sharing (supported on iOS 15+/most modern
+// mobile browsers) instead hands the file to the OS share sheet, where
+// "Save to Files" actually works. Desktop browsers (and any mobile browser
+// without file-sharing support) fall back to the classic anchor-download.
+async function downloadReceipt(sale) {
   const html = buildReceiptHTML(sale);
+  const fileName = `receipt-order-${sale.orderNo ?? "unknown"}.html`;
   const blob = new Blob([html], { type: "text/html" });
+
+  if (typeof navigator !== "undefined" && navigator.canShare && navigator.share) {
+    try {
+      const file = new File([blob], fileName, { type: "text/html" });
+      if (navigator.canShare({ files: [file] })) {
+        await navigator.share({ files: [file], title: fileName });
+        return;
+      }
+    } catch (err) {
+      // User cancelling the share sheet also lands here (AbortError) — not
+      // an actual failure, so just fall through silently rather than also
+      // firing the anchor-download fallback on top of a share the person
+      // may have already completed or deliberately dismissed.
+      if (err && err.name === "AbortError") return;
+    }
+  }
+
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = `receipt-order-${sale.orderNo ?? "unknown"}.html`;
+  a.download = fileName;
   document.body.appendChild(a);
   a.click();
   a.remove();
