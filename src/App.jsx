@@ -4270,8 +4270,8 @@ export default function CafePOS() {
           onConfirm={confirmHandoff}
         />
       )}
-      {receipt && <ReceiptModal sale={receipt} onClose={() => setReceipt(null)} />}
-      {detailSale && <ReceiptModal sale={detailSale} onClose={() => setDetailSale(null)} closeLabel="Close" />}
+      {receipt && <ReceiptModal sale={receipt} business={account} onClose={() => setReceipt(null)} />}
+      {detailSale && <ReceiptModal sale={detailSale} business={account} onClose={() => setDetailSale(null)} closeLabel="Close" />}
       {parkModalOpen && (
         <ParkOrderModal
           nextOrderNo={nextOrderNo}
@@ -5863,6 +5863,21 @@ function isIPadDevice() {
   return /ipad/i.test(ua) || iPadDesktopMode;
 }
 
+// Used by downloadReceipt to decide whether "Save" should go through the OS
+// share sheet (phones/tablets) or a plain file download (laptops/desktops).
+// Checked separately from isIPadDevice() because this needs to catch phones
+// too, not just iPad. A real touchscreen phone/tablet UA, or an iPad
+// wearing its "Macintosh" disguise (see isIPadDevice above), counts as
+// mobile; an ordinary laptop — even a touchscreen Windows laptop, which
+// still reports maxTouchPoints > 0 — does not, since it has a normal
+// filesystem a download can land in.
+function isMobileDevice() {
+  if (typeof navigator === "undefined") return false;
+  const ua = navigator.userAgent || "";
+  if (/android|iphone|ipod/i.test(ua)) return true;
+  return isIPadDevice();
+}
+
 // Builds a small, self-contained HTML page for a single sale receipt.
 // Kept separate from the "how do we actually print it" step below because
 // that step differs by device (see printReceipt).
@@ -6206,8 +6221,8 @@ async function buildReceiptImageBlob(sale, business) {
 // window away to the receipt page instead, with no back/close affordance,
 // stranding the cashier away from the register. iPadReceiptOverlay (below)
 // is used instead on iPad; this path stays for everything else.
-function printReceipt(sale) {
-  const html = buildReceiptHTML(sale);
+function printReceipt(sale, business) {
+  const html = buildReceiptHTML(sale, business);
   // A popup keeps this print job fully independent of the current page —
   // no CSS conflicts with whatever view (POS, Sales History, Reports) the
   // receipt happened to be opened from.
@@ -6235,11 +6250,17 @@ function printReceipt(sale) {
 // where "Save Image" actually saves it to Photos/gallery. Desktop browsers
 // (and any mobile browser without file-sharing support) fall back to the
 // classic anchor-download, which saves a normal .png file.
-async function downloadReceipt(sale) {
-  const blob = await buildReceiptImageBlob(sale);
+async function downloadReceipt(sale, business) {
+  const blob = await buildReceiptImageBlob(sale, business);
   const fileName = `receipt-order-${sale.orderNo ?? "unknown"}.png`;
 
-  if (typeof navigator !== "undefined" && navigator.canShare && navigator.share) {
+  // Only route through the OS share sheet on actual phones/tablets, where
+  // Safari/Chrome often can't save a plain <a download> reliably (see note
+  // above this function). Many desktop/laptop browsers now also expose
+  // navigator.share, but on a laptop "Save" should just download the file
+  // straight to disk like any other download — popping the share sheet
+  // there looks like the button did nothing.
+  if (isMobileDevice() && typeof navigator !== "undefined" && navigator.canShare && navigator.share) {
     try {
       const file = new File([blob], fileName, { type: "image/png" });
       if (navigator.canShare({ files: [file] })) {
@@ -6271,8 +6292,8 @@ async function downloadReceipt(sale) {
 // modal holding an <iframe>, printed via the iframe's own contentWindow —
 // so the cashier never leaves the register screen and can dismiss it with a
 // single tap at any time.
-function IPadReceiptOverlay({ sale, onClose }) {
-  const html = useMemo(() => buildReceiptHTML(sale), [sale]);
+function IPadReceiptOverlay({ sale, business, onClose }) {
+  const html = useMemo(() => buildReceiptHTML(sale, business), [sale, business]);
   const iframeRef = useRef(null);
 
   const handlePrint = () => {
@@ -6322,7 +6343,7 @@ function IPadReceiptOverlay({ sale, onClose }) {
             Close
           </button>
           <button
-            onClick={() => downloadReceipt(sale)}
+            onClick={() => downloadReceipt(sale, business)}
             className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-lg text-sm font-medium border"
             style={{ borderColor: "var(--line)", color: "var(--ink-soft)" }}
             title="Saves this receipt as a file you can keep or share"
@@ -6342,8 +6363,9 @@ function IPadReceiptOverlay({ sale, onClose }) {
   );
 }
 
-function ReceiptModal({ sale, onClose, closeLabel = "New order" }) {
+function ReceiptModal({ sale, business, onClose, closeLabel = "New order" }) {
   const [showIPadOverlay, setShowIPadOverlay] = useState(false);
+  const storeName = (business?.businessName && business.businessName.trim()) || "The Counter";
 
   const handlePrintClick = () => {
     if (isIPadDevice()) {
@@ -6352,19 +6374,27 @@ function ReceiptModal({ sale, onClose, closeLabel = "New order" }) {
       // to the register — so show an in-page overlay there instead.
       setShowIPadOverlay(true);
     } else {
-      printReceipt(sale);
+      printReceipt(sale, business);
     }
   };
 
   return (
     <ModalWrap onClose={onClose}>
       {showIPadOverlay && (
-        <IPadReceiptOverlay sale={sale} onClose={() => setShowIPadOverlay(false)} />
+        <IPadReceiptOverlay sale={sale} business={business} onClose={() => setShowIPadOverlay(false)} />
       )}
       <div className="ticket-edge-top" />
       <div className="px-5 pt-2 pb-4">
         <div className="text-center mb-3">
-          <div className="display-font text-lg" style={{ fontWeight: 600 }}>The Counter</div>
+          {business?.logoUrl && (
+            <img
+              src={business.logoUrl}
+              alt=""
+              className="mx-auto mb-1.5 object-contain"
+              style={{ maxWidth: 56, maxHeight: 56 }}
+            />
+          )}
+          <div className="display-font text-lg" style={{ fontWeight: 600 }}>{storeName}</div>
           <div className="text-xs" style={{ color: "var(--ink-soft)" }}>
             Order #{sale.orderNo} · {new Date(sale.timestamp).toLocaleString()}
           </div>
@@ -6471,7 +6501,7 @@ function ReceiptModal({ sale, onClose, closeLabel = "New order" }) {
             <Printer size={15} /> Print
           </button>
           <button
-            onClick={() => downloadReceipt(sale)}
+            onClick={() => downloadReceipt(sale, business)}
             className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-lg text-sm font-medium border"
             style={{ borderColor: "var(--line)", color: "var(--ink-soft)" }}
             title="Saves this receipt as a file you can keep or share"
