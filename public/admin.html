@@ -84,6 +84,9 @@
   }
   .badge.approved { background: rgba(111,174,106,0.18); color: var(--good); }
   .badge.rejected { background: rgba(194,107,94,0.18); color: var(--bad); }
+  .badge.purpose { background: rgba(217,161,63,0.14); color: var(--accent, #d9a13f); margin-right: 6px; }
+  .badge.method { background: var(--surface-raised); color: var(--ink-soft); }
+  .purpose-row { margin-top: 8px; }
   .amount-row { display: flex; justify-content: space-between; align-items: baseline; margin-top: 10px; }
   .amount-label { color: var(--ink-soft); font-size: 12px; }
   .amount-value { font-weight: 700; font-size: 15px; }
@@ -168,6 +171,18 @@
       <div id="status">Loading…</div>
       <div id="list"></div>
     </div>
+
+    <div id="historyModalBackdrop" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:50;">
+      <div style="max-width:520px;margin:40px auto;max-height:80vh;overflow-y:auto;">
+        <div class="card" style="margin:0 18px;">
+          <div class="card-top">
+            <div class="biz-name" id="historyModalTitle">Payment history</div>
+            <button id="historyModalClose" class="btn" style="flex:none;background:var(--surface-raised);color:var(--ink);padding:6px 10px;">✕</button>
+          </div>
+          <div id="historyModalList" style="margin-top:12px;"></div>
+        </div>
+      </div>
+    </div>
   </div>
 
 <script>
@@ -214,9 +229,13 @@
         <div class="card-top">
           <div>
             <div class="biz-name">${biz.business_name || "(no business name set)"}</div>
-            <div class="biz-email">${biz.email || ""}</div>
+            <div class="biz-email" data-email="${(biz.email || "").replace(/"/g, "&quot;")}" style="cursor:pointer;text-decoration:underline;">${biz.email || ""}</div>
           </div>
           <div class="submitted-at">${fmtDate(biz.manual_payment_submitted_at)}</div>
+        </div>
+        <div class="purpose-row">
+          <span class="badge purpose">${biz.purpose || "New subscription"}</span>
+          <span class="badge method">${biz.paymentMethod || "(not specified)"}</span>
         </div>
         <div class="ref-row">
           <div class="ref-label">Reference submitted</div>
@@ -226,6 +245,11 @@
           <span class="amount-label">Expected amount</span>
           <span class="amount-value">${biz.expectedAmount || ""}</span>
         </div>
+        <div class="amount-row">
+          <span class="amount-label">Customer reported paying</span>
+          <span class="amount-value" style="${biz.underpaidWarning ? "color:var(--bad);" : ""}">${biz.amountPaid || "(not specified)"}</span>
+        </div>
+        ${biz.underpaidWarning ? `<div class="warning-row">⚠️ ${biz.underpaidWarning}</div>` : ""}
         ${biz.duplicateWarning ? `<div class="warning-row">⚠️ ${biz.duplicateWarning}</div>` : ""}
         <div class="actions">
           <button class="btn approve" data-id="${biz.id}" data-action="approve">Approve</button>
@@ -250,7 +274,7 @@
         <div class="card-top">
           <div>
             <div class="biz-name">${entry.business_name || "(no business name set)"}</div>
-            <div class="biz-email">${entry.email || ""}</div>
+            <div class="biz-email" data-email="${(entry.email || "").replace(/"/g, "&quot;")}" style="cursor:pointer;text-decoration:underline;">${entry.email || ""}</div>
           </div>
           <span class="badge ${entry.action}">${entry.action}</span>
         </div>
@@ -357,7 +381,46 @@
     }
   }
 
+  const historyModalBackdrop = document.getElementById("historyModalBackdrop");
+  const historyModalTitle = document.getElementById("historyModalTitle");
+  const historyModalList = document.getElementById("historyModalList");
+  const historyModalClose = document.getElementById("historyModalClose");
+
+  function openHistoryModal(email) {
+    if (!email) return;
+    historyModalTitle.textContent = `Payment history — ${email}`;
+    const entries = latestData.history.filter((h) => (h.email || "").toLowerCase() === email.toLowerCase());
+    if (!entries.length) {
+      historyModalList.innerHTML = '<div class="empty">No past decisions for this account yet.</div>';
+    } else {
+      historyModalList.innerHTML = entries.map((entry) => `
+        <div class="ref-row" style="margin-top:10px;">
+          <div class="card-top" style="margin-bottom:6px;">
+            <span class="badge ${entry.action}">${entry.action}</span>
+            <span class="submitted-at">${fmtDate(entry.reviewed_at)}</span>
+          </div>
+          <div class="ref-label">Reference</div>
+          <div class="ref-value" style="margin-bottom:6px;">${entry.reference || "(empty)"}</div>
+          <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--ink-soft);">
+            <span>${entry.purpose === "renewal" ? "Renewal" : "New subscription"} · ${entry.payment_method || "(method not specified)"}</span>
+            <span>${entry.amount_paid != null ? "Paid: " + entry.amount_paid : ""}</span>
+          </div>
+        </div>
+      `).join("");
+    }
+    historyModalBackdrop.style.display = "block";
+  }
+
+  historyModalClose.addEventListener("click", () => { historyModalBackdrop.style.display = "none"; });
+  historyModalBackdrop.addEventListener("click", (e) => {
+    if (e.target === historyModalBackdrop) historyModalBackdrop.style.display = "none";
+  });
   listEl.addEventListener("click", (e) => {
+    const emailEl = e.target.closest("[data-email]");
+    if (emailEl) {
+      openHistoryModal(emailEl.dataset.email);
+      return;
+    }
     const btn = e.target.closest("button[data-action]");
     if (!btn) return;
     act(btn.dataset.id, btn.dataset.action, btn.parentElement);
