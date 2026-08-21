@@ -5971,6 +5971,24 @@ function printReceipt(sale) {
   win.onafterprint = () => win.close();
 }
 
+// Saves the same receipt markup used for printing as a standalone .html
+// file the customer/owner can keep, re-open, or print later from anywhere —
+// no popup, no print dialog, works the same on every device including
+// iPad/PWA where window.open is unreliable (see printReceipt above).
+function downloadReceipt(sale) {
+  const html = buildReceiptHTML(sale);
+  const blob = new Blob([html], { type: "text/html" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `receipt-order-${sale.orderNo ?? "unknown"}.html`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  // Release the blob URL once the download has had a moment to start.
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 // iPad's stand-in for printReceipt: instead of window.open (see note above),
 // this renders the same receipt markup inside a same-page overlay — a small
 // modal holding an <iframe>, printed via the iframe's own contentWindow —
@@ -6025,6 +6043,14 @@ function IPadReceiptOverlay({ sale, onClose }) {
             style={{ borderColor: "var(--line)", color: "var(--ink-soft)" }}
           >
             Close
+          </button>
+          <button
+            onClick={() => downloadReceipt(sale)}
+            className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-lg text-sm font-medium border"
+            style={{ borderColor: "var(--line)", color: "var(--ink-soft)" }}
+            title="Saves this receipt as a file you can keep or share"
+          >
+            <Download size={15} /> Save
           </button>
           <button
             onClick={handlePrint}
@@ -6165,12 +6191,20 @@ function ReceiptModal({ sale, onClose, closeLabel = "New order" }) {
             style={{ borderColor: "var(--line)", color: "var(--ink-soft)" }}
             title="Opens this receipt in a print-ready window"
           >
-            <Printer size={15} /> Print receipt
+            <Printer size={15} /> Print
           </button>
-          <button onClick={onClose} className="flex-1 py-2 rounded-lg text-sm font-medium" style={{ background: "var(--primary)", color: "#fff" }}>
-            {closeLabel}
+          <button
+            onClick={() => downloadReceipt(sale)}
+            className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-lg text-sm font-medium border"
+            style={{ borderColor: "var(--line)", color: "var(--ink-soft)" }}
+            title="Saves this receipt as a file you can keep or share"
+          >
+            <Download size={15} /> Download
           </button>
         </div>
+        <button onClick={onClose} className="w-full mt-2 py-2 rounded-lg text-sm font-medium" style={{ background: "var(--primary)", color: "#fff" }}>
+          {closeLabel}
+        </button>
       </div>
       <div className="ticket-edge-bottom" />
     </ModalWrap>
@@ -7592,10 +7626,7 @@ function InventoryView({ ingredients, products, openNew, openEdit, deleteIngredi
       {ingredients.length === 0 ? (
         <EmptyState text="No ingredients yet. Add coffee, milk, syrups, or anything you track by weight or volume." />
       ) : (
-        <div className="rounded-xl border overflow-x-auto" style={{ borderColor: "var(--line)", background: "var(--surface)" }}>
-          <div className="grid grid-cols-[1fr_70px_100px_90px_150px] gap-2 px-3.5 py-2 text-xs font-medium min-w-[560px]" style={{ color: "var(--ink-soft)", borderBottom: "1px solid var(--line)" }}>
-            <span>Ingredient</span><span>Unit</span><span>Stock</span><span>Low at</span><span></span>
-          </div>
+        <div className="space-y-2">
           {sortedIngredients.map((i) => {
             const isLow = i.low > 0 && i.stock <= i.low;
             const daysToExpiry = i.expiryDate
@@ -7605,41 +7636,51 @@ function InventoryView({ ingredients, products, openNew, openEdit, deleteIngredi
             const isExpiringSoon = daysToExpiry !== null && daysToExpiry >= 0 && daysToExpiry <= 3;
             const servings = servingsByIngredient[i.id] || [];
             return (
-              <div key={i.id} className="grid grid-cols-[1fr_70px_100px_90px_150px] gap-2 px-3.5 py-2.5 items-center text-sm mono-font min-w-[560px]" style={{ borderBottom: "1px solid var(--line)", background: isExpired ? "#F3E3DC" : (isLow || isExpiringSoon) ? "#FBF1EC" : "transparent" }}>
-                <div className="min-w-0" style={{ fontFamily: "'IBM Plex Sans', sans-serif" }}>
-                  <span className="truncate block">
-                    {i.name}
-                    {isLow && <AlertTriangle size={11} color="var(--alert)" className="inline ml-1.5 -mt-0.5" />}
-                    {(isExpired || isExpiringSoon) && (
-                      <span className="text-[10px] ml-1.5 px-1.5 py-0.5 rounded-full" style={{ background: isExpired ? "var(--alert)" : "#E7C9A8", color: isExpired ? "#fff" : "#6B4A22" }}>
-                        {isExpired ? "Expired" : daysToExpiry === 0 ? "Expires today" : `Expires in ${daysToExpiry}d`}
-                      </span>
-                    )}
-                  </span>
-                  {servings.length > 0 && (
-                    <div className="flex flex-wrap gap-x-2 gap-y-0.5 mt-0.5">
-                      {servings.map((s) => (
-                        <span key={s.productId} className="text-[10.5px]" style={{ color: s.servings <= 0 ? "var(--alert)" : "var(--ink-soft)" }}>
-                          {s.productName}: <strong className="font-semibold">{s.servings}</strong> left
+              <div key={i.id} className="rounded-xl border px-3.5 py-3" style={{ borderColor: "var(--line)", background: isExpired ? "#F3E3DC" : (isLow || isExpiringSoon) ? "#FBF1EC" : "var(--surface)" }}>
+                <div className="flex items-start justify-between gap-2">
+                  <div className="min-w-0" style={{ fontFamily: "'IBM Plex Sans', sans-serif" }}>
+                    <span className="block font-medium text-sm">
+                      {i.name}
+                      {isLow && <AlertTriangle size={12} color="var(--alert)" className="inline ml-1.5 -mt-0.5" />}
+                      {(isExpired || isExpiringSoon) && (
+                        <span className="text-[10px] ml-1.5 px-1.5 py-0.5 rounded-full" style={{ background: isExpired ? "var(--alert)" : "#E7C9A8", color: isExpired ? "#fff" : "#6B4A22" }}>
+                          {isExpired ? "Expired" : daysToExpiry === 0 ? "Expires today" : `Expires in ${daysToExpiry}d`}
                         </span>
-                      ))}
-                    </div>
-                  )}
-                </div>
-                <span style={{ color: "var(--ink-soft)" }}>{i.unit}</span>
-                {restockId === i.id ? (
-                  <div className="flex items-center gap-1">
-                    <input autoFocus type="number" value={restockVal} onChange={(e) => setRestockVal(e.target.value)} onKeyDown={(e) => e.key === "Enter" && applyRestock(i.id)} className="w-14 border rounded-lg px-1.5 py-2 text-xs" style={{ borderColor: "var(--line)" }} placeholder="+amt" />
-                    <button onClick={() => applyRestock(i.id)} className="w-9 h-9 flex items-center justify-center rounded-full"><Check size={16} color="var(--primary-dark)" /></button>
+                      )}
+                    </span>
+                    {servings.length > 0 && (
+                      <div className="flex flex-wrap gap-x-2 gap-y-0.5 mt-0.5">
+                        {servings.map((s) => (
+                          <span key={s.productId} className="text-[10.5px]" style={{ color: s.servings <= 0 ? "var(--alert)" : "var(--ink-soft)" }}>
+                            {s.productName}: <strong className="font-semibold">{s.servings}</strong> left
+                          </span>
+                        ))}
+                      </div>
+                    )}
                   </div>
-                ) : (
-                  <span style={{ color: isLow ? "var(--alert)" : "var(--ink)" }}>{i.stock}</span>
-                )}
-                <span style={{ color: "var(--ink-soft)" }}>{i.low}</span>
-                <div className="flex items-center gap-1.5 justify-end">
-                  <button onClick={() => setRestockId(restockId === i.id ? null : i.id)} className="text-xs px-3 py-2 rounded-lg border font-medium min-h-[36px]" style={{ borderColor: "var(--line)" }}>+stock</button>
-                  <button onClick={() => openEdit(i)} className="w-9 h-9 flex items-center justify-center rounded-full"><Pencil size={15} color="var(--ink-soft)" /></button>
-                  <ConfirmDeleteButton onConfirm={() => deleteIngredient(i.id)} compact size={15} className="w-9 h-9 flex items-center justify-center rounded-full" />
+                  <div className="flex items-center gap-1 shrink-0">
+                    <button onClick={() => openEdit(i)} className="w-11 h-11 flex items-center justify-center rounded-full"><Pencil size={17} color="var(--ink-soft)" /></button>
+                    <ConfirmDeleteButton onConfirm={() => deleteIngredient(i.id)} compact size={17} className="w-11 h-11 flex items-center justify-center rounded-full" />
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-between gap-2 mt-2.5 pt-2.5" style={{ borderTop: "1px solid var(--line)" }}>
+                  <div className="flex items-baseline gap-3 text-sm mono-font">
+                    <span>
+                      <span style={{ color: isLow ? "var(--alert)" : "var(--ink)" }} className="font-semibold">{i.stock}</span>
+                      <span style={{ color: "var(--ink-soft)" }}> {i.unit}</span>
+                    </span>
+                    <span className="text-xs" style={{ color: "var(--ink-soft)" }}>low at {i.low}</span>
+                  </div>
+
+                  {restockId === i.id ? (
+                    <div className="flex items-center gap-1.5">
+                      <input autoFocus type="number" value={restockVal} onChange={(e) => setRestockVal(e.target.value)} onKeyDown={(e) => e.key === "Enter" && applyRestock(i.id)} className="w-16 border rounded-lg px-2 py-2.5 text-sm" style={{ borderColor: "var(--line)" }} placeholder="+amt" />
+                      <button onClick={() => applyRestock(i.id)} className="w-11 h-11 flex items-center justify-center rounded-full" style={{ background: "var(--primary)" }}><Check size={18} color="#fff" /></button>
+                    </div>
+                  ) : (
+                    <button onClick={() => setRestockId(i.id)} className="text-sm px-4 py-2.5 rounded-lg border font-medium min-h-[44px]" style={{ borderColor: "var(--line)" }}>+stock</button>
+                  )}
                 </div>
               </div>
             );
