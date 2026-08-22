@@ -5887,7 +5887,7 @@ function buildReceiptHTML(sale, business) {
 
   const storeName = (business?.businessName && business.businessName.trim()) || "The Counter";
   const logoHTML = business?.logoUrl
-    ? `<img src="${esc(business.logoUrl)}" alt="" style="max-width:64px;max-height:64px;object-fit:contain;margin:0 auto 6px;display:block;" />`
+    ? `<img src="${esc(business.logoUrl)}" alt="" style="max-width:64px;max-height:64px;object-fit:contain;margin:0 auto 12px;display:block;" />`
     : "";
 
   const itemsHTML = sale.items
@@ -6126,7 +6126,7 @@ async function buildReceiptImageBlob(sale, business) {
         ? logoDrawHeight * (logoImg.naturalWidth / logoImg.naturalHeight)
         : logoDrawHeight;
       if (draw) ctx.drawImage(logoImg, centerX - logoDrawWidth / 2, y, logoDrawWidth, logoDrawHeight);
-      y += logoDrawHeight + 6;
+      y += logoDrawHeight + 16;
     }
 
     centerLine(storeName, 18, 700, "#2B2420", 6);
@@ -6390,7 +6390,7 @@ function ReceiptModal({ sale, business, onClose, closeLabel = "New order" }) {
             <img
               src={business.logoUrl}
               alt=""
-              className="mx-auto mb-1.5 object-contain"
+              className="mx-auto mb-2.5 object-contain"
               style={{ maxWidth: 56, maxHeight: 56 }}
             />
           )}
